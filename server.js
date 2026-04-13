@@ -686,10 +686,11 @@ app.post('/api/chat', async (req, res) => {
 
 app.post('/api/chat/stream', async (req, res) => {
   res.setHeader('Content-Type',  'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection',    'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
-  const sse = d => res.write(`data: ${typeof d === 'string' ? d : JSON.stringify(d)}\n\n`);
+  const sse = d => { res.write(`data: ${typeof d === 'string' ? d : JSON.stringify(d)}\n\n`); if (typeof res.flush === 'function') res.flush(); };
   if (!checkRate(req.ip)) { sse({ error:'Rate limited' }); return res.end(); }
   if (isOverCap()) { sse({ error:'Monthly message limit reached — please try again next month.' }); return res.end(); }
   if (!process.env.ANTHROPIC_API_KEY) { sse({ error:'API key not configured — add ANTHROPIC_API_KEY to your .env file' }); return res.end(); }
