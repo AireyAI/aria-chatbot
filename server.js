@@ -695,6 +695,8 @@ app.post('/api/chat/stream', async (req, res) => {
   if (!process.env.ANTHROPIC_API_KEY) { sse({ error:'API key not configured — add ANTHROPIC_API_KEY to your .env file' }); return res.end(); }
   const { system, messages, model, max_tokens, sessionId } = req.body;
   if (!messages?.length) { sse({ error:'Invalid' }); return res.end(); }
+  let aborted = false;
+  req.on('close', () => { aborted = true; });
   try {
     const stream = claude.messages.stream({
       model:      model || 'claude-haiku-4-5-20251001',
@@ -702,17 +704,26 @@ app.post('/api/chat/stream', async (req, res) => {
       system:     (system || 'You are a helpful assistant.') + buildBusinessContext(),
       messages:   messages.slice(-24),
     });
-    stream.on('text', t => sse({ text: t }));
+    req.on('close', () => { try { stream.controller?.abort(); } catch {} });
+    stream.on('text', t => { if (!aborted) sse({ text: t }); });
     stream.on('finalMessage', msg => {
       trackUsage(msg.usage?.input_tokens || 0, msg.usage?.output_tokens || 0);
-      sse('[DONE]'); res.end();
+      if (!aborted) { sse('[DONE]'); res.end(); }
       if (sessionId) saveSession(sessionId, { messages: messages.slice(-24) });
     });
-    stream.on('error', e => { console.error('Stream error:', e.message); sse({ error:'Stream error' }); res.end(); });
-    req.on('close', () => stream.controller?.abort());
+    stream.on('error', e => {
+      if (e.name === 'APIUserAbortError' || aborted) return;
+      console.error('Stream error:', e.message);
+      if (!aborted) { sse({ error:'Stream error' }); res.end(); }
+    });
+    // Catch the stream promise to prevent unhandled rejections on abort
+    stream.finalMessage().catch(e => {
+      if (e.name === 'APIUserAbortError' || aborted) return;
+      console.error('Stream promise error:', e.message);
+    });
   } catch(e) {
     console.error('Stream setup error:', e.message);
-    sse({ error: 'AI error' }); res.end();
+    if (!aborted) { sse({ error: 'AI error' }); res.end(); }
   }
 });
 
@@ -2618,3 +2629,11 @@ setInterval(async () => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`\n  ✦ Aria Chatbot Server v5\n  → Admin: http://localhost:${PORT}/admin?pass=${ADMIN}\n  → Health: http://localhost:${PORT}/health\n`));
+
+// ─── Global error handlers — prevent unhandled errors from crashing the process
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err.message);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err?.message || err);
+});
