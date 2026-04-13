@@ -141,7 +141,7 @@
     autoLearnSite:      _a('autoLearn',   'true')  !== 'false',  // crawl site pages for bot knowledge
 
     // Core features
-    streamingEnabled:     true,
+    streamingEnabled:     false,
     multiBubble:          true,
     soundEnabled:         true,
     persistHistory:       true,
