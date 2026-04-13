@@ -704,7 +704,7 @@ app.post('/api/chat/stream', async (req, res) => {
       system:     (system || 'You are a helpful assistant.') + buildBusinessContext(),
       messages:   messages.slice(-24),
     });
-    req.on('close', () => { try { stream.controller?.abort(); } catch {} });
+    req.on('close', () => { try { stream.abort(); } catch {} });
     stream.on('text', t => { if (!aborted) sse({ text: t }); });
     stream.on('finalMessage', msg => {
       trackUsage(msg.usage?.input_tokens || 0, msg.usage?.output_tokens || 0);
@@ -716,11 +716,7 @@ app.post('/api/chat/stream', async (req, res) => {
       console.error('Stream error:', e.message);
       if (!aborted) { sse({ error:'Stream error' }); res.end(); }
     });
-    // Catch the stream promise to prevent unhandled rejections on abort
-    stream.finalMessage().catch(e => {
-      if (e.name === 'APIUserAbortError' || aborted) return;
-      console.error('Stream promise error:', e.message);
-    });
+    stream.on('abort', () => { /* expected on client disconnect, do nothing */ });
   } catch(e) {
     console.error('Stream setup error:', e.message);
     if (!aborted) { sse({ error: 'AI error' }); res.end(); }
