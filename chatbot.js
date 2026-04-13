@@ -419,7 +419,7 @@
 
   /* Messages */
   #_ac-msgs{flex:1;overflow-y:auto;padding:14px 14px 8px;display:flex;flex-direction:column;
-    gap:7px;background:var(--bg2);scroll-behavior:smooth;
+    gap:7px;background:var(--bg2);
     -webkit-overflow-scrolling:touch;overscroll-behavior:contain;}
   #_ac-msgs::-webkit-scrollbar{width:4px;}
   #_ac-msgs::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px;}
