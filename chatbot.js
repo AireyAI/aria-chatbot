@@ -419,7 +419,8 @@
 
   /* Messages */
   #_ac-msgs{flex:1;overflow-y:auto;padding:14px 14px 8px;display:flex;flex-direction:column;
-    gap:7px;background:var(--bg2);scroll-behavior:smooth;}
+    gap:7px;background:var(--bg2);scroll-behavior:smooth;
+    -webkit-overflow-scrolling:touch;overscroll-behavior:contain;}
   #_ac-msgs::-webkit-scrollbar{width:4px;}
   #_ac-msgs::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px;}
   .ac-msg{max-width:84%;padding:11px 15px;border-radius:18px;font-size:14px;line-height:1.58;
@@ -2008,6 +2009,21 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     }
     if (isOpen) { closeMenu(); setTimeout(() => el('_ac-inp').focus(), 380); resetInactivity(); resetChatInactivity(); }
     if (!isOpen) clearTimeout(chatInactTimer);
+    // Lock body scroll when chat is open to prevent page scrolling behind
+    if (isOpen) {
+      document.body.dataset.acScrollY = window.scrollY;
+      document.body.style.overflow = 'hidden';
+      document.body.style.position = 'fixed';
+      document.body.style.top = `-${window.scrollY}px`;
+      document.body.style.width = '100%';
+    } else {
+      const scrollY = document.body.dataset.acScrollY || '0';
+      document.body.style.overflow = '';
+      document.body.style.position = '';
+      document.body.style.top = '';
+      document.body.style.width = '';
+      window.scrollTo(0, parseInt(scrollY));
+    }
   }
 
   function showWelcome() {
