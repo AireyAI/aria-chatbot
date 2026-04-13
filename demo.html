@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aria Chatbot — Demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(135deg, #667eea15, #764ba215), #f8f9fc;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 20px;
+      color: #1a1a2e;
+    }
+    .demo-badge {
+      background: #6C63FF;
+      color: white;
+      padding: 6px 16px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      margin-bottom: 24px;
+    }
+    h1 { font-size: 42px; font-weight: 800; margin-bottom: 12px; text-align: center; }
+    h1 span { color: #6C63FF; }
+    p { color: #666; font-size: 17px; text-align: center; max-width: 480px; line-height: 1.6; margin-bottom: 40px; }
+    .cards {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      justify-content: center;
+      margin-bottom: 60px;
+    }
+    .card {
+      background: white;
+      border-radius: 16px;
+      padding: 24px;
+      width: 200px;
+      box-shadow: 0 2px 16px rgba(0,0,0,0.07);
+      text-align: center;
+    }
+    .card-icon { font-size: 32px; margin-bottom: 10px; }
+    .card h3 { font-size: 14px; font-weight: 600; color: #1a1a2e; margin-bottom: 6px; }
+    .card p { font-size: 12px; color: #999; margin: 0; }
+    .hint {
+      position: fixed;
+      bottom: 100px;
+      right: 24px;
+      background: white;
+      border-radius: 12px;
+      padding: 10px 16px;
+      font-size: 13px;
+      color: #666;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+      animation: hint-bounce 2s ease-in-out infinite;
+    }
+    .hint::after {
+      content: '';
+      position: absolute;
+      bottom: -8px;
+      right: 22px;
+      width: 0; height: 0;
+      border-left: 8px solid transparent;
+      border-right: 8px solid transparent;
+      border-top: 8px solid white;
+    }
+    @keyframes hint-bounce {
+      0%,100% { transform: translateY(0); }
+      50% { transform: translateY(-4px); }
+    }
+  </style>
+</head>
+<body>
+  <div class="demo-badge">✦ Live Demo</div>
+  <h1>Meet <span>Aria</span> ✦</h1>
+  <p>An AI chatbot that works on any website. Smart, fun, and completely customisable. Click the button to try it.</p>
+
+  <div class="cards">
+    <div class="card">
+      <div class="card-icon">⚡</div>
+      <h3>Instant Setup</h3>
+      <p>One script tag. Any website.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">🎨</div>
+      <h3>Any Brand</h3>
+      <p>Change colour, name, personality in minutes.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">🧠</div>
+      <h3>Claude Powered</h3>
+      <p>Genuinely smart responses, not scripted trees.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">📱</div>
+      <h3>Mobile Ready</h3>
+      <p>Looks great on every screen size.</p>
+    </div>
+  </div>
+
+  <div class="hint">👇 Try the chat button</div>
+
+  <!-- THE CHATBOT — this is all you need on any site -->
+  <script src="chatbot.js"></script>
+</body>
+</html>
