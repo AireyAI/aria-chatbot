@@ -1,5 +1,5 @@
 /**
- * Aria Chatbot Server — v5
+ * Aria Chatbot Server — v5.1
  *
  * Env vars:
  *   ANTHROPIC_API_KEY      required
