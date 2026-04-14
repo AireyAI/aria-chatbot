@@ -418,7 +418,7 @@
   .ac-mi+.ac-mi{border-top:1px solid var(--border);}
 
   /* Messages */
-  #_ac-msgs{flex:1;overflow-y:auto;padding:14px 14px 8px;display:flex;flex-direction:column;
+  #_ac-msgs{flex:1;min-height:0;overflow-y:auto;padding:14px 14px 8px;display:flex;flex-direction:column;
     gap:7px;background:var(--bg2);
     -webkit-overflow-scrolling:touch;overscroll-behavior:contain;}
   #_ac-msgs::-webkit-scrollbar{width:4px;}
@@ -528,7 +528,7 @@
   #_ac-mic.on{background:#ff4757;border-color:#ff4757;color:#fff;animation:_apls 1s infinite;}
   #_ac-mic.hide{display:none;}
   #_ac-inp{flex:1;border:1.5px solid var(--border);border-radius:20px;padding:9px 15px;
-    font-size:14px;outline:none;resize:none;max-height:90px;font-family:inherit;
+    font-size:16px;outline:none;resize:none;max-height:90px;font-family:inherit;
     color:var(--text);background:var(--inp);transition:border-color .2s,background .2s,box-shadow .2s;line-height:1.4;}
   #_ac-inp:focus{border-color:var(--ab);background:var(--bg);box-shadow:0 0 0 3px ${A}22;}
   #_ac-inp::placeholder{color:var(--text2);}
@@ -630,7 +630,7 @@
   .ac-video-native{width:100%;border-radius:14px;display:block;}
 
   @media(max-width:480px){
-    #_ac-win{width:calc(100vw - 16px);height:calc(100vh - 104px);${P}:8px;bottom:82px;border-radius:18px;}
+    #_ac-win{width:calc(100vw - 16px);height:calc(100dvh - 104px);${P}:8px;bottom:82px;border-radius:18px;}
   }
   `;
 
@@ -2008,21 +2008,22 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
       else setTimeout(showWelcome, 350);
     }
     if (isOpen) { closeMenu(); setTimeout(() => el('_ac-inp').focus(), 380); resetInactivity(); resetChatInactivity(); }
-    if (!isOpen) clearTimeout(chatInactTimer);
-    // Lock body scroll when chat is open to prevent page scrolling behind
-    if (isOpen) {
-      document.body.dataset.acScrollY = window.scrollY;
-      document.body.style.overflow = 'hidden';
-      document.body.style.position = 'fixed';
-      document.body.style.top = `-${window.scrollY}px`;
-      document.body.style.width = '100%';
-    } else {
-      const scrollY = document.body.dataset.acScrollY || '0';
-      document.body.style.overflow = '';
-      document.body.style.position = '';
-      document.body.style.top = '';
-      document.body.style.width = '';
-      window.scrollTo(0, parseInt(scrollY));
+    if (!isOpen) {
+      clearTimeout(chatInactTimer);
+      // Reset keyboard resize overrides when closing
+      const win = el('_ac-win');
+      win.style.height = '';
+      win.style.bottom = '';
+    }
+    // Lock body scroll on mobile when chat is open (full-screen mode only)
+    const isMobile = window.innerWidth <= 480;
+    if (isMobile) {
+      if (isOpen) {
+        document.body.dataset.acScrollY = window.scrollY;
+        document.body.style.overflow = 'hidden';
+      } else {
+        document.body.style.overflow = '';
+      }
     }
   }
 
@@ -2402,6 +2403,28 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
       resetInactivity();
     });
     send.onclick = () => sendMessage(inp.value);
+
+    // Mobile keyboard resize — adjust chat window height when virtual keyboard opens/closes
+    if (window.visualViewport) {
+      const win = el('_ac-win');
+      const onVVResize = () => {
+        if (!isOpen) return;
+        const vv = window.visualViewport;
+        const kbHeight = window.innerHeight - vv.height;
+        if (kbHeight > 100) {
+          // Keyboard is open
+          win.style.height = (vv.height - 24) + 'px';
+          win.style.bottom = (kbHeight + 8) + 'px';
+        } else {
+          // Keyboard closed — reset to CSS defaults
+          win.style.height = '';
+          win.style.bottom = '';
+        }
+        scrollBottom();
+      };
+      window.visualViewport.addEventListener('resize', onVVResize);
+      window.visualViewport.addEventListener('scroll', onVVResize);
+    }
 
     updateSoundToggle();
 
