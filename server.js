@@ -105,10 +105,60 @@ function getAuthUrl(ownerEmail) {
   });
 }
 
+const TOKEN_FILE = resolve('data/gmail-tokens.json');
+const AUTOREPLY_FILE = resolve('data/email-autoreply.json');
+
+// Load saved tokens on startup
+function loadSavedTokens() {
+  try {
+    if (existsSync(TOKEN_FILE)) {
+      const saved = JSON.parse(readFileSync(TOKEN_FILE, 'utf8'));
+      for (const [email, tokens] of Object.entries(saved)) {
+        const auth = makeOAuthClient();
+        auth.setCredentials(tokens);
+        gmailTokens.set(email, { auth, tokens });
+        console.log(`✉️  Restored Gmail connection for ${email}`);
+      }
+    }
+  } catch (e) { console.warn('Failed to load saved tokens:', e.message); }
+}
+
+// Load saved auto-reply configs on startup
+function loadSavedAutoReply() {
+  try {
+    if (existsSync(AUTOREPLY_FILE)) {
+      const saved = JSON.parse(readFileSync(AUTOREPLY_FILE, 'utf8'));
+      for (const [email, config] of Object.entries(saved)) {
+        EMAIL_AUTO_REPLY_ENABLED.set(email, config);
+        console.log(`📧 Restored auto-reply for ${email}`);
+      }
+    }
+  } catch (e) { console.warn('Failed to load auto-reply config:', e.message); }
+}
+
+function persistTokens() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [email, { tokens }] of gmailTokens) obj[email] = tokens;
+    writeFileSync(TOKEN_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist tokens:', e.message); }
+}
+
+function persistAutoReply() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [email, config] of EMAIL_AUTO_REPLY_ENABLED) obj[email] = config;
+    writeFileSync(AUTOREPLY_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist auto-reply config:', e.message); }
+}
+
 async function saveGmailTokens(ownerEmail, tokens) {
   const auth = makeOAuthClient();
   auth.setCredentials(tokens);
   gmailTokens.set(ownerEmail, { auth, tokens });
+  persistTokens();
   console.log(`✉️  Gmail connected for ${ownerEmail}`);
 }
 
@@ -161,11 +211,13 @@ const EMAIL_AUTO_REPLY_ENABLED = new Map(); // ownerEmail → { enabled, systemP
 
 function enableEmailAutoReply(ownerEmail, systemPrompt) {
   EMAIL_AUTO_REPLY_ENABLED.set(ownerEmail, { enabled: true, systemPrompt });
+  persistAutoReply();
   console.log(`📧 Auto-reply enabled for ${ownerEmail}`);
 }
 
 function disableEmailAutoReply(ownerEmail) {
   EMAIL_AUTO_REPLY_ENABLED.delete(ownerEmail);
+  persistAutoReply();
   console.log(`📧 Auto-reply disabled for ${ownerEmail}`);
 }
 
@@ -2858,8 +2910,12 @@ setInterval(async () => {
   }
 }, 60*60*1000);
 
+// Restore persisted state before starting
+loadSavedTokens();
+loadSavedAutoReply();
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`\n  ✦ Aria Chatbot Server v5\n  → Admin: http://localhost:${PORT}/admin?pass=${ADMIN}\n  → Health: http://localhost:${PORT}/health\n`));
+app.listen(PORT, () => console.log(`\n  ✦ Aria Chatbot Server v5.1\n  → Admin: http://localhost:${PORT}/admin?pass=${ADMIN}\n  → Health: http://localhost:${PORT}/health\n`));
 
 // ─── Global error handlers — prevent unhandled errors from crashing the process
 process.on('uncaughtException', (err) => {
