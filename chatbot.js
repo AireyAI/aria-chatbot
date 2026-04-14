@@ -1661,7 +1661,7 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     insertBefore(wrap); scrollBottom();
   }
 
-  function renderRichElements({ richBtns, richImgs, richDocs, richVideos, showHandoff }) {
+  function renderRichElements({ richBtns = [], richImgs = [], richDocs = [], richVideos = [], showHandoff = false } = {}) {
     richImgs.forEach(url => {
       const img = document.createElement('img'); img.src = url; img.className = 'ac-img'; img.alt = '';
       insertBefore(img);
@@ -1732,7 +1732,7 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
   // =====================================================
   function deliverResponse(fullText) {
     const { clean: withRich, followups } = parseFollowups(fullText);
-    const { text, richBtns, richImgs, showHandoff } = parseRich(withRich);
+    const { text, richBtns, richImgs, richDocs, richVideos, showHandoff } = parseRich(withRich);
 
     if (CONFIG.multiBubble) {
       const parts = text.split(/\n\n+/).map(s => s.trim()).filter(Boolean);
@@ -1741,7 +1741,7 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
       makeBotBubble(text);
     }
 
-    renderRichElements({ richBtns, richImgs, showHandoff });
+    renderRichElements({ richBtns, richImgs, richDocs, richVideos, showHandoff });
     addReactions();
     sounds.pop();
     addTimestamp();
