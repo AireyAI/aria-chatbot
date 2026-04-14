@@ -180,7 +180,7 @@ async function checkInboxAndReply(ownerEmail) {
     // Get unread emails from the last hour (not sent by us, not spam/trash)
     const res = await gmail.users.messages.list({
       userId: 'me',
-      q: 'is:unread is:inbox -from:me newer_than:10m',
+      q: 'is:unread is:inbox -from:me newer_than:1h',
       maxResults: 10,
     });
 
@@ -362,6 +362,20 @@ app.get('/api/email-autoreply/status', (req, res) => {
   const { owner } = req.query;
   const config = EMAIL_AUTO_REPLY_ENABLED.get(owner);
   res.json({ owner, enabled: !!config?.enabled });
+});
+
+// Manual trigger — check inbox now without waiting for the poll
+app.post('/api/email-autoreply/check-now', async (req, res) => {
+  const { owner } = req.body;
+  if (!owner) return res.status(400).json({ error: 'owner required' });
+  if (!gmailTokens.has(owner)) return res.status(400).json({ error: 'Gmail not connected' });
+  if (!EMAIL_AUTO_REPLY_ENABLED.has(owner)) return res.status(400).json({ error: 'Auto-reply not enabled' });
+  try {
+    await checkInboxAndReply(owner);
+    res.json({ ok: true, checked: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─── Slack ────────────────────────────────────────────────────────────────────
