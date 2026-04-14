@@ -97,6 +97,8 @@ function getAuthUrl(ownerEmail) {
     prompt: 'consent',
     scope: [
       'https://www.googleapis.com/auth/gmail.send',
+      'https://www.googleapis.com/auth/gmail.readonly',
+      'https://www.googleapis.com/auth/gmail.modify',
       'https://www.googleapis.com/auth/calendar',
     ],
     state: ownerEmail || '',
@@ -149,6 +151,175 @@ async function smartSend({ ownerEmail, to, subject, html, replyTo }) {
   // Fallback to server SMTP
   await sendEmail({ to, subject, html, replyTo });
 }
+
+// ─── Email Auto-Reply ────────────────────────────────────────────────────────
+// Polls connected Gmail inboxes and auto-replies using Claude + the business prompt
+
+const repliedEmails = new Set();       // track message IDs we've already replied to
+const EMAIL_POLL_INTERVAL = 3 * 60 * 1000; // check every 3 minutes
+const EMAIL_AUTO_REPLY_ENABLED = new Map(); // ownerEmail → { enabled, systemPrompt }
+
+function enableEmailAutoReply(ownerEmail, systemPrompt) {
+  EMAIL_AUTO_REPLY_ENABLED.set(ownerEmail, { enabled: true, systemPrompt });
+  console.log(`📧 Auto-reply enabled for ${ownerEmail}`);
+}
+
+function disableEmailAutoReply(ownerEmail) {
+  EMAIL_AUTO_REPLY_ENABLED.delete(ownerEmail);
+  console.log(`📧 Auto-reply disabled for ${ownerEmail}`);
+}
+
+async function checkInboxAndReply(ownerEmail) {
+  const entry = gmailTokens.get(ownerEmail);
+  const config = EMAIL_AUTO_REPLY_ENABLED.get(ownerEmail);
+  if (!entry || !config?.enabled) return;
+
+  try {
+    const gmail = google.gmail({ version: 'v1', auth: entry.auth });
+
+    // Get unread emails from the last hour (not sent by us, not spam/trash)
+    const res = await gmail.users.messages.list({
+      userId: 'me',
+      q: 'is:unread is:inbox -from:me newer_than:1h',
+      maxResults: 10,
+    });
+
+    const messages = res.data.messages || [];
+    for (const msg of messages) {
+      if (repliedEmails.has(msg.id)) continue;
+
+      const full = await gmail.users.messages.get({ userId: 'me', id: msg.id, format: 'full' });
+      const headers = full.data.payload.headers;
+      const from    = headers.find(h => h.name.toLowerCase() === 'from')?.value || '';
+      const subject = headers.find(h => h.name.toLowerCase() === 'subject')?.value || '';
+      const msgId   = headers.find(h => h.name.toLowerCase() === 'message-id')?.value || '';
+
+      // Extract sender email
+      const senderEmail = from.match(/<(.+?)>/)?.[1] || from.trim();
+
+      // Skip noreply, mailer-daemon, own emails
+      if (/noreply|no-reply|mailer-daemon|postmaster/i.test(senderEmail)) {
+        repliedEmails.add(msg.id);
+        continue;
+      }
+      if (senderEmail.toLowerCase() === ownerEmail.toLowerCase()) {
+        repliedEmails.add(msg.id);
+        continue;
+      }
+
+      // Extract body text
+      let bodyText = '';
+      const parts = full.data.payload.parts || [];
+      if (parts.length) {
+        const textPart = parts.find(p => p.mimeType === 'text/plain') || parts[0];
+        if (textPart?.body?.data) bodyText = Buffer.from(textPart.body.data, 'base64').toString('utf-8');
+      } else if (full.data.payload.body?.data) {
+        bodyText = Buffer.from(full.data.payload.body.data, 'base64').toString('utf-8');
+      }
+
+      if (!bodyText.trim()) { repliedEmails.add(msg.id); continue; }
+
+      // Strip email signatures and quoted replies
+      bodyText = bodyText.split(/\n--\s*\n/)[0].split(/\nOn .+ wrote:/)[0].trim();
+
+      console.log(`📧 New email from ${senderEmail}: "${subject}"`);
+
+      // Generate reply with Claude
+      const senderName = from.split('<')[0].trim().replace(/"/g, '') || 'there';
+      const reply = await generateEmailReply(config.systemPrompt, senderName, senderEmail, subject, bodyText);
+
+      if (reply) {
+        // Build reply email with threading headers
+        const replySubject = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
+        const threadId = full.data.threadId;
+
+        const replyHeaders = [
+          `From: ${ownerEmail}`,
+          `To: ${senderEmail}`,
+          `Subject: ${replySubject}`,
+          msgId ? `In-Reply-To: ${msgId}` : '',
+          msgId ? `References: ${msgId}` : '',
+          'MIME-Version: 1.0',
+          'Content-Type: text/html; charset=utf-8',
+          '',
+          reply,
+        ].filter(Boolean).join('\r\n');
+
+        const encoded = Buffer.from(replyHeaders).toString('base64url');
+        await gmail.users.messages.send({
+          userId: 'me',
+          requestBody: { raw: encoded, threadId },
+        });
+
+        // Mark original as read
+        await gmail.users.messages.modify({
+          userId: 'me', id: msg.id,
+          requestBody: { removeLabelIds: ['UNREAD'] },
+        });
+
+        console.log(`✅ Auto-replied to ${senderEmail} re: "${subject}"`);
+      }
+
+      repliedEmails.add(msg.id);
+    }
+  } catch (e) {
+    console.warn(`📧 Inbox check failed for ${ownerEmail}:`, e.message);
+  }
+}
+
+async function generateEmailReply(systemPrompt, senderName, senderEmail, subject, body) {
+  try {
+    const r = await claude.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 800,
+      messages: [{ role: 'user', content: `You received this email. Write a helpful, professional reply.
+
+From: ${senderName} (${senderEmail})
+Subject: ${subject}
+Message:
+${body}
+
+Reply as the business. Be friendly, helpful, and concise. If they're asking for a quote or booking, ask for the details you need (type of work, address, preferred date). If you can answer their question directly, do so. Always offer to arrange a call or site visit. Sign off with the business name. Format the reply as simple HTML with <p> tags.` }],
+      system: systemPrompt + '\n\nYou are replying to emails on behalf of this business. Keep replies short, professional, and warm. Never mention you are an AI — write as if you are a member of the team.',
+    });
+    return r.content[0]?.text || null;
+  } catch (e) {
+    console.warn('Email reply generation failed:', e.message);
+    return null;
+  }
+}
+
+// Start polling loop for all connected accounts with auto-reply enabled
+setInterval(() => {
+  for (const [ownerEmail] of EMAIL_AUTO_REPLY_ENABLED) {
+    checkInboxAndReply(ownerEmail);
+  }
+}, EMAIL_POLL_INTERVAL);
+
+// ─── Email Auto-Reply API Routes ─────────────────────────────────────────────
+
+// Enable auto-reply for an owner
+app.post('/api/email-autoreply/enable', (req, res) => {
+  const { owner, systemPrompt } = req.body;
+  if (!owner) return res.status(400).json({ error: 'owner required' });
+  if (!gmailTokens.has(owner)) return res.status(400).json({ error: 'Gmail not connected for this owner' });
+  enableEmailAutoReply(owner, systemPrompt || 'You are a helpful business assistant.');
+  res.json({ ok: true, owner, enabled: true });
+});
+
+// Disable auto-reply
+app.post('/api/email-autoreply/disable', (req, res) => {
+  const { owner } = req.body;
+  disableEmailAutoReply(owner);
+  res.json({ ok: true, owner, enabled: false });
+});
+
+// Check status
+app.get('/api/email-autoreply/status', (req, res) => {
+  const { owner } = req.query;
+  const config = EMAIL_AUTO_REPLY_ENABLED.get(owner);
+  res.json({ owner, enabled: !!config?.enabled });
+});
 
 // ─── Slack ────────────────────────────────────────────────────────────────────
 async function slack(blocks, text = 'Aria notification') {
