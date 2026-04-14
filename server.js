@@ -156,7 +156,7 @@ async function smartSend({ ownerEmail, to, subject, html, replyTo }) {
 // Polls connected Gmail inboxes and auto-replies using Claude + the business prompt
 
 const repliedEmails = new Set();       // track message IDs we've already replied to
-const EMAIL_POLL_INTERVAL = 3 * 60 * 1000; // check every 3 minutes
+const EMAIL_POLL_INTERVAL = 60 * 60 * 1000; // check every hour
 const EMAIL_AUTO_REPLY_ENABLED = new Map(); // ownerEmail → { enabled, systemPrompt }
 
 function enableEmailAutoReply(ownerEmail, systemPrompt) {
@@ -224,11 +224,11 @@ async function checkInboxAndReply(ownerEmail) {
 
       console.log(`📧 New email from ${senderEmail}: "${subject}"`);
 
-      // Generate reply with Claude
+      // Generate reply with Claude (also detects bookings)
       const senderName = from.split('<')[0].trim().replace(/"/g, '') || 'there';
-      const reply = await generateEmailReply(config.systemPrompt, senderName, senderEmail, subject, bodyText);
+      const result = await generateEmailReply(config.systemPrompt, senderName, senderEmail, subject, bodyText);
 
-      if (reply) {
+      if (result?.reply) {
         // Build reply email with threading headers
         const replySubject = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
         const threadId = full.data.threadId;
@@ -242,7 +242,7 @@ async function checkInboxAndReply(ownerEmail) {
           'MIME-Version: 1.0',
           'Content-Type: text/html; charset=utf-8',
           '',
-          reply,
+          result.reply,
         ].filter(Boolean).join('\r\n');
 
         const encoded = Buffer.from(replyHeaders).toString('base64url');
@@ -258,6 +258,25 @@ async function checkInboxAndReply(ownerEmail) {
         });
 
         console.log(`✅ Auto-replied to ${senderEmail} re: "${subject}"`);
+
+        // If a booking was detected, create a Google Calendar event
+        if (result.booking) {
+          const b = result.booking;
+          b.email = b.email || senderEmail;
+          b.name  = b.name || senderName;
+          console.log(`📅 Booking detected in email from ${senderEmail}: ${b.datetime}`);
+          const calEvent = await createCalendarEvent(ownerEmail, {
+            name:     b.name,
+            email:    b.email,
+            datetime: b.datetime,
+            notes:    b.notes || subject,
+            siteName: 'Email',
+            page:     'Email auto-reply',
+          });
+          if (calEvent) {
+            console.log(`📅 Calendar event created from email: ${calEvent.htmlLink}`);
+          }
+        }
       }
 
       repliedEmails.add(msg.id);
@@ -271,18 +290,42 @@ async function generateEmailReply(systemPrompt, senderName, senderEmail, subject
   try {
     const r = await claude.messages.create({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 800,
-      messages: [{ role: 'user', content: `You received this email. Write a helpful, professional reply.
+      max_tokens: 1200,
+      messages: [{ role: 'user', content: `You received this email. Write a helpful, professional reply AND check if it contains a booking or appointment request.
 
 From: ${senderName} (${senderEmail})
 Subject: ${subject}
 Message:
 ${body}
 
-Reply as the business. Be friendly, helpful, and concise. If they're asking for a quote or booking, ask for the details you need (type of work, address, preferred date). If you can answer their question directly, do so. Always offer to arrange a call or site visit. Sign off with the business name. Format the reply as simple HTML with <p> tags.` }],
-      system: systemPrompt + '\n\nYou are replying to emails on behalf of this business. Keep replies short, professional, and warm. Never mention you are an AI — write as if you are a member of the team.',
+Respond with valid JSON only:
+{
+  "reply": "<p>Your HTML reply here</p>",
+  "booking": null or { "name": "customer name", "email": "their email", "datetime": "the date/time they mentioned", "notes": "what work they need" }
+}
+
+Rules for the reply:
+- Be friendly, helpful, and concise
+- If they're asking for a quote or booking, confirm you'll get back to them and ask for any missing details
+- If you can answer their question directly, do so
+- Always offer to arrange a call or site visit
+- Sign off with the business name
+- Format the reply as simple HTML with <p> tags
+
+Rules for booking detection:
+- If the email mentions a specific date, time, appointment, booking, or scheduling — extract it into the booking object
+- Include their name, email, the date/time they mentioned (as written), and what work they need
+- If no booking/date is mentioned, set booking to null` }],
+      system: systemPrompt + '\n\nYou are replying to emails on behalf of this business. Keep replies short, professional, and warm. Never mention you are an AI — write as if you are a member of the team. Always respond with valid JSON.',
     });
-    return r.content[0]?.text || null;
+    const text = r.content[0]?.text || '';
+    try {
+      const parsed = JSON.parse(text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim());
+      return parsed;
+    } catch {
+      // If JSON parsing fails, treat whole response as reply
+      return { reply: text, booking: null };
+    }
   } catch (e) {
     console.warn('Email reply generation failed:', e.message);
     return null;
