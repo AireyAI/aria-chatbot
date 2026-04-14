@@ -53,6 +53,12 @@ app.options('*', cors(corsOpts));
 // Raw body capture for Shopify webhook HMAC verification — must run before express.json()
 app.use('/api/shopify/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
+app.use('/chatbot.js', (req, res, next) => {
+  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
 app.use(express.static('.'));
 
 // ─── Email ────────────────────────────────────────────────────────────────────
