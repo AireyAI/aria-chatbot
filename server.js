@@ -156,7 +156,7 @@ async function smartSend({ ownerEmail, to, subject, html, replyTo }) {
 // Polls connected Gmail inboxes and auto-replies using Claude + the business prompt
 
 const repliedEmails = new Set();       // track message IDs we've already replied to
-const EMAIL_POLL_INTERVAL = 60 * 60 * 1000; // check every hour
+const EMAIL_POLL_INTERVAL = 3 * 60 * 1000; // check every 3 minutes
 const EMAIL_AUTO_REPLY_ENABLED = new Map(); // ownerEmail → { enabled, systemPrompt }
 
 function enableEmailAutoReply(ownerEmail, systemPrompt) {
@@ -180,7 +180,7 @@ async function checkInboxAndReply(ownerEmail) {
     // Get unread emails from the last hour (not sent by us, not spam/trash)
     const res = await gmail.users.messages.list({
       userId: 'me',
-      q: 'is:unread is:inbox -from:me newer_than:1h',
+      q: 'is:unread is:inbox -from:me newer_than:10m',
       maxResults: 10,
     });
 
