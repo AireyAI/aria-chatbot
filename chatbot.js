@@ -232,7 +232,7 @@
   //  CONFETTI ENGINE (pure canvas — no dependencies)
   // =====================================================
   function confetti(opts = {}) {
-    if (!CONFIG.confettiEnabled) return;
+    if (!CONFIG.confettiEnabled || reducedMotion) return;
     const { count = 90, x = 0.5, y = 0.6, spread = 'full' } = opts;
     const A = CONFIG.accentColor;
     const colors = [A, '#FF6B6B', '#FFD93D', '#6BCB77', '#4D96FF', '#FF922B', '#F78CA2', '#a18cd1'];
@@ -287,7 +287,7 @@
   //  FLOATING EMOJI
   // =====================================================
   function floatEmoji(emoji, fromEl) {
-    if (!CONFIG.floatingEmoji) return;
+    if (!CONFIG.floatingEmoji || reducedMotion) return;
     const rect = fromEl.getBoundingClientRect();
     const span = document.createElement('span');
     span.textContent = emoji;
@@ -320,6 +320,62 @@
   ];
   let thinkIdx = 0;
   const nextThink = () => THINKING[thinkIdx++ % THINKING.length];
+
+  // =====================================================
+  //  ACCESSIBILITY — reduced motion detection
+  // =====================================================
+  const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches || false;
+
+  // =====================================================
+  //  MARKDOWN PARSER (lightweight, no dependencies)
+  // =====================================================
+  function escapeHtml(str) {
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function parseMarkdown(text) {
+    let html = escapeHtml(text);
+
+    // Code blocks (``` ... ```)
+    html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) =>
+      `<pre style="background:var(--bg3);padding:10px 12px;border-radius:10px;overflow-x:auto;font-size:12.5px;line-height:1.5;margin:4px 0;"><code>${code.trim()}</code></pre>`);
+
+    // Inline code
+    html = html.replace(/`([^`]+)`/g, '<code style="background:var(--bg3);padding:2px 6px;border-radius:4px;font-size:12.5px;">$1</code>');
+
+    // Bold
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+    // Italic
+    html = html.replace(/(?<!\w)\*([^*]+)\*(?!\w)/g, '<em>$1</em>');
+
+    // Links [text](url)
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" style="color:var(--ab);text-decoration:underline;">$1</a>');
+
+    // Bare URLs
+    html = html.replace(/(?<!href="|&quot;|">)(https?:\/\/[^\s<&]+)/g, '<a href="$1" target="_blank" rel="noopener" style="color:var(--ab);text-decoration:underline;">$1</a>');
+
+    // Phone numbers — tel: links
+    html = html.replace(/(?<!href="|tel:)(\+?[\d][\d\s\-().]{8,15}\d)(?!["\d])/g, (match) => {
+      const digits = match.replace(/\D/g, '');
+      if (digits.length < 10 || digits.length > 15) return match;
+      return `<a href="tel:+${digits}" style="color:var(--ab);text-decoration:underline;">${match}</a>`;
+    });
+
+    // Unordered lists
+    html = html.replace(/((?:^|\n)(?:[\-*] .+(?:\n|$))+)/g, (block) => {
+      const items = block.trim().split('\n').map(line => `<li>${line.replace(/^[\-*]\s+/, '')}</li>`).join('');
+      return `<ul style="margin:4px 0;padding-left:18px;">${items}</ul>`;
+    });
+
+    // Ordered lists
+    html = html.replace(/((?:^|\n)(?:\d+\. .+(?:\n|$))+)/g, (block) => {
+      const items = block.trim().split('\n').map(line => `<li>${line.replace(/^\d+\.\s+/, '')}</li>`).join('');
+      return `<ol style="margin:4px 0;padding-left:18px;">${items}</ol>`;
+    });
+
+    return html;
+  }
 
   // =====================================================
   //  EASTER EGGS
@@ -629,6 +685,55 @@
   .ac-video-frame{width:100%;height:180px;border:none;}
   .ac-video-native{width:100%;border-radius:14px;display:block;}
 
+  /* Copy button on bot messages */
+  .ac-msg.bot{position:relative;}
+  .ac-copy-btn{position:absolute;top:6px;right:6px;background:var(--bg3);border:1px solid var(--border);
+    border-radius:6px;padding:2px 5px;font-size:11px;cursor:pointer;opacity:0;transition:opacity .15s;
+    color:var(--text2);line-height:1;z-index:1;}
+  .ac-msg.bot:hover .ac-copy-btn{opacity:1;}
+  @media(hover:none){.ac-copy-btn{opacity:.5;}}
+
+  /* Offline banner */
+  #_ac-offline{display:none;padding:8px 14px;background:#ff475718;border-bottom:1px solid #ff475730;
+    font-size:12px;color:#ff4757;text-align:center;flex-shrink:0;animation:_afad .2s ease;}
+  #_ac-offline.show{display:block;}
+
+  /* Retry button */
+  .ac-retry-card{display:flex;align-items:center;gap:10px;background:var(--bot);border-radius:16px;
+    padding:12px 16px;align-self:flex-start;box-shadow:0 2px 8px var(--sh);animation:_afad .25s ease;max-width:90%;}
+  .ac-retry-card p{font-size:13px;color:var(--text);margin:0;flex:1;}
+  .ac-retry-btn{background:var(--ab);color:var(--abt);border:none;border-radius:10px;
+    padding:7px 14px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;
+    transition:background .15s;white-space:nowrap;}
+  .ac-retry-btn:hover{background:var(--abd);}
+
+  /* Image lightbox */
+  #_ac-lightbox{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.85);
+    z-index:2147483647;display:none;align-items:center;justify-content:center;cursor:pointer;
+    animation:_afad .2s ease;}
+  #_ac-lightbox.show{display:flex;}
+  #_ac-lightbox img{max-width:92vw;max-height:88vh;border-radius:12px;box-shadow:0 8px 40px rgba(0,0,0,.5);
+    cursor:default;object-fit:contain;}
+  #_ac-lb-close{position:absolute;top:16px;right:20px;background:rgba(255,255,255,.15);border:none;
+    color:#fff;width:36px;height:36px;border-radius:50%;font-size:18px;cursor:pointer;
+    display:flex;align-items:center;justify-content:center;transition:background .15s;}
+  #_ac-lb-close:hover{background:rgba(255,255,255,.3);}
+
+  /* Thinking text animation */
+  #_ac-ttext{transition:opacity .15s;}
+
+  /* ARIA live region — visually hidden */
+  #_ac-live{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+    clip:rect(0,0,0,0);white-space:nowrap;border:0;}
+
+  /* Reduced motion */
+  @media(prefers-reduced-motion:reduce){
+    #_ac-w *{animation-duration:0.01s!important;animation-iteration-count:1!important;
+      transition-duration:0.01s!important;}
+    #_ac-btn{animation:none!important;box-shadow:0 4px 24px ${A}55!important;}
+    @keyframes _acglow{0%,100%{box-shadow:0 4px 24px ${A}55}}
+  }
+
   @media(max-width:480px){
     #_ac-win{width:calc(100vw - 16px);height:calc(100dvh - 104px);${P}:8px;bottom:82px;border-radius:18px;}
   }
@@ -804,6 +909,38 @@ Return JSON:
     return null;
   }
 
+  // =====================================================
+  //  QUICK REPLY i18n
+  // =====================================================
+  async function translateQuickReplies() {
+    const lang = navigator.language || 'en';
+    if (lang.startsWith('en')) return;
+    const cacheKey = `_ac_qr_${lang}`;
+    const cached = sessionStorage.getItem(cacheKey);
+    if (cached) { try { CONFIG.quickReplies = JSON.parse(cached); return; } catch {} }
+    try {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 2000);
+      const res = await fetch(PROXY_URL, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001', max_tokens: 200,
+          system: 'Translate the given JSON array of short button labels. Return ONLY a JSON array, no markdown.',
+          messages: [{ role: 'user', content: `Translate to ${lang}: ${JSON.stringify(CONFIG.quickReplies)}` }],
+          sessionId: SESSION_ID,
+        }),
+      });
+      const data = await res.json();
+      const text = data?.content?.[0]?.text || '';
+      const arr = JSON.parse(text.match(/\[[\s\S]*\]/)?.[0] || '[]');
+      if (arr.length === CONFIG.quickReplies.length) {
+        CONFIG.quickReplies = arr;
+        try { sessionStorage.setItem(cacheKey, JSON.stringify(arr)); } catch {}
+      }
+    } catch {}
+  }
+
   // Main entry point — runs all 3 phases in the right order
   async function crawlSite() {
     if (!CONFIG.autoLearnSite) return;
@@ -857,6 +994,9 @@ Return JSON:
         siteKnowledge = profileStr + '\n\n━━━ RAW SITE CONTENT ━━━\n' + rawKnowledge.slice(0, 3000);
       }
     });
+
+    // Phase 4: translate quick replies for non-English visitors
+    translateQuickReplies();
   }
 
   // =====================================================
@@ -1292,6 +1432,7 @@ Return JSON:
             <button class="ac-hbtn" id="_ac-close">✕</button>
           </div>
         </div>
+        <div id="_ac-offline">⚠ You're offline — messages will send when you're back</div>
         <div id="_ac-menu">
           <button class="ac-mi" id="_ac-exp">📄 Export chat</button>
           <button class="ac-mi" id="_ac-clr">🗑 Clear chat</button>
@@ -1315,7 +1456,9 @@ Return JSON:
           <button id="_ac-gdpr-btn">I agree — start chatting ✦</button>
         </div>` : ''}
         ${CONFIG.whiteLabelMode ? '' : '<div id="_ac-power">Powered by AI ✦</div>'}
-      </div>`;
+      </div>
+      <div id="_ac-live" aria-live="polite" aria-atomic="true"></div>
+      <div id="_ac-lightbox"><button id="_ac-lb-close">✕</button><img src="" alt="Enlarged image" /></div>`;
     document.body.appendChild(root);
   }
 
@@ -1616,9 +1759,28 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
 
   function makeBotBubble(text = '', animate = true) {
     const d = document.createElement('div');
-    d.className = 'ac-msg bot'; d.textContent = text;
+    d.className = 'ac-msg bot';
+    d.innerHTML = parseMarkdown(text);
+    d.dataset.raw = text; // keep raw text for copy/export
     if (!animate) d.style.animation = 'none';
+    // Copy button
+    const cp = document.createElement('button');
+    cp.className = 'ac-copy-btn'; cp.textContent = '📋'; cp.title = 'Copy message';
+    cp.onclick = (e) => {
+      e.stopPropagation();
+      navigator.clipboard?.writeText(text).then(() => { toast('Copied!', 1200); }).catch(() => {});
+    };
+    d.appendChild(cp);
+    // ARIA live announcement
+    announceToScreenReader(text);
     insertBefore(d); return d;
+  }
+
+  function announceToScreenReader(text) {
+    const live = el('_ac-live');
+    if (!live) return;
+    live.textContent = text;
+    setTimeout(() => { live.textContent = ''; }, 1500);
   }
 
   function addReactions(bubbleEl) {
@@ -1664,6 +1826,8 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
   function renderRichElements({ richBtns = [], richImgs = [], richDocs = [], richVideos = [], showHandoff = false } = {}) {
     richImgs.forEach(url => {
       const img = document.createElement('img'); img.src = url; img.className = 'ac-img'; img.alt = '';
+      img.style.cursor = 'pointer'; img.title = 'Click to enlarge';
+      img.onclick = () => window._acOpenLightbox?.(url);
       insertBefore(img);
     });
     richVideos.forEach(url => {
@@ -1930,7 +2094,7 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     typ().classList.add('show');
     el('_ac-ttext').textContent = thinkTxt;
     scrollBottom();
-    await delay(500 + Math.random() * 700);
+    await delay(200);
 
     try {
       let fullText = '';
@@ -1966,8 +2130,13 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     } catch {
       typ().classList.remove('show');
       // Remove the last user message from history so they can retry cleanly
-      if (history[history.length - 1]?.role === 'user') history.pop();
-      makeBotBubble("Sorry, I hit a snag there — try sending that again 😊");
+      const failedMsg = (history[history.length - 1]?.role === 'user') ? history.pop()?.content : text;
+      const retryCard = document.createElement('div'); retryCard.className = 'ac-retry-card';
+      retryCard.innerHTML = `<p>Something went wrong — want to try again?</p>`;
+      const retryBtn = document.createElement('button'); retryBtn.className = 'ac-retry-btn'; retryBtn.textContent = '↻ Retry';
+      retryBtn.onclick = () => { retryCard.remove(); sendMessage(failedMsg); };
+      retryCard.appendChild(retryBtn);
+      insertBefore(retryCard); scrollBottom();
     }
 
     isBusy = false;
@@ -2080,7 +2249,9 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     history.forEach(msg => {
       const d = document.createElement('div');
       d.className = `ac-msg ${msg.role === 'user' ? 'user' : 'bot'}`;
-      d.textContent = msg.content; d.style.animation = 'none';
+      if (msg.role === 'user') { d.textContent = msg.content; }
+      else { d.innerHTML = parseMarkdown(msg.content); d.dataset.raw = msg.content; }
+      d.style.animation = 'none';
       insertBefore(d);
     });
     setTimeout(() => {
@@ -2275,6 +2446,44 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
 
   function nudge() { if (!isOpen && !hasOpened) addNotifDot(); }
 
+  // =====================================================
+  //  OFFLINE DETECTION
+  // =====================================================
+  // =====================================================
+  //  IMAGE LIGHTBOX
+  // =====================================================
+  function initLightbox() {
+    const lb = el('_ac-lightbox');
+    if (!lb) return;
+    const lbImg = lb.querySelector('img');
+    const lbClose = el('_ac-lb-close');
+    const closeLb = () => lb.classList.remove('show');
+    lbClose.onclick = closeLb;
+    lb.onclick = (e) => { if (e.target === lb) closeLb(); };
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && lb.classList.contains('show')) closeLb(); });
+    window._acOpenLightbox = (src) => { lbImg.src = src; lb.classList.add('show'); };
+  }
+
+  function initOfflineDetection() {
+    const updateStatus = () => {
+      const offline = !navigator.onLine;
+      const banner = el('_ac-offline');
+      if (banner) banner.classList.toggle('show', offline);
+      const send = el('_ac-send');
+      const inp = el('_ac-inp');
+      if (offline) {
+        if (send) send.disabled = true;
+        if (inp) inp.placeholder = 'Offline...';
+      } else {
+        if (send) send.disabled = !el('_ac-inp')?.value?.trim();
+        if (inp) inp.placeholder = `Message ${CONFIG.botName}...`;
+      }
+    };
+    window.addEventListener('online', updateStatus);
+    window.addEventListener('offline', updateStatus);
+    updateStatus();
+  }
+
   function initTriggers() {
     if (CONFIG.exitIntentEnabled) {
       document.addEventListener('mouseleave', e => {
@@ -2343,7 +2552,7 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
   function init() {
     // A/B variant selection runs before buildWidget so color/name can be overridden
     selectABVariant();
-    buildWidget(); initVoice(); initTriggers(); initAvatarEgg();
+    buildWidget(); initVoice(); initTriggers(); initAvatarEgg(); initLightbox(); initOfflineDetection();
     // Track this page in journey
     trackJourney();
     // Cart abandonment detection — auto-open chat if on checkout/cart page
