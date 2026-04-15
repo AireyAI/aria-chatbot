@@ -1290,6 +1290,122 @@ async function createCalendarEvent(ownerEmail, booking) {
 
 // Connection page — owner visits this URL to connect their Gmail
 // e.g. http://localhost:3000/connect/gmail?owner=pete@gmail.com
+const passwordResetTokens = new Map(); // token → { ownerEmail, expiresAt }
+
+// Request password reset — sends email with reset link
+app.post('/api/dashboard/forgot-password', async (req, res) => {
+  const { owner } = req.body;
+  if (!owner) return res.status(400).json({ error: 'owner required' });
+  if (!dashboardPasswords.has(owner)) return res.status(400).json({ error: 'No account found for this email' });
+  const token = generateSessionToken();
+  passwordResetTokens.set(token, { ownerEmail: owner, expiresAt: Date.now() + 30 * 60 * 1000 }); // 30 min
+  const serverUrl = process.env.GOOGLE_REDIRECT_URI?.replace('/auth/gmail/callback', '') || `http://localhost:${process.env.PORT || 3000}`;
+  const resetLink = `${serverUrl}/dashboard/reset-password?token=${token}&owner=${encodeURIComponent(owner)}`;
+  try {
+    await sendEmail({
+      to: owner,
+      subject: 'Aria Dashboard — Password Reset',
+      html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:20px;">
+        <h2 style="color:#1a1a2e;">Reset your password</h2>
+        <p style="color:#666;line-height:1.6;">Someone requested a password reset for your Aria dashboard. Click the button below to set a new password.</p>
+        <a href="${resetLink}" style="display:inline-block;margin:20px 0;padding:14px 28px;background:#00e5a0;color:#0d0d1f;border-radius:12px;text-decoration:none;font-weight:600;">Reset Password</a>
+        <p style="color:#999;font-size:12px;">This link expires in 30 minutes. If you didn't request this, you can ignore this email.</p>
+      </div>`,
+    });
+    res.json({ ok: true, message: 'Reset link sent to your email' });
+  } catch (e) {
+    console.warn('Failed to send reset email:', e.message);
+    // Fall back — try sending via Gmail if SMTP not configured
+    try {
+      await smartSend({ ownerEmail: owner, to: owner, subject: 'Aria Dashboard — Password Reset',
+        html: `<p>Click here to reset your Aria dashboard password:</p><p><a href="${resetLink}">${resetLink}</a></p><p style="color:#999;font-size:12px;">Expires in 30 minutes.</p>` });
+      res.json({ ok: true, message: 'Reset link sent to your email' });
+    } catch (e2) {
+      res.status(500).json({ error: 'Failed to send reset email. Contact support.' });
+    }
+  }
+});
+
+// Password reset page
+app.get('/dashboard/reset-password', (req, res) => {
+  const { token, owner } = req.query;
+  const reset = passwordResetTokens.get(token);
+  if (!reset || reset.expiresAt < Date.now() || reset.ownerEmail !== owner) {
+    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#eee;}.box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:36px;max-width:400px;width:100%;text-align:center;}a{color:#00e5a0;text-decoration:none;}</style>
+    </head><body><div class="box">
+      <div style="font-size:36px;margin-bottom:16px;">⏰</div>
+      <h2>Link expired</h2>
+      <p style="color:#9898b8;margin:16px 0;">This reset link has expired or is invalid.</p>
+      <a href="/connect/gmail?owner=${encodeURIComponent(owner || '')}">Back to login</a>
+    </div></body></html>`);
+  }
+
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Aria — Reset Password</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#eee;}
+    .box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:36px;max-width:400px;width:100%;text-align:center;}
+    .logo span{font-size:28px;font-weight:800;color:#fff;letter-spacing:-0.5px;}
+    .logo span em{font-style:normal;color:#00e5a0;}
+    h2{font-size:18px;margin:24px 0 8px;}
+    p{font-size:13px;color:#9898b8;margin-bottom:20px;}
+    input[type=password]{width:100%;padding:14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:15px;color:#eee;font-family:inherit;outline:none;text-align:center;letter-spacing:2px;margin-bottom:12px;}
+    input[type=password]:focus{border-color:rgba(0,229,160,0.4);}
+    .btn{display:block;width:100%;padding:14px;background:#00e5a0;color:#0d0d1f;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;}
+    .btn:hover{opacity:.88;}
+    .msg{padding:10px;border-radius:8px;font-size:13px;margin-bottom:14px;display:none;}
+    .msg.error{display:block;background:rgba(255,80,80,0.1);border:1px solid rgba(255,80,80,0.2);color:#ff6b6b;}
+    .msg.success{display:block;background:rgba(0,229,160,0.1);border:1px solid rgba(0,229,160,0.25);color:#00e5a0;}
+  </style>
+  </head><body>
+  <div class="box">
+    <div class="logo"><span>Aria<em>Ai</em></span></div>
+    <h2>Set new password</h2>
+    <p>Choose a new password for your dashboard.</p>
+    <div id="msg" class="msg"></div>
+    <input type="password" id="pw" placeholder="New password" autofocus>
+    <input type="password" id="pw2" placeholder="Confirm password" onkeydown="if(event.key==='Enter')resetPw()">
+    <button class="btn" onclick="resetPw()">Reset Password</button>
+  </div>
+  <script>
+    async function resetPw() {
+      const pw = document.getElementById('pw').value;
+      const pw2 = document.getElementById('pw2').value;
+      const el = document.getElementById('msg');
+      if (!pw || pw.length < 4) { el.textContent = 'Password must be at least 4 characters'; el.className = 'msg error'; return; }
+      if (pw !== pw2) { el.textContent = "Passwords don't match"; el.className = 'msg error'; return; }
+      const r = await fetch('/api/dashboard/complete-reset', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({token:'${token}',owner:'${owner}',password:pw}) });
+      const data = await r.json();
+      if (data.ok) {
+        el.textContent = 'Password reset! Redirecting...';
+        el.className = 'msg success';
+        setTimeout(() => { window.location.href = '/connect/gmail?owner=${encodeURIComponent(owner)}&s=' + data.sessionToken; }, 1500);
+      } else {
+        el.textContent = data.error || 'Failed to reset password';
+        el.className = 'msg error';
+      }
+    }
+  </script>
+  </body></html>`);
+});
+
+// Complete password reset
+app.post('/api/dashboard/complete-reset', (req, res) => {
+  const { token, owner, password } = req.body;
+  const reset = passwordResetTokens.get(token);
+  if (!reset || reset.expiresAt < Date.now() || reset.ownerEmail !== owner) {
+    return res.status(400).json({ error: 'Invalid or expired reset link' });
+  }
+  if (!password || password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+  dashboardPasswords.set(owner, simpleHash(password));
+  persistPasswords();
+  passwordResetTokens.delete(token);
+  const sessionToken = createSession(owner);
+  res.json({ ok: true, sessionToken });
+});
+
 // Set password for dashboard
 app.post('/api/dashboard/set-password', (req, res) => {
   const { owner, password } = req.body;
@@ -1368,6 +1484,7 @@ app.get('/connect/gmail', (req, res) => {
       <div id="msg" class="msg"></div>
       <input type="password" id="pw" placeholder="Enter your password" autofocus onkeydown="if(event.key==='Enter')login()">
       <button class="btn" onclick="login()">Login</button>
+      <button id="forgotBtn" onclick="forgotPw()" style="background:none;border:none;color:#6b6b8a;font-size:12px;cursor:pointer;margin-top:12px;font-family:inherit;">Forgot password?</button>
       <div class="footer">Powered by <a href="https://aireyai.co.uk">AireyAi</a></div>
     </div>
     <script>
@@ -1383,6 +1500,27 @@ app.get('/connect/gmail', (req, res) => {
           el.textContent = data.error || 'Wrong password';
           el.className = 'msg error';
         }
+      }
+      async function forgotPw() {
+        const btn = document.getElementById('forgotBtn');
+        btn.textContent = 'Sending reset link...';
+        btn.disabled = true;
+        const r = await fetch('/api/dashboard/forgot-password', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({owner:'${ownerEmail}'}) });
+        const data = await r.json();
+        const el = document.getElementById('msg');
+        if (data.ok) {
+          el.textContent = 'Reset link sent to your email!';
+          el.className = 'msg';
+          el.style.display = 'block';
+          el.style.background = 'rgba(0,229,160,0.1)';
+          el.style.border = '1px solid rgba(0,229,160,0.25)';
+          el.style.color = '#00e5a0';
+        } else {
+          el.textContent = data.error || 'Failed to send reset link';
+          el.className = 'msg error';
+        }
+        btn.textContent = 'Forgot password?';
+        btn.disabled = false;
       }
     </script>
     </body></html>`);
