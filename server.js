@@ -1297,6 +1297,157 @@ app.delete('/api/knowledge-base', (req, res) => {
   res.json({ ok: true, deleted: id });
 });
 
+// ─── Website Scanner ─────────────────────────────────────────────────────────
+const CLIENT_PROFILES_FILE = resolve('data/client-profiles.json');
+const clientProfiles = new Map(); // url → { profile, scannedAt }
+
+try {
+  if (existsSync(CLIENT_PROFILES_FILE)) {
+    const raw = JSON.parse(readFileSync(CLIENT_PROFILES_FILE, 'utf8'));
+    for (const [k, v] of Object.entries(raw)) clientProfiles.set(k, v);
+    console.log(`🔍 Loaded ${clientProfiles.size} cached client profiles`);
+  }
+} catch (e) { console.warn('Failed to load client profiles:', e.message); }
+
+function persistProfiles() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    writeFileSync(CLIENT_PROFILES_FILE, JSON.stringify(Object.fromEntries(clientProfiles), null, 2));
+  } catch (e) { console.warn('Failed to persist client profiles:', e.message); }
+}
+
+async function scanWebsite(url) {
+  // Normalise URL
+  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+  const baseUrl = new URL(url);
+
+  // Fetch homepage
+  const homepageRes = await fetch(url, {
+    headers: { 'User-Agent': 'AriaBot/1.0 (website scanner)' },
+    signal: AbortSignal.timeout(15000)
+  });
+  if (!homepageRes.ok) throw new Error(`Failed to fetch ${url}: ${homepageRes.status}`);
+  const homepageHtml = await homepageRes.text();
+
+  // Find internal links to key pages
+  const keyPages = ['about', 'services', 'contact', 'menu', 'pricing', 'team', 'faq',
+                    'our-services', 'about-us', 'contact-us', 'our-team', 'price', 'treatments'];
+  const linkRegex = /href=["']([^"']+)["']/gi;
+  const foundLinks = new Set();
+  let match;
+  while ((match = linkRegex.exec(homepageHtml)) !== null) {
+    try {
+      const href = match[1];
+      const linkUrl = new URL(href, baseUrl.origin);
+      // Only same-origin links
+      if (linkUrl.hostname !== baseUrl.hostname) continue;
+      const path = linkUrl.pathname.toLowerCase();
+      if (keyPages.some(kp => path.includes(kp))) {
+        foundLinks.add(linkUrl.href);
+      }
+    } catch {}
+  }
+
+  // Limit to 5 subpages
+  const pagesToFetch = [...foundLinks].slice(0, 5);
+
+  // Helper: strip HTML to plain text
+  function stripHtml(html) {
+    return html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
+      .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&#?\w+;/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  // Gather text from all pages
+  let allText = `=== HOMEPAGE (${url}) ===\n${stripHtml(homepageHtml)}\n\n`;
+
+  for (const pageUrl of pagesToFetch) {
+    try {
+      const res = await fetch(pageUrl, {
+        headers: { 'User-Agent': 'AriaBot/1.0 (website scanner)' },
+        signal: AbortSignal.timeout(10000)
+      });
+      if (res.ok) {
+        const html = await res.text();
+        allText += `=== ${pageUrl} ===\n${stripHtml(html)}\n\n`;
+      }
+    } catch {}
+  }
+
+  // Truncate to ~30k chars to stay within context limits
+  if (allText.length > 30000) allText = allText.slice(0, 30000);
+
+  // Ask Claude to extract the business profile
+  const extraction = await claude.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 1024,
+    messages: [{
+      role: 'user',
+      content: `You are a business profile extractor. Analyze the following website text and extract a JSON business profile.
+
+Return ONLY valid JSON with these fields (use null for anything not found):
+{
+  "name": "Business name",
+  "services": ["service 1", "service 2"],
+  "location": "Full address or city/area",
+  "phone": "Phone number",
+  "email": "Email address",
+  "hours": "Opening hours summary",
+  "tone": "Brand tone in 2-3 words, e.g. 'friendly and professional', 'luxury and elegant', 'casual and fun'",
+  "summary": "One paragraph describing what this business does"
+}
+
+Website text:
+${allText}`
+    }]
+  });
+
+  const responseText = extraction.content[0].text.trim();
+  // Extract JSON from response (handle markdown code blocks)
+  const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error('Failed to extract profile from website');
+
+  return JSON.parse(jsonMatch[0]);
+}
+
+app.post('/api/scan-website', async (req, res) => {
+  try {
+    const { url } = req.body;
+    if (!url) return res.status(400).json({ error: 'url is required' });
+
+    // Normalise for cache key
+    let cacheKey = url.toLowerCase().replace(/\/+$/, '');
+    if (!/^https?:\/\//i.test(cacheKey)) cacheKey = 'https://' + cacheKey;
+
+    // Check cache (24 hour TTL)
+    const cached = clientProfiles.get(cacheKey);
+    if (cached && (Date.now() - new Date(cached.scannedAt).getTime()) < 24 * 60 * 60 * 1000) {
+      return res.json({ ok: true, profile: cached.profile, cached: true });
+    }
+
+    const profile = await scanWebsite(url);
+
+    // Cache the result
+    clientProfiles.set(cacheKey, { profile, scannedAt: new Date().toISOString() });
+    persistProfiles();
+
+    res.json({ ok: true, profile, cached: false });
+  } catch (e) {
+    console.error('Website scan failed:', e.message);
+    res.status(500).json({ error: 'Failed to scan website', detail: e.message });
+  }
+});
+
 // ─── Slack ────────────────────────────────────────────────────────────────────
 async function slack(blocks, text = 'Aria notification') {
   const url = process.env.SLACK_WEBHOOK;
