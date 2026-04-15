@@ -243,10 +243,63 @@ function persistRepliedEmails() {
   } catch (e) { console.warn('Failed to persist replied emails:', e.message); }
 }
 const EMAIL_POLL_INTERVAL = 3 * 60 * 1000; // check every 3 minutes
-const EMAIL_AUTO_REPLY_ENABLED = new Map(); // ownerEmail → { enabled, systemPrompt }
+const EMAIL_AUTO_REPLY_ENABLED = new Map(); // ownerEmail → { enabled, systemPrompt, config }
+const EMAIL_REPLY_STATS = new Map();       // ownerEmail → { replied, bookings, lastReply, followUps }
+const STATS_FILE = resolve('data/email-stats.json');
+const FOLLOWUP_FILE = resolve('data/email-followups.json');
+const pendingFollowUps = new Map();        // msgId → { ownerEmail, senderEmail, senderName, subject, sentAt, followUpAt, attempts }
 
-function enableEmailAutoReply(ownerEmail, systemPrompt) {
-  EMAIL_AUTO_REPLY_ENABLED.set(ownerEmail, { enabled: true, systemPrompt });
+function loadEmailStats() {
+  try {
+    if (existsSync(STATS_FILE)) {
+      const saved = JSON.parse(readFileSync(STATS_FILE, 'utf8'));
+      for (const [email, stats] of Object.entries(saved)) EMAIL_REPLY_STATS.set(email, stats);
+    }
+  } catch (e) { console.warn('Failed to load email stats:', e.message); }
+}
+
+function persistEmailStats() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [email, stats] of EMAIL_REPLY_STATS) obj[email] = stats;
+    writeFileSync(STATS_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist email stats:', e.message); }
+}
+
+function loadFollowUps() {
+  try {
+    if (existsSync(FOLLOWUP_FILE)) {
+      const saved = JSON.parse(readFileSync(FOLLOWUP_FILE, 'utf8'));
+      for (const [id, fu] of Object.entries(saved)) pendingFollowUps.set(id, fu);
+      console.log(`📧 Restored ${pendingFollowUps.size} pending follow-ups`);
+    }
+  } catch (e) { console.warn('Failed to load follow-ups:', e.message); }
+}
+
+function persistFollowUps() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [id, fu] of pendingFollowUps) obj[id] = fu;
+    writeFileSync(FOLLOWUP_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist follow-ups:', e.message); }
+}
+
+function trackReply(ownerEmail, type) {
+  const stats = EMAIL_REPLY_STATS.get(ownerEmail) || { replied: 0, bookings: 0, followUps: 0, urgent: 0, lastReply: null, history: [] };
+  if (type === 'reply') { stats.replied++; stats.lastReply = new Date().toISOString(); }
+  if (type === 'booking') stats.bookings++;
+  if (type === 'followup') stats.followUps++;
+  if (type === 'urgent') stats.urgent++;
+  stats.history.push({ type, time: new Date().toISOString() });
+  if (stats.history.length > 200) stats.history = stats.history.slice(-200);
+  EMAIL_REPLY_STATS.set(ownerEmail, stats);
+  persistEmailStats();
+}
+
+function enableEmailAutoReply(ownerEmail, systemPrompt, config = {}) {
+  EMAIL_AUTO_REPLY_ENABLED.set(ownerEmail, { enabled: true, systemPrompt, config });
   persistAutoReply();
   console.log(`📧 Auto-reply enabled for ${ownerEmail}`);
 }
@@ -255,6 +308,88 @@ function disableEmailAutoReply(ownerEmail) {
   EMAIL_AUTO_REPLY_ENABLED.delete(ownerEmail);
   persistAutoReply();
   console.log(`📧 Auto-reply disabled for ${ownerEmail}`);
+}
+
+// Check if currently within business hours
+function isWithinBusinessHours(config) {
+  if (!config?.hoursStart || !config?.hoursEnd) return null; // no hours set = always on
+  const now = new Date();
+  const hour = now.getUTCHours() + (config.timezone || 0);
+  const day = now.getUTCDay();
+  // Skip weekends if configured
+  if (config.skipWeekends && (day === 0 || day === 6)) return false;
+  return hour >= config.hoursStart && hour < config.hoursEnd;
+}
+
+// Wrap reply HTML in a branded email template
+function wrapInTemplate(replyHtml, config, isOutOfHours) {
+  const brandColor = config?.brandColor || '#6C63FF';
+  const businessName = config?.businessName || '';
+  const phone = config?.phone || '';
+  const website = config?.website || '';
+  const ownerEmail = config?.ownerEmail || '';
+
+  const signature = [
+    businessName ? `<strong>${businessName}</strong>` : '',
+    phone ? `📞 ${phone}` : '',
+    ownerEmail ? `✉️ ${ownerEmail}` : '',
+    website ? `🌐 <a href="${website}" style="color:${brandColor};text-decoration:none;">${website.replace(/^https?:\/\//, '')}</a>` : '',
+  ].filter(Boolean).join('<br>');
+
+  const oohNotice = isOutOfHours === false ? '' : isOutOfHours ? `
+    <div style="background:#fff8e1;border-left:4px solid #ffc107;padding:12px 16px;border-radius:0 8px 8px 0;margin-bottom:16px;font-size:13px;color:#666;">
+      We're currently outside business hours. We've received your message and will follow up during working hours.
+    </div>` : '';
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f5f5f5;">
+  <div style="max-width:580px;margin:20px auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08);">
+    <div style="background:${brandColor};padding:20px 28px;">
+      <div style="font-size:18px;font-weight:700;color:#ffffff;">${businessName || 'Hi there'}</div>
+    </div>
+    <div style="padding:28px;font-size:14px;line-height:1.7;color:#333;">
+      ${oohNotice}
+      ${replyHtml}
+    </div>
+    ${signature ? `
+    <div style="border-top:1px solid #eee;padding:20px 28px;font-size:12.5px;line-height:1.8;color:#888;">
+      ${signature}
+    </div>` : ''}
+    <div style="background:#fafafa;padding:12px 28px;text-align:center;font-size:11px;color:#bbb;">
+      Powered by <a href="https://aireyai.co.uk" style="color:${brandColor};text-decoration:none;">AireyAi</a>
+    </div>
+  </div>
+</body></html>`;
+}
+
+// Detect if email is spam, cold outreach, marketing, or automated
+function isSpamOrMarketing(from, subject, body) {
+  const spamPatterns = [
+    /unsubscribe/i, /opt.?out/i, /click here to/i, /limited.?time.?offer/i,
+    /act now/i, /congratulations.*won/i, /claim your/i, /free trial/i,
+    /discount code/i, /special offer/i, /exclusive deal/i, /bulk email/i,
+    /mailing list/i, /view in browser/i, /email preferences/i,
+    /just following up.*haven't heard/i, /touching base/i, /circle back/i,
+    /I came across your/i, /I noticed your company/i, /I'd love to connect/i,
+    /quick question about your/i, /partnership opportunity/i, /collaboration opportunity/i,
+    /we help (companies|businesses|brands)/i, /increase your (revenue|sales|traffic)/i,
+    /SEO (services|agency|expert)/i, /lead generation/i, /marketing (agency|services)/i,
+    /schedule a (demo|call|meeting) with/i, /book a time/i,
+  ];
+  const combined = `${subject} ${body}`;
+  const matches = spamPatterns.filter(p => p.test(combined));
+  return matches.length >= 2; // 2+ spam signals = skip
+}
+
+// Detect urgent emails that need forwarding
+function isUrgentEmail(subject, body) {
+  const urgentPatterns = [
+    /urgent/i, /emergency/i, /asap/i, /immediately/i,
+    /complaint/i, /not happy/i, /disappointed/i, /disgusted/i,
+    /refund/i, /broken/i, /damaged/i, /safety/i,
+    /legal action/i, /solicitor/i, /lawyer/i, /trading standards/i,
+  ];
+  const combined = `${subject} ${body}`;
+  return urgentPatterns.some(p => p.test(combined));
 }
 
 async function checkInboxAndReply(ownerEmail) {
@@ -345,13 +480,44 @@ async function checkInboxAndReply(ownerEmail) {
       // Strip email signatures and quoted replies
       bodyText = bodyText.split(/\n--\s*\n/)[0].split(/\nOn .+ wrote:/)[0].trim();
 
-      console.log(`📧 New email from ${senderEmail}: "${subject}"`);
+      const senderName = from.split('<')[0].trim().replace(/"/g, '') || 'there';
+      const cfg = config.config || {};
+
+      // Spam/marketing filter
+      if (isSpamOrMarketing(from, subject, bodyText)) {
+        console.log(`🚫 Skipped spam/marketing from ${senderEmail}: "${subject}"`);
+        repliedEmails.add(msg.id);
+        continue;
+      }
+
+      // Urgent email detection — forward to owner's phone via email
+      const urgent = isUrgentEmail(subject, bodyText);
+      if (urgent && cfg.phone) {
+        console.log(`🚨 URGENT email from ${senderEmail}: "${subject}"`);
+        trackReply(ownerEmail, 'urgent');
+        // Send SMS-style alert to owner (short email to their personal address)
+        try {
+          await sendEmail({
+            to: ownerEmail,
+            subject: `🚨 URGENT: ${subject}`,
+            html: `<p><strong>Urgent email from ${senderName} (${senderEmail})</strong></p><p>Subject: ${subject}</p><p>${bodyText.substring(0, 300)}...</p><p><em>This was flagged as urgent by Aria. Please respond directly.</em></p>`,
+          });
+        } catch (e) { console.warn('Failed to send urgent alert:', e.message); }
+      }
+
+      // Check business hours
+      const withinHours = isWithinBusinessHours(cfg);
+
+      console.log(`📧 New email from ${senderEmail}: "${subject}"${withinHours === false ? ' [OUT OF HOURS]' : ''}${urgent ? ' [URGENT]' : ''}`);
 
       // Generate reply with Claude (also detects bookings)
-      const senderName = from.split('<')[0].trim().replace(/"/g, '') || 'there';
-      const result = await generateEmailReply(config.systemPrompt, senderName, senderEmail, subject, bodyText);
+      const hoursContext = withinHours === false ? '\n\nIMPORTANT: It is currently outside business hours. Acknowledge their message warmly, let them know you have received it, and that the team will follow up during working hours. Still answer any simple questions you can.' : '';
+      const result = await generateEmailReply(config.systemPrompt + hoursContext, senderName, senderEmail, subject, bodyText);
 
       if (result?.reply) {
+        // Wrap in branded template
+        const brandedHtml = wrapInTemplate(result.reply, { ...cfg, ownerEmail }, withinHours === false);
+
         // Build reply email with threading headers
         const replySubject = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
         const threadId = full.data.threadId;
@@ -365,7 +531,7 @@ async function checkInboxAndReply(ownerEmail) {
           'MIME-Version: 1.0',
           'Content-Type: text/html; charset=utf-8',
         ].filter(Boolean).join('\r\n');
-        const replyHeaders = headerLines + '\r\n\r\n' + result.reply;
+        const replyHeaders = headerLines + '\r\n\r\n' + brandedHtml;
 
         const encoded = Buffer.from(replyHeaders).toString('base64url');
         await gmail.users.messages.send({
@@ -379,7 +545,23 @@ async function checkInboxAndReply(ownerEmail) {
           requestBody: { removeLabelIds: ['UNREAD'] },
         });
 
+        trackReply(ownerEmail, 'reply');
         console.log(`✅ Auto-replied to ${senderEmail} re: "${subject}"`);
+
+        // Schedule follow-up check (24h)
+        if (cfg.followUps !== false) {
+          pendingFollowUps.set(msg.id, {
+            ownerEmail,
+            senderEmail,
+            senderName,
+            subject,
+            threadId,
+            sentAt: Date.now(),
+            followUpAt: Date.now() + 24 * 60 * 60 * 1000,
+            attempts: 0,
+          });
+          persistFollowUps();
+        }
 
         // If a booking was detected, create a Google Calendar event
         if (result.booking) {
@@ -387,6 +569,7 @@ async function checkInboxAndReply(ownerEmail) {
           b.email = b.email || senderEmail;
           b.name  = b.name || senderName;
           console.log(`📅 Booking detected in email from ${senderEmail}: ${b.datetime}`);
+          trackReply(ownerEmail, 'booking');
           const calEvent = await createCalendarEvent(ownerEmail, {
             name:     b.name,
             email:    b.email,
@@ -462,14 +645,77 @@ setInterval(() => {
   }
 }, EMAIL_POLL_INTERVAL);
 
+// Follow-up check loop — every 30 minutes, check if leads replied
+setInterval(async () => {
+  const now = Date.now();
+  for (const [msgId, fu] of pendingFollowUps) {
+    if (now < fu.followUpAt || fu.attempts >= 2) {
+      if (fu.attempts >= 2) { pendingFollowUps.delete(msgId); persistFollowUps(); }
+      continue;
+    }
+    const entry = gmailTokens.get(fu.ownerEmail);
+    const config = EMAIL_AUTO_REPLY_ENABLED.get(fu.ownerEmail);
+    if (!entry || !config?.enabled) continue;
+
+    try {
+      const gmail = google.gmail({ version: 'v1', auth: entry.auth });
+      // Check if the sender replied in this thread
+      const thread = await gmail.users.threads.get({ userId: 'me', id: fu.threadId, format: 'metadata', metadataHeaders: ['From'] });
+      const senderReplied = thread.data.messages?.some(m => {
+        const f = m.payload.headers.find(h => h.name.toLowerCase() === 'from')?.value || '';
+        return f.toLowerCase().includes(fu.senderEmail.toLowerCase()) && m.id !== msgId;
+      });
+
+      if (senderReplied) {
+        pendingFollowUps.delete(msgId);
+        persistFollowUps();
+        continue;
+      }
+
+      // Send follow-up
+      const followUpNum = fu.attempts + 1;
+      const cfg = config.config || {};
+      const followUpReply = await generateEmailReply(
+        config.systemPrompt + `\n\nThis is follow-up #${followUpNum}. The customer hasn't replied to your previous email. Send a brief, friendly follow-up. Don't be pushy — just check in and remind them you're here to help.`,
+        fu.senderName, fu.senderEmail, fu.subject, `(Follow-up to previous conversation about: ${fu.subject})`
+      );
+
+      if (followUpReply?.reply) {
+        const brandedHtml = wrapInTemplate(followUpReply.reply, { ...cfg, ownerEmail: fu.ownerEmail }, false);
+        const replySubject = fu.subject.startsWith('Re:') ? fu.subject : `Re: ${fu.subject}`;
+        const headerLines = [
+          `From: ${fu.ownerEmail}`,
+          `To: ${fu.senderEmail}`,
+          `Subject: ${replySubject}`,
+          'MIME-Version: 1.0',
+          'Content-Type: text/html; charset=utf-8',
+        ].join('\r\n');
+        const raw = headerLines + '\r\n\r\n' + brandedHtml;
+        await gmail.users.messages.send({
+          userId: 'me',
+          requestBody: { raw: Buffer.from(raw).toString('base64url'), threadId: fu.threadId },
+        });
+        trackReply(fu.ownerEmail, 'followup');
+        console.log(`📧 Follow-up #${followUpNum} sent to ${fu.senderEmail} re: "${fu.subject}"`);
+      }
+
+      fu.attempts++;
+      fu.followUpAt = now + 48 * 60 * 60 * 1000; // next follow-up in 48h
+      persistFollowUps();
+    } catch (e) {
+      console.warn(`Follow-up check failed for ${fu.senderEmail}:`, e.message);
+    }
+  }
+}, 30 * 60 * 1000); // every 30 minutes
+
 // ─── Email Auto-Reply API Routes ─────────────────────────────────────────────
 
-// Enable auto-reply for an owner
+// Enable auto-reply for an owner (with extended config)
 app.post('/api/email-autoreply/enable', (req, res) => {
-  const { owner, systemPrompt } = req.body;
+  const { owner, systemPrompt, config: cfg } = req.body;
   if (!owner) return res.status(400).json({ error: 'owner required' });
   if (!gmailTokens.has(owner)) return res.status(400).json({ error: 'Gmail not connected for this owner' });
-  enableEmailAutoReply(owner, systemPrompt || 'You are a helpful business assistant.');
+  enableEmailAutoReply(owner, systemPrompt || 'You are a helpful business assistant.', cfg || {});
   res.json({ ok: true, owner, enabled: true });
 });
 
@@ -484,7 +730,8 @@ app.post('/api/email-autoreply/disable', (req, res) => {
 app.get('/api/email-autoreply/status', (req, res) => {
   const { owner } = req.query;
   const config = EMAIL_AUTO_REPLY_ENABLED.get(owner);
-  res.json({ owner, enabled: !!config?.enabled });
+  const stats = EMAIL_REPLY_STATS.get(owner) || { replied: 0, bookings: 0, followUps: 0, urgent: 0, lastReply: null };
+  res.json({ owner, enabled: !!config?.enabled, config: config?.config || {}, stats });
 });
 
 // Debug — show what's in the inbox and why each email would be skipped
@@ -985,6 +1232,8 @@ app.get('/connect/gmail', (req, res) => {
   const autoReplyConfig = EMAIL_AUTO_REPLY_ENABLED.get(ownerEmail);
   const autoReplyEnabled = !!autoReplyConfig?.enabled;
   const currentPrompt = autoReplyConfig?.systemPrompt || '';
+  const currentCfg = autoReplyConfig?.config || {};
+  const stats = EMAIL_REPLY_STATS.get(ownerEmail) || { replied: 0, bookings: 0, followUps: 0, urgent: 0, lastReply: null };
 
   res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Aria — Email Settings</title>
@@ -1083,6 +1332,18 @@ app.get('/connect/gmail', (req, res) => {
     </div>
 
     ${isConnected ? `
+    <!-- Stats Card -->
+    <div class="card">
+      <h2>📊 Performance</h2>
+      <div class="features">
+        <div class="feat"><div class="icon" style="font-size:28px;font-weight:800;color:#00e5a0;">${stats.replied}</div><div class="label">Emails Replied</div></div>
+        <div class="feat"><div class="icon" style="font-size:28px;font-weight:800;color:#38bdf8;">${stats.bookings}</div><div class="label">Bookings Made</div></div>
+        <div class="feat"><div class="icon" style="font-size:28px;font-weight:800;color:#fbbf24;">${stats.followUps}</div><div class="label">Follow-Ups Sent</div></div>
+        <div class="feat"><div class="icon" style="font-size:28px;font-weight:800;color:#ff6b6b;">${stats.urgent}</div><div class="label">Urgent Flagged</div></div>
+      </div>
+      ${stats.lastReply ? `<div style="font-size:12px;color:#6b6b8a;text-align:center;">Last reply: ${new Date(stats.lastReply).toLocaleString('en-GB')}</div>` : ''}
+    </div>
+
     <!-- Auto-Reply Card -->
     <div class="card">
       <h2>🤖 Email Auto-Reply</h2>
@@ -1106,12 +1367,88 @@ Example: You are Aria, the assistant for Smith Plumbing — a family plumbing bu
       <p class="hint">This tells Aria about your business so it can reply to emails accurately. The more detail you include, the better the replies.</p>
 
       <div style="margin-top:16px;">
-        <button class="btn btn-primary" onclick="savePrompt()">Save Business Description</button>
+        <button class="btn btn-primary" onclick="saveAll()">Save Settings</button>
       </div>
 
       <div class="divider"></div>
 
       <button class="btn btn-outline" onclick="testNow()" id="testBtn">Test — Check Inbox Now</button>
+    </div>
+
+    <!-- Business Details Card -->
+    <div class="card">
+      <h2>🏢 Business Details</h2>
+      <p>These details are used in your branded email signature.</p>
+
+      <label for="businessName">Business Name</label>
+      <input type="text" id="businessName" value="${currentCfg.businessName || ''}" placeholder="e.g. Smith Plumbing" style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:13px;color:#eee;font-family:inherit;outline:none;margin-bottom:14px;">
+
+      <label for="phone">Phone Number</label>
+      <input type="text" id="phone" value="${currentCfg.phone || ''}" placeholder="e.g. 07700 123456" style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:13px;color:#eee;font-family:inherit;outline:none;margin-bottom:14px;">
+
+      <label for="website">Website</label>
+      <input type="text" id="website" value="${currentCfg.website || ''}" placeholder="e.g. https://yoursite.co.uk" style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:13px;color:#eee;font-family:inherit;outline:none;margin-bottom:14px;">
+
+      <label for="brandColor">Brand Colour</label>
+      <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;">
+        <input type="color" id="brandColor" value="${currentCfg.brandColor || '#6C63FF'}" style="width:48px;height:40px;border:none;border-radius:8px;cursor:pointer;background:none;">
+        <input type="text" id="brandColorText" value="${currentCfg.brandColor || '#6C63FF'}" placeholder="#6C63FF" style="flex:1;padding:12px 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:13px;color:#eee;font-family:inherit;outline:none;">
+      </div>
+    </div>
+
+    <!-- Business Hours Card -->
+    <div class="card">
+      <h2>🕐 Business Hours</h2>
+      <p>Set your working hours so Aria gives appropriate out-of-hours replies.</p>
+
+      <div class="toggle-row" style="margin-top:12px;">
+        <div>
+          <div style="font-size:14px;font-weight:600;margin-bottom:2px;">Enable business hours</div>
+          <div style="font-size:12px;color:#6b6b8a;">Different replies outside working hours</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="hoursToggle" ${currentCfg.hoursStart ? 'checked' : ''}>
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px;">
+        <div>
+          <label for="hoursStart">Opens (24h)</label>
+          <select id="hoursStart" style="width:100%;padding:12px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:13px;color:#eee;font-family:inherit;">
+            ${Array.from({length:24}, (_,i) => `<option value="${i}" ${(currentCfg.hoursStart||9) === i ? 'selected' : ''}>${String(i).padStart(2,'0')}:00</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label for="hoursEnd">Closes (24h)</label>
+          <select id="hoursEnd" style="width:100%;padding:12px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:13px;color:#eee;font-family:inherit;">
+            ${Array.from({length:24}, (_,i) => `<option value="${i}" ${(currentCfg.hoursEnd||17) === i ? 'selected' : ''}>${String(i).padStart(2,'0')}:00</option>`).join('')}
+          </select>
+        </div>
+      </div>
+
+      <div class="toggle-row" style="margin-top:14px;">
+        <div style="font-size:13px;color:#9898b8;">Skip weekends</div>
+        <label class="toggle">
+          <input type="checkbox" id="skipWeekends" ${currentCfg.skipWeekends ? 'checked' : ''}>
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Follow-ups Card -->
+    <div class="card">
+      <h2>📬 Follow-Ups</h2>
+      <div class="toggle-row">
+        <div>
+          <div style="font-size:14px;font-weight:600;margin-bottom:2px;">Auto follow-up if no reply</div>
+          <div style="font-size:12px;color:#6b6b8a;">Sends a friendly check-in after 24h, then again at 48h</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="followUpsToggle" ${currentCfg.followUps !== false ? 'checked' : ''}>
+          <span class="slider"></span>
+        </label>
+      </div>
     </div>
 
     <!-- How It Works -->
@@ -1120,10 +1457,12 @@ Example: You are Aria, the assistant for Smith Plumbing — a family plumbing bu
       <p style="margin-bottom:8px;">Once enabled, Aria will:</p>
       <div style="font-size:13px;color:#9898b8;line-height:2;">
         1. Check your inbox every 3 minutes<br>
-        2. Read new unread emails<br>
-        3. Write a professional reply using your business info<br>
-        4. Send the reply from your Gmail<br>
-        5. If a booking is mentioned, add it to your Google Calendar
+        2. Read new unread emails (skip spam &amp; marketing automatically)<br>
+        3. Write a professional, branded reply using your business info<br>
+        4. Send the reply from your Gmail with your signature<br>
+        5. If a booking is mentioned, add it to your Google Calendar<br>
+        6. Flag urgent emails and alert you immediately<br>
+        7. Follow up with leads who don't reply within 24h
       </div>
     </div>
     ` : ''}
@@ -1142,6 +1481,29 @@ Example: You are Aria, the assistant for Smith Plumbing — a family plumbing bu
       setTimeout(() => { el.className = 'msg'; }, 4000);
     }
 
+    function getConfig() {
+      const hoursEnabled = document.getElementById('hoursToggle')?.checked;
+      return {
+        businessName: document.getElementById('businessName')?.value || '',
+        phone: document.getElementById('phone')?.value || '',
+        website: document.getElementById('website')?.value || '',
+        brandColor: document.getElementById('brandColorText')?.value || '#6C63FF',
+        hoursStart: hoursEnabled ? parseInt(document.getElementById('hoursStart')?.value || '9') : null,
+        hoursEnd: hoursEnabled ? parseInt(document.getElementById('hoursEnd')?.value || '17') : null,
+        skipWeekends: document.getElementById('skipWeekends')?.checked || false,
+        followUps: document.getElementById('followUpsToggle')?.checked !== false,
+        timezone: 0,
+      };
+    }
+
+    // Sync colour picker with text input
+    document.getElementById('brandColor')?.addEventListener('input', e => {
+      document.getElementById('brandColorText').value = e.target.value;
+    });
+    document.getElementById('brandColorText')?.addEventListener('input', e => {
+      if (/^#[0-9a-f]{6}$/i.test(e.target.value)) document.getElementById('brandColor').value = e.target.value;
+    });
+
     async function toggleAutoReply(enabled) {
       const prompt = document.getElementById('prompt')?.value || '';
       if (enabled && !prompt.trim()) {
@@ -1150,24 +1512,25 @@ Example: You are Aria, the assistant for Smith Plumbing — a family plumbing bu
         return;
       }
       const endpoint = enabled ? '/api/email-autoreply/enable' : '/api/email-autoreply/disable';
-      const body = enabled ? { owner, systemPrompt: prompt } : { owner };
+      const body = enabled ? { owner, systemPrompt: prompt, config: getConfig() } : { owner };
       const r = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const data = await r.json();
       if (data.ok) showMsg(enabled ? 'Auto-reply enabled!' : 'Auto-reply disabled.', 'success');
       else showMsg(data.error || 'Something went wrong.', 'error');
     }
 
-    async function savePrompt() {
-      const prompt = document.getElementById('prompt').value.trim();
+    async function saveAll() {
+      const prompt = document.getElementById('prompt')?.value?.trim();
       if (!prompt) { showMsg('Please enter a business description.', 'error'); return; }
       const toggle = document.getElementById('autoReplyToggle');
+      const body = { owner, systemPrompt: prompt, config: getConfig() };
       if (toggle.checked) {
-        const r = await fetch('/api/email-autoreply/enable', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ owner, systemPrompt: prompt }) });
+        const r = await fetch('/api/email-autoreply/enable', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         const data = await r.json();
-        if (data.ok) showMsg('Business description saved!', 'success');
+        if (data.ok) showMsg('All settings saved!', 'success');
         else showMsg(data.error || 'Failed to save.', 'error');
       } else {
-        showMsg('Saved! Turn on auto-reply to start using it.', 'success');
+        showMsg('Settings saved! Turn on auto-reply to activate.', 'success');
       }
     }
 
@@ -3188,6 +3551,8 @@ setInterval(async () => {
 loadSavedTokens();
 loadSavedAutoReply();
 loadRepliedEmails();
+loadEmailStats();
+loadFollowUps();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`\n  ✦ Aria Chatbot Server v5.1\n  → Admin: http://localhost:${PORT}/admin?pass=${ADMIN}\n  → Health: http://localhost:${PORT}/health\n`));
