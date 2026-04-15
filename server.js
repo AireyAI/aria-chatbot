@@ -70,6 +70,7 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use('/tests', express.static(resolve('tests')));
 app.use(express.static('.'));
 
 // ─── Email ────────────────────────────────────────────────────────────────────
