@@ -247,6 +247,79 @@ const EMAIL_AUTO_REPLY_ENABLED = new Map(); // ownerEmail → { enabled, systemP
 const EMAIL_REPLY_STATS = new Map();       // ownerEmail → { replied, bookings, lastReply, followUps }
 const STATS_FILE = resolve('data/email-stats.json');
 const FOLLOWUP_FILE = resolve('data/email-followups.json');
+const PASSWORDS_FILE = resolve('data/dashboard-passwords.json');
+const SESSIONS_FILE = resolve('data/dashboard-sessions.json');
+const dashboardPasswords = new Map(); // ownerEmail → hashed password
+const dashboardSessions = new Map();  // token → { ownerEmail, expiresAt }
+
+function loadPasswords() {
+  try {
+    if (existsSync(PASSWORDS_FILE)) {
+      const saved = JSON.parse(readFileSync(PASSWORDS_FILE, 'utf8'));
+      for (const [email, hash] of Object.entries(saved)) dashboardPasswords.set(email, hash);
+    }
+  } catch (e) { console.warn('Failed to load passwords:', e.message); }
+}
+
+function persistPasswords() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [email, hash] of dashboardPasswords) obj[email] = hash;
+    writeFileSync(PASSWORDS_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist passwords:', e.message); }
+}
+
+function loadSessions() {
+  try {
+    if (existsSync(SESSIONS_FILE)) {
+      const saved = JSON.parse(readFileSync(SESSIONS_FILE, 'utf8'));
+      for (const [token, session] of Object.entries(saved)) {
+        if (session.expiresAt > Date.now()) dashboardSessions.set(token, session);
+      }
+    }
+  } catch (e) { console.warn('Failed to load sessions:', e.message); }
+}
+
+function persistSessions() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [token, session] of dashboardSessions) {
+      if (session.expiresAt > Date.now()) obj[token] = session;
+    }
+    writeFileSync(SESSIONS_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist sessions:', e.message); }
+}
+
+// Simple hash — not crypto-grade but fine for dashboard PINs
+function simpleHash(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return 'h_' + Math.abs(hash).toString(36);
+}
+
+function generateSessionToken() {
+  return Array.from({ length: 32 }, () => Math.random().toString(36)[2]).join('');
+}
+
+function createSession(ownerEmail) {
+  const token = generateSessionToken();
+  dashboardSessions.set(token, { ownerEmail, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 }); // 7 days
+  persistSessions();
+  return token;
+}
+
+function validateSession(token, ownerEmail) {
+  const session = dashboardSessions.get(token);
+  if (!session) return false;
+  if (session.expiresAt < Date.now()) { dashboardSessions.delete(token); persistSessions(); return false; }
+  return session.ownerEmail === ownerEmail;
+}
 const pendingFollowUps = new Map();        // msgId → { ownerEmail, senderEmail, senderName, subject, sentAt, followUpAt, attempts }
 
 function loadEmailStats() {
@@ -1217,8 +1290,44 @@ async function createCalendarEvent(ownerEmail, booking) {
 
 // Connection page — owner visits this URL to connect their Gmail
 // e.g. http://localhost:3000/connect/gmail?owner=pete@gmail.com
+// Set password for dashboard
+app.post('/api/dashboard/set-password', (req, res) => {
+  const { owner, password } = req.body;
+  if (!owner || !password) return res.status(400).json({ error: 'owner and password required' });
+  if (password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+  if (dashboardPasswords.has(owner)) return res.status(400).json({ error: 'Password already set. Use reset if needed.' });
+  dashboardPasswords.set(owner, simpleHash(password));
+  persistPasswords();
+  const token = createSession(owner);
+  res.json({ ok: true, token });
+});
+
+// Login to dashboard
+app.post('/api/dashboard/login', (req, res) => {
+  const { owner, password } = req.body;
+  if (!owner || !password) return res.status(400).json({ error: 'owner and password required' });
+  const stored = dashboardPasswords.get(owner);
+  if (!stored) return res.status(400).json({ error: 'No password set' });
+  if (simpleHash(password) !== stored) return res.status(401).json({ error: 'Wrong password' });
+  const token = createSession(owner);
+  res.json({ ok: true, token });
+});
+
+// Reset password (requires current password)
+app.post('/api/dashboard/reset-password', (req, res) => {
+  const { owner, currentPassword, newPassword } = req.body;
+  if (!owner || !currentPassword || !newPassword) return res.status(400).json({ error: 'All fields required' });
+  const stored = dashboardPasswords.get(owner);
+  if (!stored || simpleHash(currentPassword) !== stored) return res.status(401).json({ error: 'Wrong current password' });
+  if (newPassword.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+  dashboardPasswords.set(owner, simpleHash(newPassword));
+  persistPasswords();
+  res.json({ ok: true });
+});
+
 app.get('/connect/gmail', (req, res) => {
   const ownerEmail = req.query.owner || '';
+  const sessionToken = req.query.s || '';
   if (!process.env.GOOGLE_CLIENT_ID) {
     return res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center">
       <h2>⚠️ Google credentials not configured</h2>
@@ -1226,6 +1335,116 @@ app.get('/connect/gmail', (req, res) => {
     </body></html>`);
   }
 
+  const hasPassword = dashboardPasswords.has(ownerEmail);
+  const isAuthenticated = sessionToken && validateSession(sessionToken, ownerEmail);
+
+  // If password exists but not authenticated, show login
+  if (hasPassword && !isAuthenticated) {
+    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Aria — Login</title>
+    <style>
+      *{box-sizing:border-box;margin:0;padding:0}
+      body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#eee;}
+      .box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:36px;max-width:400px;width:100%;text-align:center;}
+      .logo span{font-size:28px;font-weight:800;color:#fff;letter-spacing:-0.5px;}
+      .logo span em{font-style:normal;color:#00e5a0;}
+      h2{font-size:18px;margin:24px 0 8px;}
+      p{font-size:13px;color:#9898b8;margin-bottom:20px;}
+      .email-badge{display:inline-block;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:5px 14px;font-size:13px;color:#fff;font-weight:600;margin-bottom:20px;}
+      input[type=password]{width:100%;padding:14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:15px;color:#eee;font-family:inherit;outline:none;text-align:center;letter-spacing:2px;margin-bottom:16px;}
+      input[type=password]:focus{border-color:rgba(0,229,160,0.4);}
+      .btn{display:block;width:100%;padding:14px;background:#00e5a0;color:#0d0d1f;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;}
+      .btn:hover{opacity:.88;}
+      .msg{padding:10px;border-radius:8px;font-size:13px;margin-bottom:14px;display:none;}
+      .msg.error{display:block;background:rgba(255,80,80,0.1);border:1px solid rgba(255,80,80,0.2);color:#ff6b6b;}
+      .footer{margin-top:24px;font-size:12px;color:#6b6b8a;}
+      .footer a{color:#00e5a0;text-decoration:none;}
+    </style>
+    </head><body>
+    <div class="box">
+      <div class="logo"><span>Aria<em>Ai</em></span></div>
+      <h2>Welcome back</h2>
+      <div class="email-badge">${ownerEmail}</div>
+      <div id="msg" class="msg"></div>
+      <input type="password" id="pw" placeholder="Enter your password" autofocus onkeydown="if(event.key==='Enter')login()">
+      <button class="btn" onclick="login()">Login</button>
+      <div class="footer">Powered by <a href="https://aireyai.co.uk">AireyAi</a></div>
+    </div>
+    <script>
+      async function login() {
+        const pw = document.getElementById('pw').value;
+        if (!pw) return;
+        const r = await fetch('/api/dashboard/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({owner:'${ownerEmail}',password:pw}) });
+        const data = await r.json();
+        if (data.ok) {
+          window.location.href = '/connect/gmail?owner=${encodeURIComponent(ownerEmail)}&s=' + data.token;
+        } else {
+          const el = document.getElementById('msg');
+          el.textContent = data.error || 'Wrong password';
+          el.className = 'msg error';
+        }
+      }
+    </script>
+    </body></html>`);
+  }
+
+  // If no password set, show create password screen
+  if (!hasPassword) {
+    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Aria — Create Password</title>
+    <style>
+      *{box-sizing:border-box;margin:0;padding:0}
+      body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#eee;}
+      .box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:36px;max-width:400px;width:100%;text-align:center;}
+      .logo span{font-size:28px;font-weight:800;color:#fff;letter-spacing:-0.5px;}
+      .logo span em{font-style:normal;color:#00e5a0;}
+      h2{font-size:18px;margin:24px 0 8px;}
+      p{font-size:13px;color:#9898b8;margin-bottom:20px;line-height:1.6;}
+      .email-badge{display:inline-block;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:5px 14px;font-size:13px;color:#fff;font-weight:600;margin-bottom:20px;}
+      input[type=password]{width:100%;padding:14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:15px;color:#eee;font-family:inherit;outline:none;text-align:center;letter-spacing:2px;margin-bottom:12px;}
+      input[type=password]:focus{border-color:rgba(0,229,160,0.4);}
+      .btn{display:block;width:100%;padding:14px;background:#00e5a0;color:#0d0d1f;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;}
+      .btn:hover{opacity:.88;}
+      .msg{padding:10px;border-radius:8px;font-size:13px;margin-bottom:14px;display:none;}
+      .msg.error{display:block;background:rgba(255,80,80,0.1);border:1px solid rgba(255,80,80,0.2);color:#ff6b6b;}
+      .hint{font-size:11.5px;color:#6b6b8a;margin-bottom:16px;}
+      .footer{margin-top:24px;font-size:12px;color:#6b6b8a;}
+      .footer a{color:#00e5a0;text-decoration:none;}
+    </style>
+    </head><body>
+    <div class="box">
+      <div class="logo"><span>Aria<em>Ai</em></span></div>
+      <h2>Create your password</h2>
+      <p>This password protects your Aria dashboard. You'll need it each time you log in.</p>
+      <div class="email-badge">${ownerEmail}</div>
+      <div id="msg" class="msg"></div>
+      <input type="password" id="pw" placeholder="Choose a password" autofocus>
+      <input type="password" id="pw2" placeholder="Confirm password" onkeydown="if(event.key==='Enter')createPw()">
+      <p class="hint">Minimum 4 characters</p>
+      <button class="btn" onclick="createPw()">Create Password</button>
+      <div class="footer">Powered by <a href="https://aireyai.co.uk">AireyAi</a></div>
+    </div>
+    <script>
+      async function createPw() {
+        const pw = document.getElementById('pw').value;
+        const pw2 = document.getElementById('pw2').value;
+        const el = document.getElementById('msg');
+        if (!pw || pw.length < 4) { el.textContent = 'Password must be at least 4 characters'; el.className = 'msg error'; return; }
+        if (pw !== pw2) { el.textContent = 'Passwords don\\'t match'; el.className = 'msg error'; return; }
+        const r = await fetch('/api/dashboard/set-password', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({owner:'${ownerEmail}',password:pw}) });
+        const data = await r.json();
+        if (data.ok) {
+          window.location.href = '/connect/gmail?owner=${encodeURIComponent(ownerEmail)}&s=' + data.token;
+        } else {
+          el.textContent = data.error || 'Failed to create password';
+          el.className = 'msg error';
+        }
+      }
+    </script>
+    </body></html>`);
+  }
+
+  // ── Authenticated dashboard ──
   const isConnected = gmailTokens.has(ownerEmail);
   const authUrl = getAuthUrl(ownerEmail);
 
@@ -1558,12 +1777,14 @@ app.get('/auth/gmail/callback', async (req, res) => {
     const client = makeOAuthClient();
     const { tokens } = await client.getToken(code);
     await saveGmailTokens(ownerEmail, tokens);
-    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><style>body{font-family:sans-serif;background:#f0f0f8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}.box{background:white;border-radius:20px;padding:40px;text-align:center;box-shadow:0 8px 40px rgba(0,0,0,.12)}</style></head>
+    // Create a session so they go straight to the dashboard
+    const token = createSession(ownerEmail);
+    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><style>body{font-family:sans-serif;background:#0d0d1f;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;color:#eee}.box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:40px;text-align:center;max-width:440px;}</style></head>
     <body><div class="box">
       <div style="font-size:48px;margin-bottom:16px">🎉</div>
-      <h1 style="color:#1a1a2e;margin-bottom:10px">Gmail Connected!</h1>
-      <p style="color:#666;font-size:14px">Your chatbot will now send emails from <strong>${ownerEmail}</strong>.</p>
-      <p style="color:#666;font-size:13px;margin-top:12px">You can close this window.</p>
+      <h1 style="margin-bottom:10px">Gmail Connected!</h1>
+      <p style="color:#9898b8;font-size:14px">Your chatbot will now send emails from <strong style="color:#00e5a0">${ownerEmail}</strong>.</p>
+      <a href="/connect/gmail?owner=${encodeURIComponent(ownerEmail)}&s=${token}" style="display:inline-block;margin-top:20px;padding:14px 28px;background:#00e5a0;color:#0d0d1f;border-radius:12px;text-decoration:none;font-weight:600;">Go to Dashboard</a>
     </div></body></html>`);
   } catch (e) {
     console.error('Gmail OAuth error:', e.message);
@@ -3553,6 +3774,8 @@ loadSavedAutoReply();
 loadRepliedEmails();
 loadEmailStats();
 loadFollowUps();
+loadPasswords();
+loadSessions();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`\n  ✦ Aria Chatbot Server v5.1\n  → Admin: http://localhost:${PORT}/admin?pass=${ADMIN}\n  → Health: http://localhost:${PORT}/health\n`));
