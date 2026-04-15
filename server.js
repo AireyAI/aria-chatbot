@@ -3296,6 +3296,207 @@ app.post('/api/booking', async (req, res) => {
   res.json({ ok:true, calendarAdded: !!calEvent, calendarLink: b.calendarLink });
 });
 
+// ─── Smart Chat Actions ──────────────────────────────────────────────────────
+
+// Calendar availability check — returns free slots for the next 5 days
+app.get('/api/calendar/availability', async (req, res) => {
+  const owner = ownerTo(req.query.owner);
+  if (!owner || !gmailTokens.has(owner)) return res.json({ slots: [], message: 'Calendar not connected' });
+
+  try {
+    const entry = gmailTokens.get(owner);
+    const calendar = google.calendar({ version: 'v3', auth: entry.auth });
+    const now = new Date();
+    const end = new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000);
+
+    const { data } = await calendar.freebusy.query({
+      requestBody: {
+        timeMin: now.toISOString(),
+        timeMax: end.toISOString(),
+        timeZone: 'Europe/London',
+        items: [{ id: 'primary' }],
+      },
+    });
+
+    const busy = (data.calendars?.primary?.busy || []).map(b => ({
+      start: new Date(b.start),
+      end: new Date(b.end),
+    }));
+
+    // Generate available 1-hour slots between 9am-5pm
+    const slots = [];
+    for (let d = 0; d < 5; d++) {
+      const day = new Date(now);
+      day.setDate(day.getDate() + d);
+      if (day.getDay() === 0 || day.getDay() === 6) continue; // skip weekends
+
+      for (let h = 9; h < 17; h++) {
+        const slotStart = new Date(day);
+        slotStart.setHours(h, 0, 0, 0);
+        const slotEnd = new Date(slotStart);
+        slotEnd.setHours(h + 1);
+
+        if (slotStart < now) continue;
+
+        const isBusy = busy.some(b => slotStart < b.end && slotEnd > b.start);
+        if (!isBusy) {
+          slots.push({
+            date: slotStart.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short' }),
+            time: `${h}:00 - ${h + 1}:00`,
+            iso: slotStart.toISOString(),
+          });
+        }
+      }
+    }
+
+    res.json({ slots: slots.slice(0, 10) });
+  } catch (e) {
+    console.warn('Calendar availability check failed:', e.message);
+    res.json({ slots: [], message: 'Could not check calendar' });
+  }
+});
+
+// Callback request — visitor wants a call back
+app.post('/api/chat/callback', async (req, res) => {
+  const { name, phone, ownerEmail, siteName, botName, notes } = req.body;
+  if (!phone) return res.status(400).json({ error: 'Phone number required' });
+  const alertTo = ownerTo(ownerEmail);
+
+  await smartSend({
+    ownerEmail: alertTo,
+    to: alertTo,
+    subject: `📞 Callback Request: ${name || 'Visitor'} — ${siteName || 'Website'}`,
+    html: `<div style="font-family:-apple-system,sans-serif;max-width:500px;margin:0 auto;padding:24px;">
+      <h2 style="margin:0 0 16px;color:#1a1a2e">📞 Callback Requested</h2>
+      <div style="background:#f8f8fc;border-radius:12px;padding:20px;margin-bottom:16px;">
+        <p style="margin:0 0 8px;font-size:14px;"><strong>Name:</strong> ${name || 'Not provided'}</p>
+        <p style="margin:0 0 8px;font-size:14px;"><strong>Phone:</strong> <a href="tel:${phone}">${phone}</a></p>
+        ${notes ? `<p style="margin:0;font-size:14px;"><strong>Context:</strong> ${notes}</p>` : ''}
+      </div>
+      <p style="font-size:13px;color:#666;">From ${siteName || 'your website'} chat • ${new Date().toLocaleString('en-GB')}</p>
+    </div>`,
+  });
+
+  await slack([
+    { type: 'header', text: { type: 'plain_text', text: '📞 Callback Request' } },
+    { type: 'section', text: { type: 'mrkdwn', text: `*${name || 'Visitor'}* wants a call back\nPhone: ${phone}\nSite: ${siteName || 'Website'}${notes ? '\nContext: ' + notes : ''}` } },
+  ], `Callback: ${name || phone}`);
+
+  res.json({ ok: true });
+});
+
+// Quote request — visitor wants a quote
+app.post('/api/chat/quote', async (req, res) => {
+  const { name, email, phone, details, ownerEmail, siteName, botName } = req.body;
+  if (!details) return res.status(400).json({ error: 'Details required' });
+  const alertTo = ownerTo(ownerEmail);
+
+  await smartSend({
+    ownerEmail: alertTo,
+    to: alertTo,
+    replyTo: email || undefined,
+    subject: `💰 Quote Request: ${name || 'Visitor'} — ${siteName || 'Website'}`,
+    html: `<div style="font-family:-apple-system,sans-serif;max-width:500px;margin:0 auto;padding:24px;">
+      <h2 style="margin:0 0 16px;color:#1a1a2e">💰 Quote Requested</h2>
+      <div style="background:#f8f8fc;border-radius:12px;padding:20px;margin-bottom:16px;">
+        <p style="margin:0 0 8px;font-size:14px;"><strong>Name:</strong> ${name || 'Not provided'}</p>
+        ${email ? `<p style="margin:0 0 8px;font-size:14px;"><strong>Email:</strong> <a href="mailto:${email}">${email}</a></p>` : ''}
+        ${phone ? `<p style="margin:0 0 8px;font-size:14px;"><strong>Phone:</strong> <a href="tel:${phone}">${phone}</a></p>` : ''}
+        <p style="margin:0;font-size:14px;"><strong>What they need:</strong></p>
+        <p style="margin:4px 0 0;font-size:14px;color:#333;white-space:pre-wrap;">${details}</p>
+      </div>
+      <p style="font-size:13px;color:#666;">From ${siteName || 'your website'} chat • ${new Date().toLocaleString('en-GB')}</p>
+    </div>`,
+  });
+
+  // Also save as a lead if email provided
+  if (email && !leadStatuses.has(email)) {
+    leadStatuses.set(email, { status: 'new', notes: 'Quote request: ' + details.slice(0, 200), updatedAt: new Date(), name, siteName });
+    save('leadStatuses', Array.from(leadStatuses.entries()));
+  }
+
+  await slack([
+    { type: 'header', text: { type: 'plain_text', text: '💰 Quote Request' } },
+    { type: 'section', text: { type: 'mrkdwn', text: `*${name || 'Visitor'}*${email ? ' (' + email + ')' : ''}\nSite: ${siteName || 'Website'}\n${details.slice(0, 300)}` } },
+  ], `Quote request: ${name || 'Visitor'}`);
+
+  res.json({ ok: true });
+});
+
+// Chat summary — sent to owner when conversation ends
+app.post('/api/chat/summary', async (req, res) => {
+  const { messages, ownerEmail, siteName, visitorName, visitorEmail, visitorPhone, page } = req.body;
+  if (!messages?.length) return res.json({ ok: true });
+  const alertTo = ownerTo(ownerEmail);
+  if (!alertTo) return res.json({ ok: true });
+
+  // Only send summary for meaningful conversations (3+ exchanges)
+  const botMsgs = messages.filter(m => m.role === 'assistant').length;
+  if (botMsgs < 3) return res.json({ ok: true });
+
+  const convoHtml = messages.map(m => {
+    const who = m.role === 'user' ? (visitorName || 'Visitor') : 'Aria';
+    const bg = m.role === 'user' ? '#e8f4fd' : '#f0f0f0';
+    return `<div style="background:${bg};border-radius:8px;padding:10px 14px;margin-bottom:6px;font-size:13px;"><strong>${who}:</strong> ${m.content.slice(0, 500)}</div>`;
+  }).join('');
+
+  await smartSend({
+    ownerEmail: alertTo,
+    to: alertTo,
+    subject: `💬 Chat Summary${visitorName ? ': ' + visitorName : ''} — ${siteName || 'Website'}`,
+    html: `<div style="font-family:-apple-system,sans-serif;max-width:600px;margin:0 auto;padding:24px;">
+      <h2 style="margin:0 0 16px;color:#1a1a2e">💬 Chat Conversation</h2>
+      ${visitorName || visitorEmail || visitorPhone ? `<div style="background:#f8f8fc;border-radius:12px;padding:16px;margin-bottom:16px;font-size:13px;">
+        ${visitorName ? `<strong>Name:</strong> ${visitorName}<br>` : ''}
+        ${visitorEmail ? `<strong>Email:</strong> ${visitorEmail}<br>` : ''}
+        ${visitorPhone ? `<strong>Phone:</strong> ${visitorPhone}<br>` : ''}
+        <strong>Page:</strong> ${page || 'Unknown'}
+      </div>` : ''}
+      <div style="margin-bottom:16px;">${convoHtml}</div>
+      <p style="font-size:12px;color:#999;">From ${siteName || 'your website'} • ${new Date().toLocaleString('en-GB')} • ${messages.length} messages</p>
+    </div>`,
+  });
+
+  res.json({ ok: true });
+});
+
+// Auto lead capture from chat — saves contact info detected in conversation
+app.post('/api/chat/auto-lead', async (req, res) => {
+  const { name, email, phone, ownerEmail, siteName, page, sessionId } = req.body;
+  if (!email && !phone) return res.status(400).json({ error: 'Need email or phone' });
+  const alertTo = ownerTo(ownerEmail);
+  const key = email || phone;
+
+  if (!leadStatuses.has(key)) {
+    leadStatuses.set(key, { status: 'new', notes: 'Auto-captured from chat', updatedAt: new Date(), name, page, siteName });
+    save('leadStatuses', Array.from(leadStatuses.entries()));
+
+    await smartSend({
+      ownerEmail: alertTo,
+      to: alertTo,
+      replyTo: email || undefined,
+      subject: `🎯 Auto-captured Lead: ${name || email || phone} — ${siteName || 'Website'}`,
+      html: `<div style="font-family:-apple-system,sans-serif;max-width:500px;margin:0 auto;padding:24px;">
+        <h2 style="margin:0 0 16px;color:#1a1a2e">🎯 Lead Auto-Captured</h2>
+        <p style="font-size:14px;color:#666;margin-bottom:16px;">Aria detected contact info during a chat conversation.</p>
+        <div style="background:#f8f8fc;border-radius:12px;padding:20px;">
+          ${name ? `<p style="margin:0 0 8px;font-size:14px;"><strong>Name:</strong> ${name}</p>` : ''}
+          ${email ? `<p style="margin:0 0 8px;font-size:14px;"><strong>Email:</strong> <a href="mailto:${email}">${email}</a></p>` : ''}
+          ${phone ? `<p style="margin:0;font-size:14px;"><strong>Phone:</strong> <a href="tel:${phone}">${phone}</a></p>` : ''}
+        </div>
+        <p style="font-size:13px;color:#666;margin-top:16px;">From ${siteName || 'your website'} • ${page || ''} • ${new Date().toLocaleString('en-GB')}</p>
+      </div>`,
+    });
+
+    await slack([
+      { type: 'header', text: { type: 'plain_text', text: '🎯 Auto-Captured Lead' } },
+      { type: 'section', text: { type: 'mrkdwn', text: `*${name || 'Unknown'}*\n${email ? 'Email: ' + email + '\n' : ''}${phone ? 'Phone: ' + phone : ''}\nSite: ${siteName || 'Website'}` } },
+    ], `Auto-lead: ${email || phone}`);
+  }
+
+  res.json({ ok: true });
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  DROPSHIPPING ENGINE — CJ Dropshipping API v2
 //  Flow: Shopify order paid → find supplier SKU → auto-order → track → notify

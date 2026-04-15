@@ -180,6 +180,12 @@
     siteName:        _a('siteName',    ''),       // site/business name shown in follow-up email
     followupEnabled: _a('followup',    'true') !== 'false', // send visitor a follow-up email after lead
     businessType:    _a('type',         'generic'),          // restaurant|salon|gym|clinic|agency|ecommerce|law|realestate|trades
+
+    // Smart actions — contact details for ::CONTACT, ::DIRECTIONS
+    location:        _a('location',     ''),       // business address for directions
+    phone:           _a('phone',        ''),       // phone number for contact card
+    contactEmail:    _a('contactEmail', ''),       // contact email (defaults to ownerEmail)
+    whatsapp:        _a('whatsapp',     ''),       // WhatsApp number for contact card
   };
 
   // Apply business type preset (any explicit data-* overrides the preset)
@@ -197,6 +203,11 @@
   const AB_URL      = BASE + '/api/ab';
   const SHOPIFY_URL = BASE + '/api/shopify/order';
   const GAP_URL     = BASE + '/api/gap';
+  const AVAIL_URL   = BASE + '/api/calendar/availability';
+  const CALLBACK_URL = BASE + '/api/chat/callback';
+  const QUOTE_URL   = BASE + '/api/chat/quote';
+  const SUMMARY_URL = BASE + '/api/chat/summary';
+  const AUTOLEAD_URL = BASE + '/api/chat/auto-lead';
 
   const SESSION_ID = (() => {
     const k = '_ac_sid'; let id = sessionStorage.getItem(k);
@@ -1615,9 +1626,13 @@ B) INFORM → give the information that moves them forward (not generic, specifi
 C) CLOSE → once you understand their need, guide to the natural next step:
    - Interest in a service → "Want me to get that booked?" or output ::BOOKING
    - Comparing options → help them choose, then: "Shall I get that sorted for you?"
-   - Asking about pricing → answer, then: "Would it be worth a quick call to go through what fits your budget?"
+   - Asking about pricing → answer, then offer a quote: gather details and output ::QUOTE
    - Just browsing → give real value, then: "If you'd like, I can send you the key info by email so you have it for later"
-   - Asking about availability → answer, then immediately offer to reserve
+   - Asking about availability → output ::CHECK_AVAILABILITY to show real calendar slots
+   - Wants to speak to someone → collect phone and output ::CALLBACK
+   - Asking "where are you" / directions → output ::DIRECTIONS
+   - Asking for contact info / phone number → output ::CONTACT
+   - Asking "what do you offer" / services → output ::SERVICES then discuss
 
 SOFT CLOSE PHRASES (use naturally, not every message — rotate them):
 - "Want me to get that booked in for you?"
@@ -1660,6 +1675,12 @@ Use sparingly — only when genuinely helpful:
 ::VIDEO[url]               — embed video
 ::DOCUMENT[url|Name]       — downloadable file
 ::BOOKING                  — open booking form
+::CHECK_AVAILABILITY       — show real available calendar slots (use when asked "when are you free?" etc.)
+::CALLBACK{"name":"...","phone":"...","notes":"..."}  — visitor wants a call back (use ONLY after they give their phone number)
+::QUOTE{"name":"...","email":"...","phone":"...","details":"what they need"}  — send a quote request to the business (use after gathering what they need)
+::DIRECTIONS               — show clickable Google Maps directions to the business
+::CONTACT                  — show contact card with phone, email, WhatsApp
+::SERVICES                 — show all services as clickable cards
 
 ━━━ FOLLOW-UPS ━━━
 End every response with this line. Make them the NEXT LOGICAL STEP in the visitor's journey toward a decision — not generic questions.
@@ -1736,6 +1757,44 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     if (/::BOOKING/.test(text) && CONFIG.booking) {
       text = text.replace(/::BOOKING/g, '');
       setTimeout(() => startBooking(), 400);
+    }
+    // Check availability — fetch real calendar slots
+    if (/::CHECK_AVAILABILITY/.test(text)) {
+      text = text.replace(/::CHECK_AVAILABILITY/g, '');
+      setTimeout(() => fetchAvailability(), 400);
+    }
+    // Callback request — extract phone + name from JSON
+    const cbMatch = text.match(/::CALLBACK\{([^}]+)\}/);
+    if (cbMatch) {
+      text = text.replace(/::CALLBACK\{[^}]+\}/g, '');
+      try {
+        const cb = JSON.parse('{' + cbMatch[1] + '}');
+        setTimeout(() => handleCallback(cb), 400);
+      } catch {}
+    }
+    // Quote request — extract details
+    const quoteMatch = text.match(/::QUOTE\{([^}]+)\}/);
+    if (quoteMatch) {
+      text = text.replace(/::QUOTE\{[^}]+\}/g, '');
+      try {
+        const q = JSON.parse('{' + quoteMatch[1] + '}');
+        setTimeout(() => handleQuote(q), 400);
+      } catch {}
+    }
+    // Directions — show map link
+    if (/::DIRECTIONS/.test(text)) {
+      text = text.replace(/::DIRECTIONS/g, '');
+      setTimeout(() => showDirections(), 400);
+    }
+    // Contact card — show clickable contact info
+    if (/::CONTACT/.test(text)) {
+      text = text.replace(/::CONTACT/g, '');
+      setTimeout(() => showContactCard(), 400);
+    }
+    // Services menu — show service cards
+    if (/::SERVICES/.test(text)) {
+      text = text.replace(/::SERVICES/g, '');
+      setTimeout(() => showServices(), 400);
     }
     return { text: text.trim(), richBtns, richImgs, richDocs, richVideos, showHandoff };
   }
@@ -1920,6 +1979,154 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
   }
 
   // =====================================================
+  //  SMART ACTION HANDLERS
+  // =====================================================
+
+  // Fetch and display available calendar slots
+  async function fetchAvailability() {
+    const card = document.createElement('div');
+    card.className = 'ac-availability-card';
+    card.innerHTML = '<p style="font-size:13px;color:#888;">Checking availability...</p>';
+    insertBefore(card); scrollBottom();
+    try {
+      const r = await fetch(`${AVAIL_URL}?owner=${encodeURIComponent(CONFIG.ownerEmail || '')}`);
+      const data = await r.json();
+      if (!data.slots?.length) {
+        card.innerHTML = '<p style="font-size:13px;color:#888;">No available slots found — please contact us directly.</p>';
+        return;
+      }
+      card.innerHTML = '<p style="font-size:13px;font-weight:600;margin:0 0 8px;">Available slots:</p>' +
+        data.slots.map(s =>
+          `<button class="ac-slot-btn" onclick="this.closest('[class*=ac-]').querySelectorAll('.ac-slot-btn').forEach(b=>b.classList.remove('selected'));this.classList.add('selected');window._selectedSlot='${s.date} ${s.time}';" style="display:block;width:100%;text-align:left;padding:8px 12px;margin:4px 0;border:1px solid rgba(0,0,0,0.1);border-radius:8px;background:#fff;cursor:pointer;font-size:13px;transition:all .15s;">
+            <strong>${s.date}</strong> — ${s.time}
+          </button>`
+        ).join('') +
+        '<button onclick="if(window._selectedSlot){window.AriaChat.send(&quot;I would like to book &quot;+window._selectedSlot);this.parentElement.remove();}" style="margin-top:8px;padding:10px 16px;background:var(--ac-color,#6C63FF);color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;width:100%;">Book this slot</button>';
+      scrollBottom();
+    } catch {
+      card.innerHTML = '<p style="font-size:13px;color:#c00;">Could not check availability.</p>';
+    }
+  }
+
+  // Handle callback request
+  async function handleCallback(cb) {
+    const card = document.createElement('div');
+    card.className = 'ac-action-card';
+    card.innerHTML = '<p style="font-size:13px;color:#00c853;font-weight:600;">✓ Callback request sent — someone will call you shortly.</p>';
+    insertBefore(card); scrollBottom();
+    try {
+      await fetch(CALLBACK_URL, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: cb.name || userName, phone: cb.phone, ownerEmail: CONFIG.ownerEmail, siteName: CONFIG.siteName || document.title, notes: cb.notes || '' }),
+      });
+    } catch {}
+    trackEvent('callback_requested', { phone: cb.phone });
+  }
+
+  // Handle quote request
+  async function handleQuote(q) {
+    const card = document.createElement('div');
+    card.className = 'ac-action-card';
+    card.innerHTML = '<p style="font-size:13px;color:#00c853;font-weight:600;">✓ Quote request sent — we\'ll get back to you with pricing.</p>';
+    insertBefore(card); scrollBottom();
+    try {
+      await fetch(QUOTE_URL, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: q.name || userName, email: q.email, phone: q.phone, details: q.details, ownerEmail: CONFIG.ownerEmail, siteName: CONFIG.siteName || document.title }),
+      });
+    } catch {}
+    trackEvent('quote_requested', { details: (q.details || '').slice(0, 100) });
+  }
+
+  // Show directions with map link
+  function showDirections() {
+    const location = CONFIG.location || siteKnowledge?.match(/(?:address|location|located)[:\s]+([^\n]+)/i)?.[1] || '';
+    if (!location) return;
+    const mapUrl = 'https://maps.google.com/?q=' + encodeURIComponent(location);
+    const card = document.createElement('div');
+    card.className = 'ac-action-card';
+    card.innerHTML = `<a href="${mapUrl}" target="_blank" rel="noopener" style="display:flex;align-items:center;gap:8px;padding:12px 16px;background:#f0f7ff;border-radius:10px;text-decoration:none;color:#1a73e8;font-size:13px;font-weight:600;">
+      <span style="font-size:20px;">📍</span> Get Directions — ${location.slice(0, 60)}
+    </a>`;
+    insertBefore(card); scrollBottom();
+    trackEvent('directions_clicked');
+  }
+
+  // Show contact card with clickable phone/email/whatsapp
+  function showContactCard() {
+    const phone = CONFIG.phone || siteKnowledge?.match(/(?:phone|tel|call)[:\s]+([+\d\s()-]+)/i)?.[1]?.trim() || '';
+    const email = CONFIG.contactEmail || CONFIG.ownerEmail || siteKnowledge?.match(/(?:email)[:\s]+([\w.+-]+@[\w.-]+)/i)?.[1] || '';
+    const wa = CONFIG.whatsapp || '';
+    if (!phone && !email && !wa) return;
+    const card = document.createElement('div');
+    card.className = 'ac-contact-card';
+    card.innerHTML = `<div style="background:#f8f8fc;border-radius:12px;padding:14px;font-size:13px;">
+      <p style="margin:0 0 8px;font-weight:600;font-size:14px;">Contact Us</p>
+      ${phone ? `<a href="tel:${phone.replace(/\s/g,'')}" style="display:flex;align-items:center;gap:8px;padding:8px 0;text-decoration:none;color:#333;"><span>📞</span> ${phone}</a>` : ''}
+      ${email ? `<a href="mailto:${email}" style="display:flex;align-items:center;gap:8px;padding:8px 0;text-decoration:none;color:#333;"><span>✉️</span> ${email}</a>` : ''}
+      ${wa ? `<a href="https://wa.me/${wa.replace(/\D/g,'')}" target="_blank" rel="noopener" style="display:flex;align-items:center;gap:8px;padding:8px 0;text-decoration:none;color:#25D366;"><span>💬</span> WhatsApp</a>` : ''}
+    </div>`;
+    insertBefore(card); scrollBottom();
+    trackEvent('contact_card_shown');
+  }
+
+  // Show services as cards
+  function showServices() {
+    if (!CONFIG.products.length) return;
+    const card = document.createElement('div');
+    card.className = 'ac-services-card';
+    card.innerHTML = `<div style="display:flex;flex-direction:column;gap:6px;">
+      ${CONFIG.products.map(p => `<div style="background:#f8f8fc;border-radius:10px;padding:12px 14px;cursor:pointer;" onclick="window.AriaChat.send('Tell me more about ${p.name.replace(/'/g, "\\'")}')">
+        <div style="font-size:14px;font-weight:600;margin-bottom:2px;">${p.name}</div>
+        ${p.desc ? `<div style="font-size:12px;color:#666;">${p.desc}</div>` : ''}
+        ${p.price ? `<div style="font-size:13px;color:var(--ac-color,#6C63FF);font-weight:600;margin-top:4px;">${p.price}</div>` : ''}
+      </div>`).join('')}
+    </div>`;
+    insertBefore(card); scrollBottom();
+    trackEvent('services_shown');
+  }
+
+  // Auto-detect contact info in user messages and capture as lead
+  let _autoLeadSent = false;
+  function detectAndCaptureLead(text) {
+    if (_autoLeadSent) return;
+    const emailMatch = text.match(/[\w.+-]+@[\w.-]+\.\w{2,}/);
+    const phoneMatch = text.match(/(?:\+?\d{1,4}[\s-]?)?\(?\d{2,5}\)?[\s.-]?\d{3,5}[\s.-]?\d{3,5}/);
+    if (!emailMatch && !phoneMatch) return;
+    _autoLeadSent = true;
+    fetch(AUTOLEAD_URL, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: userName || null,
+        email: emailMatch?.[0] || null,
+        phone: phoneMatch?.[0] || null,
+        ownerEmail: CONFIG.ownerEmail,
+        siteName: CONFIG.siteName || document.title,
+        page: document.title,
+        sessionId: SESSION_ID,
+      }),
+    }).catch(() => {});
+    trackEvent('auto_lead_captured', { email: emailMatch?.[0], phone: phoneMatch?.[0] });
+  }
+
+  // Send chat summary to owner on conversation end
+  let _summarySent = false;
+  function sendChatSummary() {
+    if (_summarySent || history.length < 6) return;
+    _summarySent = true;
+    fetch(SUMMARY_URL, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: history.slice(-30),
+        ownerEmail: CONFIG.ownerEmail,
+        siteName: CONFIG.siteName || document.title,
+        visitorName: userName || null,
+        page: document.title,
+      }),
+    }).catch(() => {});
+  }
+
+  // =====================================================
   //  DELIVER RESPONSE (render parsed content)
   // =====================================================
   function deliverResponse(fullText) {
@@ -2034,6 +2241,9 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     // Sentiment analysis + qualification (both update before response)
     analyzeSentiment(text);
     updateQualification(text);
+
+    // Auto-detect contact info and capture as lead
+    detectAndCaptureLead(text);
 
     // Easter egg check
     const egg = checkEasterEgg(text);
@@ -2723,6 +2933,10 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     updateSoundToggle();
 
     window.AriaChat = { open: () => toggle(true), close: () => toggle(false), send: sendMessage, clear: clearChat };
+
+    // Send chat summary to owner when visitor leaves (if meaningful conversation happened)
+    window.addEventListener('beforeunload', sendChatSummary);
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') sendChatSummary(); });
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
