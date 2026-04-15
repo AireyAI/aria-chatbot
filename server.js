@@ -2035,7 +2035,15 @@ app.post('/api/dashboard/reset-password', (req, res) => {
 });
 
 // ─── Quick Setup (one-link onboarding) ───────────────────────────────────────
+const SETUP_CODE = process.env.SETUP_CODE || 'aireyai';
+
 app.get('/setup', (req, res) => {
+  if (req.query.code !== SETUP_CODE) {
+    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aria</title>
+    <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;color:#eee;padding:20px;}.box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:40px;text-align:center;max-width:400px;}</style>
+    </head><body><div class="box"><div style="font-size:48px;margin-bottom:16px">🔒</div><h2>Access Required</h2><p style="color:#9898b8;margin-top:12px;">You need an access code to set up Aria. Contact your provider.</p></div></body></html>`);
+  }
+
   if (!process.env.GOOGLE_CLIENT_ID) {
     return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aria — Setup</title>
     <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;color:#eee;padding:20px;}.box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:40px;text-align:center;max-width:440px;}</style>
