@@ -105,8 +105,10 @@ function makeOAuthClient() {
 function getAuthUrl(ownerEmail, onboardToken) {
   const client = makeOAuthClient();
   const stateValue = onboardToken
-    ? JSON.stringify({ owner: ownerEmail, onboard: onboardToken })
-    : ownerEmail || '';
+    ? JSON.stringify({ owner: ownerEmail || '', onboard: onboardToken })
+    : ownerEmail
+      ? ownerEmail
+      : JSON.stringify({ quickSetup: true });
   return client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
@@ -115,6 +117,7 @@ function getAuthUrl(ownerEmail, onboardToken) {
       'https://www.googleapis.com/auth/gmail.readonly',
       'https://www.googleapis.com/auth/gmail.modify',
       'https://www.googleapis.com/auth/calendar',
+      'https://www.googleapis.com/auth/userinfo.email',
     ],
     state: stateValue,
   });
@@ -2031,6 +2034,57 @@ app.post('/api/dashboard/reset-password', (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── Quick Setup (one-link onboarding) ───────────────────────────────────────
+app.get('/setup', (req, res) => {
+  if (!process.env.GOOGLE_CLIENT_ID) {
+    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aria — Setup</title>
+    <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;color:#eee;padding:20px;}.box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:40px;text-align:center;max-width:440px;}</style>
+    </head><body><div class="box"><h2>⚠️ Not configured yet</h2><p style="color:#9898b8;margin-top:12px;">Google credentials haven't been set up. Contact your provider.</p></div></body></html>`);
+  }
+
+  const authUrl = getAuthUrl('', '');
+
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Aria — Connect Your Business</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#eee;}
+    .box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:48px 40px;text-align:center;max-width:440px;width:100%;}
+    .logo span{font-size:32px;font-weight:800;letter-spacing:-0.5px;}
+    .logo em{font-style:normal;color:#00e5a0;}
+    h2{font-size:20px;margin:28px 0 12px;font-weight:700;}
+    p{font-size:14px;color:#9898b8;line-height:1.7;margin-bottom:24px;}
+    .gmail-btn{display:flex;align-items:center;justify-content:center;gap:12px;width:100%;padding:15px;border:1.5px solid #ddd;border-radius:12px;background:#fff;color:#333;font-size:15px;font-weight:600;cursor:pointer;text-decoration:none;transition:all .15s;font-family:inherit;}
+    .gmail-btn:hover{background:#f8f8f8;transform:translateY(-1px);}
+    .features{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:24px 0;text-align:left;}
+    .feat{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:14px;}
+    .feat .icon{font-size:20px;margin-bottom:6px;}
+    .feat .label{font-size:12px;color:#9898b8;line-height:1.4;}
+    .footer{margin-top:24px;font-size:11px;color:#6b6b8a;line-height:1.6;}
+  </style>
+  </head><body>
+  <div class="box">
+    <div class="logo"><span>Aria<em>Ai</em></span></div>
+    <h2>Your AI Business Assistant</h2>
+    <p>Connect your Google account and Aria will start replying to your emails and booking your calendar — automatically.</p>
+
+    <div class="features">
+      <div class="feat"><div class="icon">📧</div><div class="label">Auto-reply to customer emails</div></div>
+      <div class="feat"><div class="icon">📅</div><div class="label">Book appointments to your calendar</div></div>
+      <div class="feat"><div class="icon">🤖</div><div class="label">AI learns your business</div></div>
+      <div class="feat"><div class="icon">⚡</div><div class="label">Set up in 30 seconds</div></div>
+    </div>
+
+    <a href="${authUrl}" class="gmail-btn">
+      <svg width="20" height="20" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+      Connect with Google
+    </a>
+
+    <div class="footer">We'll access your Gmail to reply to customers and your Calendar to manage bookings. You can disconnect any time.</div>
+  </div>
+  </body></html>`);
+});
+
 app.get('/connect/gmail', (req, res) => {
   const ownerEmail = req.query.owner || '';
   const sessionToken = req.query.s || '';
@@ -2781,22 +2835,35 @@ Example: You are Aria, the assistant for Smith Plumbing — a family plumbing bu
 app.get('/auth/gmail/callback', async (req, res) => {
   const { code, state: rawState, error } = req.query;
 
-  // Parse state — could be JSON { owner, onboard } or plain email string
+  // Parse state — could be JSON { owner, onboard, quickSetup } or plain email string
   let ownerEmail = rawState || '';
   let onboardToken = null;
+  let isQuickSetup = false;
   try {
     const parsed = JSON.parse(rawState);
-    if (parsed && parsed.owner) {
+    if (parsed && parsed.quickSetup) {
+      isQuickSetup = true;
+      ownerEmail = '';
+    } else if (parsed && parsed.owner) {
       ownerEmail = parsed.owner;
       onboardToken = parsed.onboard || null;
     }
   } catch (_) { /* rawState is plain email string — already assigned */ }
 
-  if (error) return res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center"><h2>❌ Access denied</h2><p>${error}</p><p><a href="/connect/gmail?owner=${ownerEmail}">Try again</a></p></body></html>`);
+  if (error) return res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center"><h2>❌ Access denied</h2><p>${error}</p><p><a href="/setup">Try again</a></p></body></html>`);
   if (!code) return res.status(400).send('No code received');
   try {
     const client = makeOAuthClient();
     const { tokens } = await client.getToken(code);
+
+    // If quick setup or no email provided, fetch email from Google
+    if (!ownerEmail || isQuickSetup) {
+      client.setCredentials(tokens);
+      const oauth2 = google.oauth2({ version: 'v2', auth: client });
+      const { data } = await oauth2.userinfo.get();
+      ownerEmail = data.email;
+    }
+
     await saveGmailTokens(ownerEmail, tokens);
 
     // If coming from onboarding wizard, redirect back there
@@ -2804,18 +2871,47 @@ app.get('/auth/gmail/callback', async (req, res) => {
       return res.redirect(`/onboard?t=${encodeURIComponent(onboardToken)}&gmail_connected=1`);
     }
 
+    // Quick setup — auto-enable auto-reply with a generic prompt, show success
+    if (isQuickSetup) {
+      const genericPrompt = `You are Aria, a friendly AI assistant. You help manage emails by providing helpful, professional responses. Always be polite and try to understand what the customer needs. If you're unsure about something specific to the business, let the customer know someone will follow up with more details.`;
+      enableEmailAutoReply(ownerEmail, genericPrompt, { ownerEmail, businessName: ownerEmail.split('@')[0] });
+    }
+
     // Create a session so they go straight to the dashboard
-    const token = createSession(ownerEmail);
-    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><style>body{font-family:sans-serif;background:#0d0d1f;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;color:#eee}.box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:40px;text-align:center;max-width:440px;}</style></head>
-    <body><div class="box">
-      <div style="font-size:48px;margin-bottom:16px">🎉</div>
-      <h1 style="margin-bottom:10px">Gmail Connected!</h1>
-      <p style="color:#9898b8;font-size:14px">Your chatbot will now send emails from <strong style="color:#00e5a0">${ownerEmail}</strong>.</p>
-      <a href="/connect/gmail?owner=${encodeURIComponent(ownerEmail)}&s=${token}" style="display:inline-block;margin-top:20px;padding:14px 28px;background:#00e5a0;color:#0d0d1f;border-radius:12px;text-decoration:none;font-weight:600;">Go to Dashboard</a>
-    </div></body></html>`);
+    const sessionToken = createSession(ownerEmail);
+    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+      *{box-sizing:border-box;margin:0;padding:0}
+      body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#eee;}
+      .box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:48px 40px;text-align:center;max-width:440px;width:100%;}
+      .logo span{font-size:28px;font-weight:800;letter-spacing:-0.5px;}
+      .logo em{font-style:normal;color:#00e5a0;}
+      h1{font-size:22px;margin:16px 0 8px;}
+      p{font-size:14px;color:#9898b8;line-height:1.7;margin-bottom:8px;}
+      .email{display:inline-block;background:rgba(0,229,160,0.1);border:1px solid rgba(0,229,160,0.25);border-radius:8px;padding:6px 16px;font-size:14px;color:#00e5a0;font-weight:600;margin:12px 0;}
+      .btn{display:inline-block;margin-top:20px;padding:14px 28px;background:#00e5a0;color:#0d0d1f;border-radius:12px;text-decoration:none;font-weight:600;transition:all .15s;}
+      .btn:hover{opacity:.88;transform:translateY(-1px);}
+      .checks{text-align:left;margin:20px 0;font-size:13px;color:#9898b8;line-height:2;}
+      .checks span{color:#00e5a0;margin-right:8px;}
+    </style>
+    </head><body>
+    <div class="box">
+      <div class="logo"><span>Aria<em>Ai</em></span></div>
+      <div style="font-size:48px;margin:20px 0">🎉</div>
+      <h1>You're All Set!</h1>
+      <div class="email">${ownerEmail}</div>
+      <div class="checks">
+        <div><span>✓</span> Gmail connected</div>
+        <div><span>✓</span> Auto-reply enabled</div>
+        <div><span>✓</span> Calendar booking ready</div>
+      </div>
+      <p>Aria is now monitoring your inbox and will reply to customers automatically.</p>
+      <a href="/dashboard?owner=${encodeURIComponent(ownerEmail)}&s=${sessionToken}" class="btn">Go to Dashboard →</a>
+    </div>
+    </body></html>`);
   } catch (e) {
     console.error('Gmail OAuth error:', e.message);
-    res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center"><h2>❌ Something went wrong</h2><p>${e.message}</p><a href="/connect/gmail?owner=${ownerEmail}">Try again</a></body></html>`);
+    res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><h2>❌ Something went wrong</h2><p style="color:#9898b8;">${e.message}</p><a href="/setup" style="color:#00e5a0;">Try again</a></body></html>`);
   }
 });
 
