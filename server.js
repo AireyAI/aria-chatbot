@@ -285,7 +285,7 @@ async function checkInboxAndReply(ownerEmail) {
         const replySubject = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
         const threadId = full.data.threadId;
 
-        const replyHeaders = [
+        const headerLines = [
           `From: ${ownerEmail}`,
           `To: ${senderEmail}`,
           `Subject: ${replySubject}`,
@@ -293,9 +293,8 @@ async function checkInboxAndReply(ownerEmail) {
           msgId ? `References: ${msgId}` : '',
           'MIME-Version: 1.0',
           'Content-Type: text/html; charset=utf-8',
-          '',
-          result.reply,
         ].filter(Boolean).join('\r\n');
+        const replyHeaders = headerLines + '\r\n\r\n' + result.reply;
 
         const encoded = Buffer.from(replyHeaders).toString('base64url');
         await gmail.users.messages.send({
