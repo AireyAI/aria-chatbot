@@ -982,67 +982,208 @@ app.get('/connect/gmail', (req, res) => {
   const isConnected = gmailTokens.has(ownerEmail);
   const authUrl = getAuthUrl(ownerEmail);
 
+  const autoReplyConfig = EMAIL_AUTO_REPLY_ENABLED.get(ownerEmail);
+  const autoReplyEnabled = !!autoReplyConfig?.enabled;
+  const currentPrompt = autoReplyConfig?.systemPrompt || '';
+
   res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Connect Gmail — Aria Chatbot</title>
+  <title>Aria — Email Settings</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f0f8;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}
-    .box{background:white;border-radius:20px;padding:40px;max-width:440px;width:100%;box-shadow:0 8px 40px rgba(0,0,0,.12);text-align:center;}
-    .icon{font-size:48px;margin-bottom:20px;}
-    h1{font-size:22px;color:#1a1a2e;margin-bottom:10px;}
-    p{font-size:14px;color:#666;line-height:1.6;margin-bottom:24px;}
-    .email{display:inline-block;background:#f0f0f8;border-radius:8px;padding:6px 14px;font-size:13px;color:#1a1a2e;font-weight:600;margin-bottom:24px;}
-    .btn{display:block;width:100%;padding:14px;background:#6C63FF;color:white;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;text-decoration:none;transition:opacity .15s;}
-    .btn:hover{opacity:.88;}
-    .btn.google{background:white;color:#333;border:1.5px solid #ddd;display:flex;align-items:center;justify-content:center;gap:10px;}
-    .btn.google:hover{background:#f8f8f8;}
-    .connected{background:#2ecc7118;border:1.5px solid #2ecc71;border-radius:12px;padding:16px;margin-bottom:20px;color:#1a8a4a;}
-    .connected strong{display:block;font-size:15px;margin-bottom:4px;}
-    .connected span{font-size:13px;}
-    .what{background:#f8f8fc;border-radius:12px;padding:16px;text-align:left;margin-bottom:24px;}
-    .what h3{font-size:12px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;}
-    .what li{font-size:13px;color:#444;padding:3px 0;list-style:none;padding-left:20px;position:relative;}
-    .what li::before{content:'✓';position:absolute;left:0;color:#6C63FF;font-weight:700;}
-    .disconnect{margin-top:12px;background:none;border:none;color:#e74c3c;font-size:12px;cursor:pointer;font-family:inherit;}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;padding:20px;color:#eee;}
+    .wrap{max-width:520px;margin:0 auto;}
+    .logo{text-align:center;margin-bottom:32px;padding-top:40px;}
+    .logo span{font-size:28px;font-weight:800;color:#fff;letter-spacing:-0.5px;}
+    .logo span em{font-style:normal;color:#00e5a0;}
+    .card{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:28px;margin-bottom:20px;}
+    .card h2{font-size:17px;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:10px;}
+    .card p{font-size:13.5px;color:#9898b8;line-height:1.6;margin-bottom:16px;}
+    .status{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:5px 12px;border-radius:20px;}
+    .status.on{background:rgba(0,229,160,0.12);color:#00e5a0;border:1px solid rgba(0,229,160,0.25);}
+    .status.off{background:rgba(255,80,80,0.1);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);}
+    .dot{width:7px;height:7px;border-radius:50%;display:inline-block;}
+    .dot.on{background:#00e5a0;}
+    .dot.off{background:#ff6b6b;}
+    .email-badge{display:inline-block;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:5px 14px;font-size:13px;color:#fff;font-weight:600;margin-bottom:16px;}
+    .btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:13px;border:none;border-radius:12px;font-size:14px;font-weight:600;cursor:pointer;transition:all .15s;text-decoration:none;font-family:inherit;}
+    .btn:hover{opacity:.88;transform:translateY(-1px);}
+    .btn-primary{background:#00e5a0;color:#0d0d1f;}
+    .btn-google{background:#fff;color:#333;border:1.5px solid #ddd;}
+    .btn-google:hover{background:#f8f8f8;}
+    .btn-danger{background:rgba(255,80,80,0.12);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);}
+    .btn-danger:hover{background:rgba(255,80,80,0.2);}
+    .btn-outline{background:transparent;color:#00e5a0;border:1.5px solid rgba(0,229,160,0.3);}
+    .btn-outline:hover{background:rgba(0,229,160,0.08);}
+    .features{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px;}
+    .feat{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:14px;text-align:center;}
+    .feat .icon{font-size:22px;margin-bottom:6px;}
+    .feat .label{font-size:12px;color:#9898b8;font-weight:500;}
+    textarea{width:100%;min-height:120px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:14px;font-size:13px;color:#eee;font-family:inherit;line-height:1.6;resize:vertical;outline:none;transition:border-color .2s;}
+    textarea:focus{border-color:rgba(0,229,160,0.4);}
+    textarea::placeholder{color:#6b6b8a;}
+    label{display:block;font-size:12px;font-weight:600;color:#9898b8;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;}
+    .hint{font-size:11.5px;color:#6b6b8a;margin-top:6px;line-height:1.5;}
+    .divider{height:1px;background:rgba(255,255,255,0.06);margin:20px 0;}
+    .toggle-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;}
+    .toggle{position:relative;width:48px;height:26px;cursor:pointer;}
+    .toggle input{opacity:0;width:0;height:0;}
+    .toggle .slider{position:absolute;inset:0;background:#333;border-radius:26px;transition:.3s;}
+    .toggle .slider:before{content:'';position:absolute;height:20px;width:20px;left:3px;bottom:3px;background:#888;border-radius:50%;transition:.3s;}
+    .toggle input:checked+.slider{background:rgba(0,229,160,0.3);}
+    .toggle input:checked+.slider:before{transform:translateX(22px);background:#00e5a0;}
+    .info{background:rgba(0,229,160,0.06);border:1px solid rgba(0,229,160,0.15);border-radius:10px;padding:14px;font-size:12.5px;color:#9898b8;line-height:1.6;margin-bottom:16px;}
+    .info strong{color:#00e5a0;}
+    .msg{padding:12px 16px;border-radius:10px;font-size:13px;font-weight:500;margin-bottom:16px;display:none;}
+    .msg.success{display:block;background:rgba(0,229,160,0.1);border:1px solid rgba(0,229,160,0.25);color:#00e5a0;}
+    .msg.error{display:block;background:rgba(255,80,80,0.1);border:1px solid rgba(255,80,80,0.2);color:#ff6b6b;}
+    .actions{display:flex;gap:10px;}
+    .actions .btn{flex:1;}
+    .footer{text-align:center;padding:32px 0;font-size:12px;color:#6b6b8a;}
+    .footer a{color:#00e5a0;text-decoration:none;}
   </style>
-  </head><body><div class="box">
-    <div class="icon">📧</div>
-    <h1>Connect Your Gmail</h1>
-    ${ownerEmail ? `<div class="email">${ownerEmail}</div>` : ''}
+  </head><body>
+  <div class="wrap">
+    <div class="logo"><span>Aria<em>Ai</em></span></div>
+
+    ${ownerEmail ? `<div style="text-align:center;margin-bottom:24px"><div class="email-badge">${ownerEmail}</div></div>` : ''}
+
+    <div id="msg" class="msg"></div>
+
+    <!-- Connection Card -->
+    <div class="card">
+      <h2>📧 Gmail Connection</h2>
+      ${isConnected ? `
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+          <span class="status on"><span class="dot on"></span> Connected</span>
+        </div>
+        <div class="features">
+          <div class="feat"><div class="icon">💬</div><div class="label">Auto-Reply</div></div>
+          <div class="feat"><div class="icon">📅</div><div class="label">Calendar Sync</div></div>
+          <div class="feat"><div class="icon">📨</div><div class="label">Lead Alerts</div></div>
+          <div class="feat"><div class="icon">🔒</div><div class="label">Secure</div></div>
+        </div>
+        <div class="actions">
+          <a href="${authUrl}" class="btn btn-outline">Reconnect</a>
+          <form action="/disconnect/gmail" method="POST" style="flex:1;display:flex">
+            <input type="hidden" name="owner" value="${ownerEmail}">
+            <button class="btn btn-danger" type="submit" style="flex:1">Disconnect</button>
+          </form>
+        </div>
+      ` : `
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+          <span class="status off"><span class="dot off"></span> Not Connected</span>
+        </div>
+        <p>Connect your Gmail to enable AI-powered email replies, calendar bookings, and lead alerts — all sent from your own email address.</p>
+        <div class="info"><strong>What we access:</strong> Read incoming emails to generate replies, send on your behalf, mark as read, and manage your calendar for bookings. Revoke anytime in Google settings.</div>
+        <a href="${authUrl}" class="btn btn-google">
+          <svg width="18" height="18" viewBox="0 0 18 18"><path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z"/><path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.184l-2.908-2.258c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z"/><path fill="#FBBC05" d="M3.964 10.707A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.707V4.961H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.039l3.007-2.332z"/><path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.961L3.964 6.293C4.672 4.166 6.656 3.58 9 3.58z"/></svg>
+          Connect Gmail
+        </a>
+      `}
+    </div>
+
     ${isConnected ? `
-      <div class="connected">
-        <strong>✓ Gmail Connected!</strong>
-        <span>Your chatbot is sending emails from your Gmail account.</span>
+    <!-- Auto-Reply Card -->
+    <div class="card">
+      <h2>🤖 Email Auto-Reply</h2>
+      <div class="toggle-row">
+        <div>
+          <div style="font-size:14px;font-weight:600;margin-bottom:2px;">Auto-reply to incoming emails</div>
+          <div style="font-size:12px;color:#6b6b8a;">Aria reads new emails and sends a professional reply</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="autoReplyToggle" ${autoReplyEnabled ? 'checked' : ''} onchange="toggleAutoReply(this.checked)">
+          <span class="slider"></span>
+        </label>
       </div>
-      <div class="what"><h3>What this means</h3><ul>
-        <li>Lead alerts arrive in your Gmail sent items</li>
-        <li>Visitors see your Gmail address, not a bot address</li>
-        <li>Booking confirmations sent from you</li>
-        <li>Visitors can reply directly to you</li>
-      </ul></div>
-      <a href="${authUrl}" class="btn google">
-        <svg width="18" height="18" viewBox="0 0 18 18"><path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z"/><path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.184l-2.908-2.258c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z"/><path fill="#FBBC05" d="M3.964 10.707A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.707V4.961H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.039l3.007-2.332z"/><path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.961L3.964 6.293C4.672 4.166 6.656 3.58 9 3.58z"/></svg>
-        Reconnect Gmail
-      </a>
-      <form action="/disconnect/gmail" method="POST" style="margin-top:10px">
-        <input type="hidden" name="owner" value="${ownerEmail}">
-        <button class="disconnect" type="submit">Disconnect Gmail</button>
-      </form>
-    ` : `
-      <p>Connect your Gmail so the chatbot can <strong>read and reply to incoming emails automatically</strong>, send lead alerts, booking confirmations, and follow-ups — all from your own email address.</p>
-      <div class="what"><h3>You're giving access to</h3><ul>
-        <li>Read incoming emails to generate smart replies</li>
-        <li>Send emails and replies on your behalf</li>
-        <li>Mark emails as read after replying</li>
-        <li>Manage your Google Calendar for bookings</li>
-        <li>Revoke anytime in Google settings</li>
-      </ul></div>
-      <a href="${authUrl}" class="btn google">
-        <svg width="18" height="18" viewBox="0 0 18 18"><path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z"/><path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.184l-2.908-2.258c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z"/><path fill="#FBBC05" d="M3.964 10.707A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.707V4.961H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.039l3.007-2.332z"/><path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.961L3.964 6.293C4.672 4.166 6.656 3.58 9 3.58z"/></svg>
-        Connect Gmail
-      </a>
-    `}
-  </div></body></html>`);
+
+      <div class="divider"></div>
+
+      <label for="prompt">Business Description</label>
+      <textarea id="prompt" placeholder="Describe your business so Aria knows how to reply to emails. Include: business name, services, location, phone, email, hours, and any common questions.
+
+Example: You are Aria, the assistant for Smith Plumbing — a family plumbing business in Manchester. Services include boiler repair, bathroom fitting, and emergency callouts. Phone: 07700 123456. Mon-Sat 8am-6pm.">${currentPrompt}</textarea>
+      <p class="hint">This tells Aria about your business so it can reply to emails accurately. The more detail you include, the better the replies.</p>
+
+      <div style="margin-top:16px;">
+        <button class="btn btn-primary" onclick="savePrompt()">Save Business Description</button>
+      </div>
+
+      <div class="divider"></div>
+
+      <button class="btn btn-outline" onclick="testNow()" id="testBtn">Test — Check Inbox Now</button>
+    </div>
+
+    <!-- How It Works -->
+    <div class="card">
+      <h2>💡 How It Works</h2>
+      <p style="margin-bottom:8px;">Once enabled, Aria will:</p>
+      <div style="font-size:13px;color:#9898b8;line-height:2;">
+        1. Check your inbox every 3 minutes<br>
+        2. Read new unread emails<br>
+        3. Write a professional reply using your business info<br>
+        4. Send the reply from your Gmail<br>
+        5. If a booking is mentioned, add it to your Google Calendar
+      </div>
+    </div>
+    ` : ''}
+
+    <div class="footer">Powered by <a href="https://aireyai.co.uk">AireyAi</a></div>
+  </div>
+
+  <script>
+    const owner = '${ownerEmail}';
+    const server = '';
+
+    function showMsg(text, type) {
+      const el = document.getElementById('msg');
+      el.textContent = text;
+      el.className = 'msg ' + type;
+      setTimeout(() => { el.className = 'msg'; }, 4000);
+    }
+
+    async function toggleAutoReply(enabled) {
+      const prompt = document.getElementById('prompt')?.value || '';
+      if (enabled && !prompt.trim()) {
+        showMsg('Please enter a business description first.', 'error');
+        document.getElementById('autoReplyToggle').checked = false;
+        return;
+      }
+      const endpoint = enabled ? '/api/email-autoreply/enable' : '/api/email-autoreply/disable';
+      const body = enabled ? { owner, systemPrompt: prompt } : { owner };
+      const r = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const data = await r.json();
+      if (data.ok) showMsg(enabled ? 'Auto-reply enabled!' : 'Auto-reply disabled.', 'success');
+      else showMsg(data.error || 'Something went wrong.', 'error');
+    }
+
+    async function savePrompt() {
+      const prompt = document.getElementById('prompt').value.trim();
+      if (!prompt) { showMsg('Please enter a business description.', 'error'); return; }
+      const toggle = document.getElementById('autoReplyToggle');
+      if (toggle.checked) {
+        const r = await fetch('/api/email-autoreply/enable', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ owner, systemPrompt: prompt }) });
+        const data = await r.json();
+        if (data.ok) showMsg('Business description saved!', 'success');
+        else showMsg(data.error || 'Failed to save.', 'error');
+      } else {
+        showMsg('Saved! Turn on auto-reply to start using it.', 'success');
+      }
+    }
+
+    async function testNow() {
+      const btn = document.getElementById('testBtn');
+      btn.textContent = 'Checking...';
+      btn.disabled = true;
+      const r = await fetch('/api/email-autoreply/check-now', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ owner }) });
+      const data = await r.json();
+      btn.textContent = 'Test — Check Inbox Now';
+      btn.disabled = false;
+      if (data.ok) showMsg('Inbox checked! If there were new emails, replies have been sent.', 'success');
+      else showMsg(data.error || 'Failed to check inbox.', 'error');
+    }
+  </script>
+  </body></html>`);
 });
 
 // OAuth2 callback — Google redirects here after owner signs in
