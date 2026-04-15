@@ -187,18 +187,16 @@ async function sendViaGmail(ownerEmail, { to, subject, html, replyTo }) {
     const gmail = google.gmail({ version: 'v1', auth });
 
     // Build RFC 2822 message
-    const lines = [
+    const headerLines = [
       `From: ${ownerEmail}`,
       `To: ${to}`,
       replyTo ? `Reply-To: ${replyTo}` : '',
       `Subject: ${subject}`,
       'MIME-Version: 1.0',
       'Content-Type: text/html; charset=utf-8',
-      '',
-      html,
     ].filter(Boolean).join('\r\n');
 
-    const encoded = Buffer.from(lines).toString('base64url');
+    const encoded = Buffer.from(headerLines + '\r\n\r\n' + html).toString('base64url');
     await gmail.users.messages.send({ userId: 'me', requestBody: { raw: encoded } });
     return true;
   } catch (e) {
@@ -321,6 +319,51 @@ function validateSession(token, ownerEmail) {
   return session.ownerEmail === ownerEmail;
 }
 const pendingFollowUps = new Map();        // msgId → { ownerEmail, senderEmail, senderName, subject, sentAt, followUpAt, attempts }
+const PENDING_APPROVALS_FILE = resolve('data/pending-approvals.json');
+const pendingApprovals = new Map();        // approvalId → { ownerEmail, senderEmail, senderName, subject, threadId, msgId, replyHtml, brandedHtml, booking, createdAt }
+const REPLY_LOG_FILE = resolve('data/reply-log.json');
+const replyLog = [];                       // [{ ownerEmail, senderEmail, subject, replyPreview, sentAt, type }]
+
+function loadPendingApprovals() {
+  try {
+    if (existsSync(PENDING_APPROVALS_FILE)) {
+      const saved = JSON.parse(readFileSync(PENDING_APPROVALS_FILE, 'utf8'));
+      for (const [id, a] of Object.entries(saved)) pendingApprovals.set(id, a);
+    }
+  } catch (e) { console.warn('Failed to load approvals:', e.message); }
+}
+
+function persistPendingApprovals() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [id, a] of pendingApprovals) obj[id] = a;
+    writeFileSync(PENDING_APPROVALS_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist approvals:', e.message); }
+}
+
+function loadReplyLog() {
+  try {
+    if (existsSync(REPLY_LOG_FILE)) {
+      const saved = JSON.parse(readFileSync(REPLY_LOG_FILE, 'utf8'));
+      replyLog.push(...saved);
+    }
+  } catch (e) { console.warn('Failed to load reply log:', e.message); }
+}
+
+function persistReplyLog() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const trimmed = replyLog.slice(-200);
+    writeFileSync(REPLY_LOG_FILE, JSON.stringify(trimmed, null, 2));
+  } catch (e) { console.warn('Failed to persist reply log:', e.message); }
+}
+
+function logReply(ownerEmail, senderEmail, subject, replyPreview, type, leadScore, category) {
+  replyLog.push({ ownerEmail, senderEmail, subject, replyPreview: replyPreview.substring(0, 200), sentAt: new Date().toISOString(), type, leadScore: leadScore || null, category: category || null });
+  if (replyLog.length > 200) replyLog.splice(0, replyLog.length - 200);
+  persistReplyLog();
+}
 
 function loadEmailStats() {
   try {
@@ -359,13 +402,17 @@ function persistFollowUps() {
   } catch (e) { console.warn('Failed to persist follow-ups:', e.message); }
 }
 
-function trackReply(ownerEmail, type) {
-  const stats = EMAIL_REPLY_STATS.get(ownerEmail) || { replied: 0, bookings: 0, followUps: 0, urgent: 0, lastReply: null, history: [] };
+function trackReply(ownerEmail, type, leadScore, category) {
+  const stats = EMAIL_REPLY_STATS.get(ownerEmail) || { replied: 0, bookings: 0, followUps: 0, urgent: 0, lastReply: null, history: [], leads: { hot: 0, warm: 0, cold: 0 }, categories: { quote: 0, booking: 0, complaint: 0, feedback: 0, general: 0 } };
+  if (!stats.leads) stats.leads = { hot: 0, warm: 0, cold: 0 };
+  if (!stats.categories) stats.categories = { quote: 0, booking: 0, complaint: 0, feedback: 0, general: 0 };
   if (type === 'reply') { stats.replied++; stats.lastReply = new Date().toISOString(); }
   if (type === 'booking') stats.bookings++;
   if (type === 'followup') stats.followUps++;
   if (type === 'urgent') stats.urgent++;
-  stats.history.push({ type, time: new Date().toISOString() });
+  if (leadScore && stats.leads[leadScore] !== undefined) stats.leads[leadScore]++;
+  if (category && stats.categories[category] !== undefined) stats.categories[category]++;
+  stats.history.push({ type, time: new Date().toISOString(), leadScore, category });
   if (stats.history.length > 200) stats.history = stats.history.slice(-200);
   EMAIL_REPLY_STATS.set(ownerEmail, stats);
   persistEmailStats();
@@ -402,12 +449,25 @@ function wrapInTemplate(replyHtml, config, isOutOfHours) {
   const website = config?.website || '';
   const ownerEmail = config?.ownerEmail || '';
 
+  const facebook = config?.facebook || '';
+  const instagram = config?.instagram || '';
+  const bookingUrl = config?.bookingUrl || '';
+  const reviewsUrl = config?.reviewsUrl || '';
+
   const signature = [
     businessName ? `<strong>${businessName}</strong>` : '',
     phone ? `📞 ${phone}` : '',
     ownerEmail ? `✉️ ${ownerEmail}` : '',
     website ? `🌐 <a href="${website}" style="color:${brandColor};text-decoration:none;">${website.replace(/^https?:\/\//, '')}</a>` : '',
   ].filter(Boolean).join('<br>');
+
+  const socialLinks = [
+    facebook ? `<a href="${facebook}" style="color:${brandColor};text-decoration:none;margin-right:12px;">Facebook</a>` : '',
+    instagram ? `<a href="${instagram}" style="color:${brandColor};text-decoration:none;margin-right:12px;">Instagram</a>` : '',
+    bookingUrl ? `<a href="${bookingUrl}" style="color:${brandColor};text-decoration:none;margin-right:12px;">Book Now</a>` : '',
+    reviewsUrl ? `<a href="${reviewsUrl}" style="color:${brandColor};text-decoration:none;">Reviews</a>` : '',
+  ].filter(Boolean).join('');
+  const socialBar = socialLinks ? `<div style="padding:12px 28px;text-align:center;font-size:12px;">${socialLinks}</div>` : '';
 
   const oohNotice = isOutOfHours === false ? '' : isOutOfHours ? `
     <div style="background:#fff8e1;border-left:4px solid #ffc107;padding:12px 16px;border-radius:0 8px 8px 0;margin-bottom:16px;font-size:13px;color:#666;">
@@ -427,6 +487,7 @@ function wrapInTemplate(replyHtml, config, isOutOfHours) {
     <div style="border-top:1px solid #eee;padding:20px 28px;font-size:12.5px;line-height:1.8;color:#888;">
       ${signature}
     </div>` : ''}
+    ${socialBar}
     <div style="background:#fafafa;padding:12px 28px;text-align:center;font-size:11px;color:#bbb;">
       Powered by <a href="https://aireyai.co.uk" style="color:${brandColor};text-decoration:none;">AireyAi</a>
     </div>
@@ -463,6 +524,116 @@ function isUrgentEmail(subject, body) {
   ];
   const combined = `${subject} ${body}`;
   return urgentPatterns.some(p => p.test(combined));
+}
+
+// ─── Conversation Memory ─────────────────────────────────────────────────────
+// Stores recent email exchanges per sender so Aria has context across threads
+const CONV_MEMORY_FILE = resolve('data/conversation-memory.json');
+const conversationMemory = new Map(); // key: "ownerEmail::senderEmail" → [{ role, subject, preview, date }]
+
+function loadConversationMemory() {
+  try {
+    if (existsSync(CONV_MEMORY_FILE)) {
+      const saved = JSON.parse(readFileSync(CONV_MEMORY_FILE, 'utf8'));
+      for (const [key, entries] of Object.entries(saved)) conversationMemory.set(key, entries);
+    }
+  } catch (e) { console.warn('Failed to load conversation memory:', e.message); }
+}
+
+function persistConversationMemory() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [key, entries] of conversationMemory) obj[key] = entries;
+    writeFileSync(CONV_MEMORY_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist conversation memory:', e.message); }
+}
+
+function addToConversationMemory(ownerEmail, senderEmail, role, subject, preview) {
+  const key = `${ownerEmail}::${senderEmail.toLowerCase()}`;
+  const history = conversationMemory.get(key) || [];
+  history.push({ role, subject, preview: preview.substring(0, 300), date: new Date().toISOString() });
+  // Keep last 10 exchanges per sender
+  if (history.length > 10) history.splice(0, history.length - 10);
+  conversationMemory.set(key, history);
+  persistConversationMemory();
+}
+
+function getConversationContext(ownerEmail, senderEmail) {
+  const key = `${ownerEmail}::${senderEmail.toLowerCase()}`;
+  const history = conversationMemory.get(key) || [];
+  if (!history.length) return '';
+  return '\n\nPREVIOUS EMAIL HISTORY with this sender (most recent last):\n' +
+    history.map(h => `[${h.role === 'sender' ? 'THEM' : 'US'}] Subject: ${h.subject}\n${h.preview}`).join('\n---\n') +
+    '\n\nUse this context to give a more personal, informed reply. Reference previous conversations where relevant.';
+}
+
+// ─── Rate Limiting ───────────────────────────────────────────────────────────
+// Prevent multiple auto-replies to the same sender within a short window
+const replyRateLimit = new Map(); // "ownerEmail::senderEmail" → lastReplyTimestamp
+const RATE_LIMIT_WINDOW = 5 * 60 * 1000; // 5 minutes
+
+function isRateLimited(ownerEmail, senderEmail) {
+  const key = `${ownerEmail}::${senderEmail.toLowerCase()}`;
+  const lastReply = replyRateLimit.get(key);
+  if (lastReply && (Date.now() - lastReply) < RATE_LIMIT_WINDOW) return true;
+  return false;
+}
+
+function markReplied(ownerEmail, senderEmail) {
+  const key = `${ownerEmail}::${senderEmail.toLowerCase()}`;
+  replyRateLimit.set(key, Date.now());
+}
+
+// ─── Out-of-Office Detection ─────────────────────────────────────────────────
+function isOutOfOffice(subject, body) {
+  const oooPatterns = [
+    /out of (the )?office/i, /auto[- ]?reply/i, /automatic reply/i,
+    /on (annual |sick )?leave/i, /away from (my )?desk/i, /currently away/i,
+    /on holiday/i, /on vacation/i, /limited access to email/i,
+    /I('m| am) (currently )?(out|away|off)/i, /will (return|be back|respond)/i,
+    /no longer (work|with|at)/i, /maternity|paternity leave/i,
+  ];
+  const combined = `${subject} ${body}`;
+  return oooPatterns.filter(p => p.test(combined)).length >= 1;
+}
+
+// ─── Lead Scoring ────────────────────────────────────────────────────────────
+function scoreEmail(subject, body, urgent) {
+  let score = 0;
+  const combined = `${subject} ${body}`.toLowerCase();
+
+  // Hot signals (+3 each)
+  if (/quote|estimate|pricing|how much|cost/i.test(combined)) score += 3;
+  if (/book|appointment|schedule|available|when can/i.test(combined)) score += 3;
+  if (/asap|urgent|emergency|today|tomorrow/i.test(combined)) score += 3;
+  if (/hire|need.*done|looking for/i.test(combined)) score += 3;
+
+  // Warm signals (+1 each)
+  if (/interested|considering|thinking about/i.test(combined)) score += 1;
+  if (/do you (offer|provide|do|cover)/i.test(combined)) score += 1;
+  if (/phone|call|number|contact/i.test(combined)) score += 1;
+  if (/location|area|postcode|address/i.test(combined)) score += 1;
+
+  // Cold signals (-1 each)
+  if (/just (wondering|asking|curious)/i.test(combined)) score -= 1;
+  if (/no rush|no hurry|whenever/i.test(combined)) score -= 1;
+
+  if (urgent) score += 2;
+
+  if (score >= 5) return 'hot';
+  if (score >= 2) return 'warm';
+  return 'cold';
+}
+
+// ─── Email Category Detection ────────────────────────────────────────────────
+function categorizeEmail(subject, body) {
+  const combined = `${subject} ${body}`.toLowerCase();
+  if (/quote|estimate|pricing|how much|cost|price/i.test(combined)) return 'quote';
+  if (/book|appointment|schedule|available|reservation/i.test(combined)) return 'booking';
+  if (/complaint|not happy|disappointed|refund|damaged|broken|disgusted|terrible/i.test(combined)) return 'complaint';
+  if (/thank|thanks|great (job|work|service)|pleased|happy with/i.test(combined)) return 'feedback';
+  return 'general';
 }
 
 async function checkInboxAndReply(ownerEmail) {
@@ -563,8 +734,37 @@ async function checkInboxAndReply(ownerEmail) {
         continue;
       }
 
+      // Out-of-office detection — don't reply to OOO auto-replies
+      if (isOutOfOffice(subject, bodyText)) {
+        console.log(`🏖️ Skipped out-of-office from ${senderEmail}: "${subject}"`);
+        repliedEmails.add(msg.id);
+        // Also cancel any pending follow-ups for this sender
+        for (const [fuId, fu] of pendingFollowUps) {
+          if (fu.senderEmail.toLowerCase() === senderEmail.toLowerCase() && fu.ownerEmail === ownerEmail) {
+            pendingFollowUps.delete(fuId);
+          }
+        }
+        persistFollowUps();
+        continue;
+      }
+
+      // Rate limiting — skip if we already replied to this sender recently
+      if (isRateLimited(ownerEmail, senderEmail)) {
+        console.log(`⏳ Rate-limited reply to ${senderEmail} (replied <5 min ago)`);
+        repliedEmails.add(msg.id);
+        continue;
+      }
+
+      // Detect attachments
+      const hasAttachments = (full.data.payload.parts || []).some(p => p.filename && p.filename.length > 0);
+      const attachmentNames = (full.data.payload.parts || []).filter(p => p.filename && p.filename.length > 0).map(p => p.filename);
+
       // Urgent email detection — forward to owner's phone via email
       const urgent = isUrgentEmail(subject, bodyText);
+
+      // Lead scoring and categorization
+      const leadScore = scoreEmail(subject, bodyText, urgent);
+      const emailCategory = categorizeEmail(subject, bodyText);
       if (urgent && cfg.phone) {
         console.log(`🚨 URGENT email from ${senderEmail}: "${subject}"`);
         trackReply(ownerEmail, 'urgent');
@@ -585,55 +785,98 @@ async function checkInboxAndReply(ownerEmail) {
 
       // Generate reply with Claude (also detects bookings)
       const hoursContext = withinHours === false ? '\n\nIMPORTANT: It is currently outside business hours. Acknowledge their message warmly, let them know you have received it, and that the team will follow up during working hours. Still answer any simple questions you can.' : '';
-      const result = await generateEmailReply(config.systemPrompt + hoursContext, senderName, senderEmail, subject, bodyText);
+      // Inject knowledge base into prompt
+      const kbEntries = knowledgeBase.get(ownerEmail) || [];
+      const kbContext = kbEntries.length ? '\n\nFREQUENTLY ASKED QUESTIONS — use these to answer accurately:\n' + kbEntries.map(e => `Q: ${e.question}\nA: ${e.answer}`).join('\n\n') : '';
+      // Conversation memory — previous exchanges with this sender
+      const convContext = getConversationContext(ownerEmail, senderEmail);
+      // Attachment awareness
+      const attachContext = hasAttachments ? `\n\nNOTE: This email includes ${attachmentNames.length} attachment(s): ${attachmentNames.join(', ')}. Acknowledge that you received their attachments in your reply.` : '';
+
+      // Save incoming email to conversation memory
+      addToConversationMemory(ownerEmail, senderEmail, 'sender', subject, bodyText);
+
+      const result = await generateEmailReply(config.systemPrompt + hoursContext + kbContext + convContext + attachContext, senderName, senderEmail, subject, bodyText);
 
       if (result?.reply) {
         // Wrap in branded template
         const brandedHtml = wrapInTemplate(result.reply, { ...cfg, ownerEmail }, withinHours === false);
-
-        // Build reply email with threading headers
         const replySubject = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
         const threadId = full.data.threadId;
 
-        const headerLines = [
-          `From: ${ownerEmail}`,
-          `To: ${senderEmail}`,
-          `Subject: ${replySubject}`,
-          msgId ? `In-Reply-To: ${msgId}` : '',
-          msgId ? `References: ${msgId}` : '',
-          'MIME-Version: 1.0',
-          'Content-Type: text/html; charset=utf-8',
-        ].filter(Boolean).join('\r\n');
-        const replyHeaders = headerLines + '\r\n\r\n' + brandedHtml;
-
-        const encoded = Buffer.from(replyHeaders).toString('base64url');
-        await gmail.users.messages.send({
-          userId: 'me',
-          requestBody: { raw: encoded, threadId },
-        });
-
-        // Mark original as read
-        await gmail.users.messages.modify({
-          userId: 'me', id: msg.id,
-          requestBody: { removeLabelIds: ['UNREAD'] },
-        });
-
-        trackReply(ownerEmail, 'reply');
-        console.log(`✅ Auto-replied to ${senderEmail} re: "${subject}"`);
-
-        // Schedule follow-up check (24h)
-        if (cfg.followUps !== false) {
-          pendingFollowUps.set(msg.id, {
-            ownerEmail,
-            senderEmail,
-            senderName,
-            subject,
-            threadId,
-            sentAt: Date.now(),
-            followUpAt: Date.now() + 24 * 60 * 60 * 1000,
-            attempts: 0,
+        // Approval mode — email draft to owner instead of sending directly
+        if (cfg.approvalMode) {
+          const approvalId = generateSessionToken();
+          const serverUrl = process.env.GOOGLE_REDIRECT_URI?.replace('/auth/gmail/callback', '') || `http://localhost:${process.env.PORT || 3000}`;
+          pendingApprovals.set(approvalId, {
+            ownerEmail, senderEmail, senderName, subject: replySubject, threadId, msgId,
+            replyHtml: result.reply, brandedHtml, booking: result.booking, createdAt: Date.now(),
           });
-          persistFollowUps();
+          persistPendingApprovals();
+
+          // Send approval email to owner
+          try {
+            await smartSend({ ownerEmail, to: ownerEmail, subject: `✏️ Review Aria's draft reply to ${senderName}`,
+              html: `<div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:20px;">
+                <h2 style="color:#1a1a2e;margin-bottom:4px;">New email from ${senderName}</h2>
+                <p style="color:#888;font-size:13px;margin-bottom:16px;">Subject: ${subject}</p>
+                <div style="background:#f8f8fc;border-radius:10px;padding:16px;margin-bottom:20px;">
+                  <p style="font-size:12px;color:#999;margin-bottom:8px;">THEIR MESSAGE:</p>
+                  <p style="color:#333;font-size:14px;line-height:1.6;">${bodyText.substring(0, 500)}</p>
+                </div>
+                <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:16px;margin-bottom:20px;">
+                  <p style="font-size:12px;color:#999;margin-bottom:8px;">ARIA'S DRAFT REPLY:</p>
+                  <div style="color:#333;font-size:14px;line-height:1.6;">${result.reply}</div>
+                </div>
+                <div style="display:flex;gap:12px;">
+                  <a href="${serverUrl}/api/email-autoreply/approve?id=${approvalId}" style="display:inline-block;padding:12px 24px;background:#00e5a0;color:#0d0d1f;border-radius:10px;text-decoration:none;font-weight:600;">✓ Send Reply</a>
+                  <a href="${serverUrl}/api/email-autoreply/reject?id=${approvalId}" style="display:inline-block;padding:12px 24px;background:#ff6b6b;color:#fff;border-radius:10px;text-decoration:none;font-weight:600;">✗ Discard</a>
+                </div>
+                <p style="color:#999;font-size:11px;margin-top:16px;">This draft will expire in 24 hours if not approved.</p>
+              </div>` });
+            console.log(`✏️ Approval email sent to ${ownerEmail} for reply to ${senderEmail}`);
+          } catch (e) { console.warn('Failed to send approval email:', e.message); }
+
+          // Mark as read but don't send reply yet
+          await gmail.users.messages.modify({ userId: 'me', id: msg.id, requestBody: { removeLabelIds: ['UNREAD'] } });
+        } else {
+          // Auto mode — send immediately
+          const headerLines = [
+            `From: ${ownerEmail}`,
+            `To: ${senderEmail}`,
+            `Subject: ${replySubject}`,
+            msgId ? `In-Reply-To: ${msgId}` : '',
+            msgId ? `References: ${msgId}` : '',
+            'MIME-Version: 1.0',
+            'Content-Type: text/html; charset=utf-8',
+          ].filter(Boolean).join('\r\n');
+          const replyHeaders = headerLines + '\r\n\r\n' + brandedHtml;
+
+          const encoded = Buffer.from(replyHeaders).toString('base64url');
+          await gmail.users.messages.send({
+            userId: 'me',
+            requestBody: { raw: encoded, threadId },
+          });
+
+          await gmail.users.messages.modify({
+            userId: 'me', id: msg.id,
+            requestBody: { removeLabelIds: ['UNREAD'] },
+          });
+
+          trackReply(ownerEmail, 'reply', leadScore, emailCategory);
+          logReply(ownerEmail, senderEmail, subject, result.reply, 'auto', leadScore, emailCategory);
+          addToConversationMemory(ownerEmail, senderEmail, 'us', subject, result.reply);
+          markReplied(ownerEmail, senderEmail);
+          console.log(`✅ Auto-replied to ${senderEmail} re: "${subject}" [${leadScore}/${emailCategory}]`);
+
+          // Schedule follow-up check (24h)
+          if (cfg.followUps !== false) {
+            pendingFollowUps.set(msg.id, {
+              ownerEmail, senderEmail, senderName, subject, threadId,
+              sentAt: Date.now(), followUpAt: Date.now() + 24 * 60 * 60 * 1000, attempts: 0,
+            });
+            persistFollowUps();
+          }
         }
 
         // If a booking was detected, create a Google Calendar event
@@ -803,7 +1046,7 @@ app.post('/api/email-autoreply/disable', (req, res) => {
 app.get('/api/email-autoreply/status', (req, res) => {
   const { owner } = req.query;
   const config = EMAIL_AUTO_REPLY_ENABLED.get(owner);
-  const stats = EMAIL_REPLY_STATS.get(owner) || { replied: 0, bookings: 0, followUps: 0, urgent: 0, lastReply: null };
+  const stats = EMAIL_REPLY_STATS.get(owner) || { replied: 0, bookings: 0, followUps: 0, urgent: 0, lastReply: null, leads: { hot: 0, warm: 0, cold: 0 }, categories: { quote: 0, booking: 0, complaint: 0, feedback: 0, general: 0 } };
   res.json({ owner, enabled: !!config?.enabled, config: config?.config || {}, stats });
 });
 
@@ -880,6 +1123,121 @@ app.post('/api/email-autoreply/check-now', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// Approve a pending reply — sends the draft
+app.get('/api/email-autoreply/approve', async (req, res) => {
+  const { id } = req.query;
+  const approval = pendingApprovals.get(id);
+  if (!approval) return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><h2>❌ Approval not found</h2><p>This link may have expired or already been used.</p></body></html>');
+
+  const { ownerEmail, senderEmail, senderName, subject, threadId, msgId, brandedHtml, booking, replyHtml } = approval;
+  const entry = gmailTokens.get(ownerEmail);
+  if (!entry) return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><h2>❌ Gmail not connected</h2><p>Please reconnect Gmail.</p></body></html>');
+
+  try {
+    const gmail = google.gmail({ version: 'v1', auth: entry.auth });
+    const headerLines = [
+      `From: ${ownerEmail}`, `To: ${senderEmail}`, `Subject: ${subject}`,
+      msgId ? `In-Reply-To: ${msgId}` : '', msgId ? `References: ${msgId}` : '',
+      'MIME-Version: 1.0', 'Content-Type: text/html; charset=utf-8',
+    ].filter(Boolean).join('\r\n');
+    const encoded = Buffer.from(headerLines + '\r\n\r\n' + brandedHtml).toString('base64url');
+    await gmail.users.messages.send({ userId: 'me', requestBody: { raw: encoded, threadId } });
+
+    trackReply(ownerEmail, 'reply');
+    logReply(ownerEmail, senderEmail, subject, replyHtml, 'approved');
+    pendingApprovals.delete(id);
+    persistPendingApprovals();
+
+    // Handle booking if detected
+    if (booking) {
+      booking.email = booking.email || senderEmail;
+      booking.name = booking.name || senderName;
+      trackReply(ownerEmail, 'booking');
+      await createCalendarEvent(ownerEmail, { name: booking.name, email: booking.email, datetime: booking.datetime, notes: booking.notes || subject, siteName: 'Email', page: 'Approved reply' });
+    }
+
+    console.log(`✅ Approved reply to ${senderEmail} re: "${subject}"`);
+    res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><div style="font-size:48px;margin-bottom:16px">✅</div><h2 style="color:#00e5a0;">Reply Sent!</h2><p style="color:#9898b8;">The approved reply has been sent to ' + senderEmail + '.</p></body></html>');
+  } catch (e) {
+    console.warn('Approval send failed:', e.message);
+    res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><h2>❌ Failed to send</h2><p>' + e.message + '</p></body></html>');
+  }
+});
+
+// Reject a pending reply — discard the draft
+app.get('/api/email-autoreply/reject', (req, res) => {
+  const { id } = req.query;
+  const approval = pendingApprovals.get(id);
+  if (!approval) return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><h2>❌ Not found</h2><p>This link may have expired or already been used.</p></body></html>');
+
+  logReply(approval.ownerEmail, approval.senderEmail, approval.subject, approval.replyHtml, 'rejected');
+  pendingApprovals.delete(id);
+  persistPendingApprovals();
+
+  console.log(`🗑️ Rejected reply to ${approval.senderEmail} re: "${approval.subject}"`);
+  res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><div style="font-size:48px;margin-bottom:16px">🗑️</div><h2>Reply Discarded</h2><p style="color:#9898b8;">The draft reply to ' + approval.senderEmail + ' has been discarded.</p></body></html>');
+});
+
+// Get reply log for a specific owner
+app.get('/api/email-autoreply/reply-log', (req, res) => {
+  const { owner } = req.query;
+  if (!owner) return res.status(400).json({ error: 'owner required' });
+  const ownerLog = replyLog.filter(r => r.ownerEmail === owner).reverse().slice(0, 50);
+  res.json({ ok: true, log: ownerLog });
+});
+
+// ─── Knowledge Base ─────────────────────────────────────────────────────────
+const KNOWLEDGE_BASE_FILE = resolve('data/knowledge-base.json');
+const knowledgeBase = new Map(); // ownerEmail → [{ id, question, answer, createdAt }]
+
+function loadKnowledgeBase() {
+  try {
+    if (existsSync(KNOWLEDGE_BASE_FILE)) {
+      const saved = JSON.parse(readFileSync(KNOWLEDGE_BASE_FILE, 'utf8'));
+      for (const [email, entries] of Object.entries(saved)) knowledgeBase.set(email, entries);
+    }
+  } catch (e) { console.warn('Failed to load knowledge base:', e.message); }
+}
+
+function persistKnowledgeBase() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [email, entries] of knowledgeBase) obj[email] = entries;
+    writeFileSync(KNOWLEDGE_BASE_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist knowledge base:', e.message); }
+}
+
+// Get all FAQs for an owner
+app.get('/api/knowledge-base', (req, res) => {
+  const { owner } = req.query;
+  if (!owner) return res.status(400).json({ error: 'owner required' });
+  res.json({ ok: true, entries: knowledgeBase.get(owner) || [] });
+});
+
+// Add a FAQ entry
+app.post('/api/knowledge-base', (req, res) => {
+  const { owner, question, answer } = req.body;
+  if (!owner || !question || !answer) return res.status(400).json({ error: 'owner, question, and answer required' });
+  const entries = knowledgeBase.get(owner) || [];
+  const entry = { id: crypto.randomUUID(), question, answer, createdAt: new Date().toISOString() };
+  entries.push(entry);
+  knowledgeBase.set(owner, entries);
+  persistKnowledgeBase();
+  res.json({ ok: true, entry });
+});
+
+// Delete a FAQ entry
+app.delete('/api/knowledge-base', (req, res) => {
+  const { owner, id } = req.body;
+  if (!owner || !id) return res.status(400).json({ error: 'owner and id required' });
+  const entries = knowledgeBase.get(owner) || [];
+  const filtered = entries.filter(e => e.id !== id);
+  knowledgeBase.set(owner, filtered);
+  persistKnowledgeBase();
+  res.json({ ok: true, deleted: id });
 });
 
 // ─── Slack ────────────────────────────────────────────────────────────────────
@@ -1590,10 +1948,35 @@ app.get('/connect/gmail', (req, res) => {
   const autoReplyEnabled = !!autoReplyConfig?.enabled;
   const currentPrompt = autoReplyConfig?.systemPrompt || '';
   const currentCfg = autoReplyConfig?.config || {};
-  const stats = EMAIL_REPLY_STATS.get(ownerEmail) || { replied: 0, bookings: 0, followUps: 0, urgent: 0, lastReply: null };
+  const stats = EMAIL_REPLY_STATS.get(ownerEmail) || { replied: 0, bookings: 0, followUps: 0, urgent: 0, lastReply: null, leads: { hot: 0, warm: 0, cold: 0 }, categories: { quote: 0, booking: 0, complaint: 0, feedback: 0, general: 0 }, history: [] };
+  if (!stats.leads) stats.leads = { hot: 0, warm: 0, cold: 0 };
+  if (!stats.categories) stats.categories = { quote: 0, booking: 0, complaint: 0, feedback: 0, general: 0 };
+  if (!stats.history) stats.history = [];
+
+  // Build chart data — last 30 days
+  const chartData = {};
+  const now = new Date();
+  for (let i = 29; i >= 0; i--) {
+    const d = new Date(now); d.setDate(d.getDate() - i);
+    chartData[d.toISOString().split('T')[0]] = { replies: 0, bookings: 0 };
+  }
+  for (const h of stats.history) {
+    const day = h.time?.split('T')[0];
+    if (chartData[day]) {
+      if (h.type === 'reply') chartData[day].replies++;
+      if (h.type === 'booking') chartData[day].bookings++;
+    }
+  }
+  const chartLabels = Object.keys(chartData);
+  const chartReplies = chartLabels.map(d => chartData[d].replies);
+  const chartBookings = chartLabels.map(d => chartData[d].bookings);
+
+  // Determine if this is a new (unconfigured) client for onboarding wizard
+  const isNewClient = !autoReplyConfig && !isConnected;
 
   res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Aria — Email Settings</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;padding:20px;color:#eee;}
@@ -1688,6 +2071,26 @@ app.get('/connect/gmail', (req, res) => {
       `}
     </div>
 
+    ${isNewClient ? `
+    <!-- Onboarding Wizard -->
+    <div class="card" id="onboardingWizard">
+      <h2>👋 Welcome to Aria</h2>
+      <p style="margin-bottom:20px;">Let's get your AI assistant set up in 3 simple steps.</p>
+
+      <div id="wizStep1" style="display:block;">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+          <div style="width:36px;height:36px;border-radius:50%;background:rgba(0,229,160,0.15);color:#00e5a0;display:flex;align-items:center;justify-content:center;font-weight:800;font-family:sans-serif;">1</div>
+          <div><div style="font-weight:600;font-size:14px;">Connect your Gmail</div><div style="font-size:12px;color:#6b6b8a;">So Aria can read and reply to emails on your behalf</div></div>
+        </div>
+        <a href="${authUrl}" class="btn btn-google" style="width:100%;text-align:center;">
+          <svg width="18" height="18" viewBox="0 0 18 18"><path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z"/><path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.184l-2.908-2.258c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z"/><path fill="#FBBC05" d="M3.964 10.707A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.707V4.961H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.039l3.007-2.332z"/><path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.961L3.964 6.293C4.672 4.166 6.656 3.58 9 3.58z"/></svg>
+          Connect Gmail
+        </a>
+        <p class="hint" style="margin-top:12px;">Steps 2 and 3 will appear once connected.</p>
+      </div>
+    </div>
+    ` : ''}
+
     ${isConnected ? `
     <!-- Stats Card -->
     <div class="card">
@@ -1698,7 +2101,46 @@ app.get('/connect/gmail', (req, res) => {
         <div class="feat"><div class="icon" style="font-size:28px;font-weight:800;color:#fbbf24;">${stats.followUps}</div><div class="label">Follow-Ups Sent</div></div>
         <div class="feat"><div class="icon" style="font-size:28px;font-weight:800;color:#ff6b6b;">${stats.urgent}</div><div class="label">Urgent Flagged</div></div>
       </div>
-      ${stats.lastReply ? `<div style="font-size:12px;color:#6b6b8a;text-align:center;">Last reply: ${new Date(stats.lastReply).toLocaleString('en-GB')}</div>` : ''}
+      ${stats.lastReply ? `<div style="font-size:12px;color:#6b6b8a;text-align:center;margin-top:8px;">Last reply: ${new Date(stats.lastReply).toLocaleString('en-GB')}</div>` : ''}
+
+      <div class="divider"></div>
+
+      <!-- Lead Scores -->
+      <div style="margin-bottom:16px;">
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px;color:#9898b8;">Lead Quality</div>
+        <div style="display:flex;gap:10px;">
+          <div style="flex:1;background:rgba(255,80,80,0.08);border:1px solid rgba(255,80,80,0.15);border-radius:10px;padding:12px;text-align:center;">
+            <div style="font-size:22px;font-weight:800;color:#ff6b6b;">${stats.leads.hot}</div>
+            <div style="font-size:11px;color:#ff6b6b;font-weight:600;">🔥 Hot</div>
+          </div>
+          <div style="flex:1;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.15);border-radius:10px;padding:12px;text-align:center;">
+            <div style="font-size:22px;font-weight:800;color:#fbbf24;">${stats.leads.warm}</div>
+            <div style="font-size:11px;color:#fbbf24;font-weight:600;">🌤️ Warm</div>
+          </div>
+          <div style="flex:1;background:rgba(56,189,248,0.08);border:1px solid rgba(56,189,248,0.15);border-radius:10px;padding:12px;text-align:center;">
+            <div style="font-size:22px;font-weight:800;color:#38bdf8;">${stats.leads.cold}</div>
+            <div style="font-size:11px;color:#38bdf8;font-weight:600;">❄️ Cold</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Category Breakdown -->
+      <div>
+        <div style="font-size:13px;font-weight:600;margin-bottom:10px;color:#9898b8;">Email Categories</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;">
+          <span style="background:rgba(0,229,160,0.1);color:#00e5a0;padding:4px 12px;border-radius:8px;font-size:12px;font-weight:600;">💰 Quotes: ${stats.categories.quote}</span>
+          <span style="background:rgba(56,189,248,0.1);color:#38bdf8;padding:4px 12px;border-radius:8px;font-size:12px;font-weight:600;">📅 Bookings: ${stats.categories.booking}</span>
+          <span style="background:rgba(255,80,80,0.1);color:#ff6b6b;padding:4px 12px;border-radius:8px;font-size:12px;font-weight:600;">⚠️ Complaints: ${stats.categories.complaint}</span>
+          <span style="background:rgba(251,191,36,0.1);color:#fbbf24;padding:4px 12px;border-radius:8px;font-size:12px;font-weight:600;">⭐ Feedback: ${stats.categories.feedback}</span>
+          <span style="background:rgba(255,255,255,0.06);color:#9898b8;padding:4px 12px;border-radius:8px;font-size:12px;font-weight:600;">📧 General: ${stats.categories.general}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Chart Card -->
+    <div class="card">
+      <h2>📈 30-Day Activity</h2>
+      <canvas id="activityChart" height="200"></canvas>
     </div>
 
     <!-- Auto-Reply Card -->
@@ -1808,18 +2250,81 @@ Example: You are Aria, the assistant for Smith Plumbing — a family plumbing bu
       </div>
     </div>
 
+    <!-- Approval Mode Card -->
+    <div class="card">
+      <h2>✏️ Reply Approval Mode</h2>
+      <div class="toggle-row">
+        <div>
+          <div style="font-size:14px;font-weight:600;margin-bottom:2px;">Review before sending</div>
+          <div style="font-size:12px;color:#6b6b8a;">Aria emails you each draft with approve/reject buttons instead of sending automatically</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="approvalToggle" ${currentCfg.approvalMode ? 'checked' : ''}>
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Custom Footer Card -->
+    <div class="card">
+      <h2>🔗 Email Footer Links</h2>
+      <p>Add social media and booking links to your email signature.</p>
+
+      <label for="facebook">Facebook URL</label>
+      <input type="text" id="facebook" value="${currentCfg.facebook || ''}" placeholder="https://facebook.com/yourbusiness" style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:13px;color:#eee;font-family:inherit;outline:none;margin-bottom:14px;">
+
+      <label for="instagram">Instagram URL</label>
+      <input type="text" id="instagram" value="${currentCfg.instagram || ''}" placeholder="https://instagram.com/yourbusiness" style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:13px;color:#eee;font-family:inherit;outline:none;margin-bottom:14px;">
+
+      <label for="bookingUrl">Booking Page URL</label>
+      <input type="text" id="bookingUrl" value="${currentCfg.bookingUrl || ''}" placeholder="https://calendly.com/yourbusiness" style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:13px;color:#eee;font-family:inherit;outline:none;margin-bottom:14px;">
+
+      <label for="reviewsUrl">Reviews Page URL</label>
+      <input type="text" id="reviewsUrl" value="${currentCfg.reviewsUrl || ''}" placeholder="https://google.com/maps/place/yourbusiness" style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:13px;color:#eee;font-family:inherit;outline:none;margin-bottom:14px;">
+    </div>
+
+    <!-- Knowledge Base Card -->
+    <div class="card">
+      <h2>📚 Knowledge Base</h2>
+      <p>Add FAQs so Aria can answer common questions accurately.</p>
+
+      <div id="kbList" style="margin:16px 0;"></div>
+
+      <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:16px;margin-top:12px;">
+        <label for="kbQuestion">Question</label>
+        <input type="text" id="kbQuestion" placeholder="e.g. What are your opening hours?" style="width:100%;padding:10px 12px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:8px;font-size:13px;color:#eee;font-family:inherit;outline:none;margin-bottom:10px;">
+
+        <label for="kbAnswer">Answer</label>
+        <textarea id="kbAnswer" rows="3" placeholder="e.g. We're open Monday to Friday, 9am to 5pm." style="min-height:70px;"></textarea>
+
+        <button class="btn btn-outline" onclick="addKbEntry()" style="margin-top:10px;width:100%;">+ Add FAQ</button>
+      </div>
+    </div>
+
+    <!-- Reply Log Card -->
+    <div class="card">
+      <h2>📨 Recent Replies</h2>
+      <p>See what Aria has been replying to.</p>
+      <div id="replyLog" style="margin-top:16px;"></div>
+      <button class="btn btn-outline" onclick="loadReplyLog()" style="margin-top:12px;width:100%;">Refresh</button>
+    </div>
+
     <!-- How It Works -->
     <div class="card">
       <h2>💡 How It Works</h2>
       <p style="margin-bottom:8px;">Once enabled, Aria will:</p>
       <div style="font-size:13px;color:#9898b8;line-height:2;">
         1. Check your inbox every 3 minutes<br>
-        2. Read new unread emails (skip spam &amp; marketing automatically)<br>
-        3. Write a professional, branded reply using your business info<br>
-        4. Send the reply from your Gmail with your signature<br>
-        5. If a booking is mentioned, add it to your Google Calendar<br>
-        6. Flag urgent emails and alert you immediately<br>
-        7. Follow up with leads who don't reply within 24h
+        2. Skip spam, marketing, and out-of-office replies automatically<br>
+        3. Remember previous conversations with each sender for context<br>
+        4. Write a professional, branded reply using your business info and FAQs<br>
+        5. Acknowledge any attachments the sender included<br>
+        6. Rate each lead as hot, warm, or cold and categorise the email<br>
+        7. Send the reply from your Gmail with your branded signature<br>
+        8. If a booking is mentioned, add it to your Google Calendar<br>
+        9. Flag urgent emails and alert you immediately<br>
+        10. Follow up with leads who don't reply within 24h<br>
+        11. Rate-limit replies so rapid-fire senders only get one response
       </div>
     </div>
     ` : ''}
@@ -1849,6 +2354,11 @@ Example: You are Aria, the assistant for Smith Plumbing — a family plumbing bu
         hoursEnd: hoursEnabled ? parseInt(document.getElementById('hoursEnd')?.value || '17') : null,
         skipWeekends: document.getElementById('skipWeekends')?.checked || false,
         followUps: document.getElementById('followUpsToggle')?.checked !== false,
+        approvalMode: document.getElementById('approvalToggle')?.checked || false,
+        facebook: document.getElementById('facebook')?.value || '',
+        instagram: document.getElementById('instagram')?.value || '',
+        bookingUrl: document.getElementById('bookingUrl')?.value || '',
+        reviewsUrl: document.getElementById('reviewsUrl')?.value || '',
         timezone: 0,
       };
     }
@@ -1902,6 +2412,135 @@ Example: You are Aria, the assistant for Smith Plumbing — a family plumbing bu
       if (data.ok) showMsg('Inbox checked! If there were new emails, replies have been sent.', 'success');
       else showMsg(data.error || 'Failed to check inbox.', 'error');
     }
+
+    // ── Knowledge Base ──
+    async function loadKb() {
+      try {
+        const r = await fetch('/api/knowledge-base?owner=' + encodeURIComponent(owner));
+        const data = await r.json();
+        const list = document.getElementById('kbList');
+        if (!list) return;
+        if (!data.entries?.length) { list.innerHTML = '<p style="color:#6b6b8a;font-size:13px;text-align:center;">No FAQs added yet.</p>'; return; }
+        list.innerHTML = data.entries.map(e => '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:14px;margin-bottom:10px;">'
+          + '<div style="font-size:13px;font-weight:600;color:#00e5a0;margin-bottom:4px;">Q: ' + e.question + '</div>'
+          + '<div style="font-size:12.5px;color:#9898b8;line-height:1.5;">A: ' + e.answer + '</div>'
+          + '<button onclick="deleteKb(\'' + e.id + '\')" style="margin-top:8px;background:none;border:1px solid rgba(255,80,80,0.3);color:#ff6b6b;font-size:11px;padding:4px 10px;border-radius:6px;cursor:pointer;">Delete</button>'
+          + '</div>').join('');
+      } catch {}
+    }
+
+    async function addKbEntry() {
+      const q = document.getElementById('kbQuestion')?.value?.trim();
+      const a = document.getElementById('kbAnswer')?.value?.trim();
+      if (!q || !a) { showMsg('Please fill in both question and answer.', 'error'); return; }
+      const r = await fetch('/api/knowledge-base', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ owner, question: q, answer: a }) });
+      const data = await r.json();
+      if (data.ok) { document.getElementById('kbQuestion').value = ''; document.getElementById('kbAnswer').value = ''; loadKb(); showMsg('FAQ added!', 'success'); }
+      else showMsg(data.error || 'Failed to add.', 'error');
+    }
+
+    async function deleteKb(id) {
+      const r = await fetch('/api/knowledge-base', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ owner, id }) });
+      const data = await r.json();
+      if (data.ok) { loadKb(); showMsg('FAQ deleted.', 'success'); }
+    }
+
+    // ── Reply Log ──
+    async function loadReplyLog() {
+      try {
+        const r = await fetch('/api/email-autoreply/reply-log?owner=' + encodeURIComponent(owner));
+        const data = await r.json();
+        const el = document.getElementById('replyLog');
+        if (!el) return;
+        if (!data.log?.length) { el.innerHTML = '<p style="color:#6b6b8a;font-size:13px;text-align:center;">No replies yet.</p>'; return; }
+        el.innerHTML = data.log.slice(0, 20).map(r => {
+          const badge = r.type === 'approved' ? '<span style="background:rgba(0,229,160,0.15);color:#00e5a0;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:600;">APPROVED</span>'
+            : r.type === 'rejected' ? '<span style="background:rgba(255,80,80,0.15);color:#ff6b6b;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:600;">REJECTED</span>'
+            : '<span style="background:rgba(56,189,248,0.15);color:#38bdf8;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:600;">AUTO</span>';
+          const scoreBadge = r.leadScore === 'hot' ? '<span style="background:rgba(255,80,80,0.12);color:#ff6b6b;padding:2px 6px;border-radius:5px;font-size:9px;font-weight:700;">🔥 HOT</span>'
+            : r.leadScore === 'warm' ? '<span style="background:rgba(251,191,36,0.12);color:#fbbf24;padding:2px 6px;border-radius:5px;font-size:9px;font-weight:700;">🌤️ WARM</span>'
+            : r.leadScore ? '<span style="background:rgba(56,189,248,0.12);color:#38bdf8;padding:2px 6px;border-radius:5px;font-size:9px;font-weight:700;">❄️ COLD</span>' : '';
+          const catBadge = r.category ? '<span style="background:rgba(255,255,255,0.06);color:#9898b8;padding:2px 6px;border-radius:5px;font-size:9px;font-weight:600;text-transform:uppercase;">' + r.category + '</span>' : '';
+          return '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:14px;margin-bottom:10px;">'
+            + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+            + '<div style="font-size:13px;font-weight:600;color:#eee;">' + (r.senderEmail || 'Unknown') + '</div><div style="display:flex;gap:6px;align-items:center;">' + scoreBadge + catBadge + badge + '</div></div>'
+            + '<div style="font-size:12px;color:#9898b8;margin-bottom:4px;">Re: ' + (r.subject || '') + '</div>'
+            + '<div style="font-size:12px;color:#6b6b8a;line-height:1.5;">' + (r.replyPreview || '').substring(0, 150) + '...</div>'
+            + '<div style="font-size:11px;color:#6b6b8a;margin-top:6px;">' + new Date(r.sentAt).toLocaleString('en-GB') + '</div>'
+            + '</div>';
+        }).join('');
+      } catch {}
+    }
+
+    // Load KB and reply log on page load
+    loadKb();
+    loadReplyLog();
+
+    // ── 30-Day Activity Chart ──
+    const chartEl = document.getElementById('activityChart');
+    if (chartEl) {
+      const labels = ${JSON.stringify(chartLabels)}.map(d => { const p = d.split('-'); return p[2] + '/' + p[1]; });
+      new Chart(chartEl, {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [
+            { label: 'Replies', data: ${JSON.stringify(chartReplies)}, backgroundColor: 'rgba(0,229,160,0.5)', borderRadius: 4 },
+            { label: 'Bookings', data: ${JSON.stringify(chartBookings)}, backgroundColor: 'rgba(56,189,248,0.5)', borderRadius: 4 },
+          ],
+        },
+        options: {
+          responsive: true,
+          plugins: { legend: { labels: { color: '#9898b8', font: { size: 11 } } } },
+          scales: {
+            x: { ticks: { color: '#6b6b8a', font: { size: 10 }, maxRotation: 45 }, grid: { color: 'rgba(255,255,255,0.04)' } },
+            y: { ticks: { color: '#6b6b8a', stepSize: 1 }, grid: { color: 'rgba(255,255,255,0.04)' }, beginAtZero: true },
+          },
+        },
+      });
+    }
+
+    // ── Browser Push Notifications ──
+    if ('Notification' in window && navigator.serviceWorker) {
+      async function setupPush() {
+        if (Notification.permission === 'default') {
+          const btn = document.createElement('div');
+          btn.innerHTML = '<div class="card" style="text-align:center;cursor:pointer;" onclick="requestNotifPermission(this)"><div style="font-size:24px;margin-bottom:8px;">🔔</div><div style="font-size:13px;font-weight:600;">Enable Browser Notifications</div><div style="font-size:12px;color:#6b6b8a;margin-top:4px;">Get instant alerts when urgent emails arrive</div></div>';
+          const wrap = document.querySelector('.wrap');
+          const footer = document.querySelector('.footer');
+          if (wrap && footer) wrap.insertBefore(btn.firstChild, footer);
+        }
+      }
+      setupPush();
+    }
+
+    window.requestNotifPermission = async function(el) {
+      const perm = await Notification.requestPermission();
+      if (perm === 'granted') {
+        el.innerHTML = '<div style="font-size:24px;margin-bottom:8px;">✅</div><div style="font-size:13px;font-weight:600;color:#00e5a0;">Notifications enabled!</div>';
+        // Start polling for urgent emails
+        startUrgentPoll();
+      } else {
+        el.innerHTML = '<div style="font-size:13px;color:#ff6b6b;">Notifications were denied. Enable in browser settings.</div>';
+      }
+    };
+
+    // Poll for urgent notifications (only if permission granted)
+    let lastUrgentCheck = Date.now();
+    function startUrgentPoll() {
+      setInterval(async () => {
+        try {
+          const r = await fetch('/api/email-autoreply/reply-log?owner=' + encodeURIComponent(owner));
+          const data = await r.json();
+          const recent = (data.log || []).filter(l => new Date(l.sentAt).getTime() > lastUrgentCheck && l.category === 'complaint');
+          for (const item of recent) {
+            new Notification('🚨 Urgent: ' + item.subject, { body: 'From: ' + item.senderEmail, icon: '/favicon.ico' });
+          }
+          if (recent.length) lastUrgentCheck = Date.now();
+        } catch {}
+      }, 60000); // check every minute
+    }
+    if (Notification.permission === 'granted') startUrgentPoll();
   </script>
   </body></html>`);
 });
@@ -3891,6 +4530,71 @@ setInterval(async () => {
   console.log('📈 Weekly report sent');
 }, 60_000);
 
+// ─── Per-client weekly email report (Mondays 9am) ─────────────────────────────
+let lastClientWeeklyDay = null;
+setInterval(async () => {
+  const now = new Date();
+  if (now.getDay() !== 1 || now.getHours() !== 9 || lastClientWeeklyDay === now.toDateString()) return;
+  lastClientWeeklyDay = now.toDateString();
+
+  for (const [ownerEmail, config] of EMAIL_AUTO_REPLY_ENABLED) {
+    if (!config?.enabled) continue;
+    const stats = EMAIL_REPLY_STATS.get(ownerEmail);
+    if (!stats || stats.replied === 0) continue;
+    const cfg = config.config || {};
+    const brandColor = cfg.brandColor || '#00e5a0';
+    const businessName = cfg.businessName || 'Your Business';
+
+    // Count this week's activity from history
+    const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const thisWeek = (stats.history || []).filter(h => new Date(h.time) >= new Date(weekAgo));
+    const weekReplied = thisWeek.filter(h => h.type === 'reply').length;
+    const weekBookings = thisWeek.filter(h => h.type === 'booking').length;
+    const weekFollowUps = thisWeek.filter(h => h.type === 'followup').length;
+    const weekUrgent = thisWeek.filter(h => h.type === 'urgent').length;
+
+    if (weekReplied === 0 && weekBookings === 0) continue; // nothing to report
+
+    const serverUrl = process.env.GOOGLE_REDIRECT_URI?.replace('/auth/gmail/callback', '') || `http://localhost:${process.env.PORT || 3000}`;
+
+    try {
+      await smartSend({ ownerEmail, to: ownerEmail, subject: `📊 Aria Weekly Report — ${businessName}`,
+        html: `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;">
+        <div style="max-width:520px;margin:20px auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08);">
+          <div style="background:${brandColor};padding:24px 28px;color:#fff;">
+            <div style="font-size:20px;font-weight:700;">Weekly Report</div>
+            <div style="font-size:13px;opacity:0.85;margin-top:4px;">${businessName} — ${new Date(weekAgo).toLocaleDateString('en-GB')} to ${now.toLocaleDateString('en-GB')}</div>
+          </div>
+          <div style="padding:28px;">
+            <div style="display:flex;gap:12px;margin-bottom:24px;flex-wrap:wrap;">
+              <div style="flex:1;min-width:100px;background:#f8f8fc;border-radius:10px;padding:16px;text-align:center;">
+                <div style="font-size:28px;font-weight:800;color:${brandColor};">${weekReplied}</div>
+                <div style="font-size:12px;color:#888;margin-top:4px;">Emails Replied</div>
+              </div>
+              <div style="flex:1;min-width:100px;background:#f8f8fc;border-radius:10px;padding:16px;text-align:center;">
+                <div style="font-size:28px;font-weight:800;color:#38bdf8;">${weekBookings}</div>
+                <div style="font-size:12px;color:#888;margin-top:4px;">Bookings</div>
+              </div>
+              <div style="flex:1;min-width:100px;background:#f8f8fc;border-radius:10px;padding:16px;text-align:center;">
+                <div style="font-size:28px;font-weight:800;color:#fbbf24;">${weekFollowUps}</div>
+                <div style="font-size:12px;color:#888;margin-top:4px;">Follow-Ups</div>
+              </div>
+            </div>
+            ${weekUrgent ? `<p style="color:#ff6b6b;font-size:13px;margin-bottom:16px;">⚠️ ${weekUrgent} urgent email${weekUrgent > 1 ? 's' : ''} flagged this week</p>` : ''}
+            <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:20px;">
+              <strong>All-time totals:</strong> ${stats.replied} replies, ${stats.bookings} bookings, ${stats.followUps} follow-ups
+            </div>
+            <a href="${serverUrl}/connect/gmail?owner=${encodeURIComponent(ownerEmail)}" style="display:inline-block;padding:12px 24px;background:${brandColor};color:#fff;border-radius:10px;text-decoration:none;font-weight:600;font-size:14px;">View Dashboard</a>
+          </div>
+          <div style="background:#fafafa;padding:12px 28px;text-align:center;font-size:11px;color:#bbb;">
+            Powered by <a href="https://aireyai.co.uk" style="color:${brandColor};text-decoration:none;">AireyAi</a>
+          </div>
+        </div></body></html>` });
+      console.log(`📊 Weekly report sent to ${ownerEmail}`);
+    } catch (e) { console.warn(`Failed to send weekly report to ${ownerEmail}:`, e.message); }
+  }
+}, 60_000);
+
 // ─── Abandoned recovery ───────────────────────────────────────────────────────
 setInterval(async () => {
   if (!process.env.NOTIFY_EMAIL) return;
@@ -3914,6 +4618,10 @@ loadEmailStats();
 loadFollowUps();
 loadPasswords();
 loadSessions();
+loadPendingApprovals();
+loadReplyLog();
+loadKnowledgeBase();
+loadConversationMemory();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`\n  ✦ Aria Chatbot Server v5.1\n  → Admin: http://localhost:${PORT}/admin?pass=${ADMIN}\n  → Health: http://localhost:${PORT}/health\n`));
