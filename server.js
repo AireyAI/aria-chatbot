@@ -464,6 +464,60 @@ app.get('/api/email-autoreply/status', (req, res) => {
   res.json({ owner, enabled: !!config?.enabled });
 });
 
+// Debug — show what's in the inbox and why each email would be skipped
+app.post('/api/email-autoreply/debug', async (req, res) => {
+  const { owner } = req.body;
+  if (!owner) return res.status(400).json({ error: 'owner required' });
+  const entry = gmailTokens.get(owner);
+  if (!entry) return res.status(400).json({ error: 'Gmail not connected' });
+  try {
+    const gmail = google.gmail({ version: 'v1', auth: entry.auth });
+    const list = await gmail.users.messages.list({
+      userId: 'me',
+      q: 'is:unread is:inbox -from:me newer_than:1h',
+      maxResults: 10,
+    });
+    const messages = list.data.messages || [];
+    const results = [];
+    for (const msg of messages) {
+      const full = await gmail.users.messages.get({ userId: 'me', id: msg.id, format: 'full' });
+      const headers = full.data.payload.headers;
+      const from = headers.find(h => h.name.toLowerCase() === 'from')?.value || '';
+      const subject = headers.find(h => h.name.toLowerCase() === 'subject')?.value || '';
+      const senderEmail = from.match(/<(.+?)>/)?.[1] || from.trim();
+
+      let skip = null;
+      if (repliedEmails.has(msg.id)) skip = 'already in repliedEmails set';
+      else if (/noreply|no-reply|mailer-daemon|postmaster|notifications?@|newsletter|digest|updates?@/i.test(senderEmail)) skip = 'automated sender';
+      else if (senderEmail.toLowerCase() === owner.toLowerCase()) skip = 'from self';
+      else {
+        const thread = await gmail.users.threads.get({ userId: 'me', id: full.data.threadId, format: 'metadata', metadataHeaders: ['From'] });
+        const threadMsgs = thread.data.messages || [];
+        const weReplied = threadMsgs.some(m => {
+          const f = m.payload.headers.find(h => h.name.toLowerCase() === 'from')?.value || '';
+          return f.toLowerCase().includes(owner.toLowerCase()) && m.id !== msg.id;
+        });
+        if (weReplied) skip = 'already replied in thread';
+      }
+
+      let bodyText = '';
+      const parts = full.data.payload.parts || [];
+      if (parts.length) {
+        const textPart = parts.find(p => p.mimeType === 'text/plain') || parts[0];
+        if (textPart?.body?.data) bodyText = Buffer.from(textPart.body.data, 'base64').toString('utf-8');
+      } else if (full.data.payload.body?.data) {
+        bodyText = Buffer.from(full.data.payload.body.data, 'base64').toString('utf-8');
+      }
+      if (!skip && !bodyText.trim()) skip = 'empty body';
+
+      results.push({ id: msg.id, from, subject, senderEmail, skip: skip || 'WOULD REPLY', bodyPreview: bodyText.substring(0, 100) });
+    }
+    res.json({ unreadCount: messages.length, repliedSetSize: repliedEmails.size, emails: results });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Manual trigger — check inbox now without waiting for the poll
 app.post('/api/email-autoreply/check-now', async (req, res) => {
   const { owner } = req.body;
