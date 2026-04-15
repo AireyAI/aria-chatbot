@@ -307,14 +307,37 @@ async function checkInboxAndReply(ownerEmail) {
         continue;
       }
 
-      // Extract body text
+      // Extract body text — try plain text first, fall back to HTML
       let bodyText = '';
       const parts = full.data.payload.parts || [];
       if (parts.length) {
-        const textPart = parts.find(p => p.mimeType === 'text/plain') || parts[0];
-        if (textPart?.body?.data) bodyText = Buffer.from(textPart.body.data, 'base64').toString('utf-8');
+        const textPart = parts.find(p => p.mimeType === 'text/plain');
+        const htmlPart = parts.find(p => p.mimeType === 'text/html');
+        if (textPart?.body?.data) {
+          bodyText = Buffer.from(textPart.body.data, 'base64').toString('utf-8');
+        } else if (htmlPart?.body?.data) {
+          bodyText = Buffer.from(htmlPart.body.data, 'base64').toString('utf-8').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+        } else if (parts[0]?.body?.data) {
+          bodyText = Buffer.from(parts[0].body.data, 'base64').toString('utf-8').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+        }
+        // Check nested parts (multipart/alternative inside multipart/mixed)
+        if (!bodyText.trim()) {
+          for (const part of parts) {
+            const subParts = part.parts || [];
+            const sub = subParts.find(p => p.mimeType === 'text/plain') || subParts.find(p => p.mimeType === 'text/html');
+            if (sub?.body?.data) {
+              bodyText = Buffer.from(sub.body.data, 'base64').toString('utf-8').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+              break;
+            }
+          }
+        }
       } else if (full.data.payload.body?.data) {
-        bodyText = Buffer.from(full.data.payload.body.data, 'base64').toString('utf-8');
+        bodyText = Buffer.from(full.data.payload.body.data, 'base64').toString('utf-8').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+      }
+
+      // If body is still empty, use the subject line as context
+      if (!bodyText.trim() && subject.trim()) {
+        bodyText = subject;
       }
 
       if (!bodyText.trim()) { repliedEmails.add(msg.id); continue; }
@@ -516,6 +539,13 @@ app.post('/api/email-autoreply/debug', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// Clear replied set — for retesting
+app.post('/api/email-autoreply/clear-replied', (req, res) => {
+  repliedEmails.clear();
+  persistRepliedEmails();
+  res.json({ ok: true, cleared: true });
 });
 
 // Manual trigger — check inbox now without waiting for the poll
