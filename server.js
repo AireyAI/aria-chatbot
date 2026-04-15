@@ -269,6 +269,7 @@ const INVITES_FILE = resolve('data/invites.json');
 const dashboardPasswords = new Map(); // ownerEmail → hashed password
 const dashboardSessions = new Map();  // token → { ownerEmail, expiresAt }
 const invites = new Map();            // token → { email, url, type, createdAt, used }
+const pendingSetups = new Map();      // token → { profile, createdAt } — temporary store for setup scan results
 
 function loadInvites() {
   try {
@@ -2050,7 +2051,7 @@ app.get('/setup', (req, res) => {
     </head><body><div class="box"><h2>⚠️ Not configured yet</h2><p style="color:#9898b8;margin-top:12px;">Google credentials haven't been set up. Contact your provider.</p></div></body></html>`);
   }
 
-  const authUrl = getAuthUrl('', '');
+  const setupCode = req.query.code;
 
   res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Aria — Connect Your Business</title>
@@ -2064,33 +2065,114 @@ app.get('/setup', (req, res) => {
     p{font-size:14px;color:#9898b8;line-height:1.7;margin-bottom:24px;}
     .gmail-btn{display:flex;align-items:center;justify-content:center;gap:12px;width:100%;padding:15px;border:1.5px solid #ddd;border-radius:12px;background:#fff;color:#333;font-size:15px;font-weight:600;cursor:pointer;text-decoration:none;transition:all .15s;font-family:inherit;}
     .gmail-btn:hover{background:#f8f8f8;transform:translateY(-1px);}
+    .gmail-btn:disabled,.gmail-btn.disabled{opacity:.4;cursor:not-allowed;transform:none;}
+    input{width:100%;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:14px;font-size:14px;color:#eee;font-family:inherit;outline:none;transition:border-color .2s;margin-bottom:16px;}
+    input:focus{border-color:rgba(0,229,160,0.4);}
+    input::placeholder{color:#6b6b8a;}
     .features{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:24px 0;text-align:left;}
     .feat{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:14px;}
     .feat .icon{font-size:20px;margin-bottom:6px;}
     .feat .label{font-size:12px;color:#9898b8;line-height:1.4;}
     .footer{margin-top:24px;font-size:11px;color:#6b6b8a;line-height:1.6;}
+    .spinner{display:inline-block;width:18px;height:18px;border:2px solid rgba(255,255,255,0.2);border-top-color:#00e5a0;border-radius:50%;animation:spin .6s linear infinite;}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .scan-status{font-size:13px;color:#9898b8;margin-bottom:16px;min-height:20px;}
+    .scan-status.done{color:#00e5a0;}
+    .scan-status.error{color:#ff6b6b;}
+    .hide{display:none!important;}
   </style>
   </head><body>
   <div class="box">
     <div class="logo"><span>Aria<em>Ai</em></span></div>
     <h2>Your AI Business Assistant</h2>
-    <p>Connect your Google account and Aria will start replying to your emails and booking your calendar — automatically.</p>
+    <p>Paste your website below and connect your Google account. Aria will learn your business and start replying to customers automatically.</p>
+
+    <input id="site-url" type="url" placeholder="https://yourbusiness.co.uk">
+    <div id="scan-status" class="scan-status"></div>
+
+    <a href="#" id="google-btn" class="gmail-btn" onclick="startSetup(event)">
+      <svg width="20" height="20" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+      Connect with Google
+    </a>
 
     <div class="features">
       <div class="feat"><div class="icon">📧</div><div class="label">Auto-reply to customer emails</div></div>
       <div class="feat"><div class="icon">📅</div><div class="label">Book appointments to your calendar</div></div>
       <div class="feat"><div class="icon">🤖</div><div class="label">AI learns your business</div></div>
-      <div class="feat"><div class="icon">⚡</div><div class="label">Set up in 30 seconds</div></div>
+      <div class="feat"><div class="icon">⚡</div><div class="label">Set up in 60 seconds</div></div>
     </div>
-
-    <a href="${authUrl}" class="gmail-btn">
-      <svg width="20" height="20" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
-      Connect with Google
-    </a>
 
     <div class="footer">We'll access your Gmail to reply to customers and your Calendar to manage bookings. You can disconnect any time.</div>
   </div>
+
+  <script>
+    let scannedProfile = null;
+
+    async function startSetup(e) {
+      e.preventDefault();
+      const url = document.getElementById('site-url').value.trim();
+      const status = document.getElementById('scan-status');
+      const btn = document.getElementById('google-btn');
+
+      if (!url) {
+        status.textContent = 'Please paste your website URL first';
+        status.className = 'scan-status error';
+        document.getElementById('site-url').focus();
+        return;
+      }
+
+      // Scan the website
+      btn.classList.add('disabled');
+      btn.style.pointerEvents = 'none';
+      status.innerHTML = '<span class="spinner"></span> Scanning your website...';
+      status.className = 'scan-status';
+
+      try {
+        const r = await fetch('/api/scan-website', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url }),
+        });
+        const data = await r.json();
+        if (data.error) throw new Error(data.error);
+        scannedProfile = data.profile || data;
+        scannedProfile.websiteUrl = url;
+
+        // Save profile temporarily with a setup token
+        const saveR = await fetch('/api/setup/save-scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ profile: scannedProfile }),
+        });
+        const saveData = await saveR.json();
+
+        status.textContent = '✓ Found: ' + (scannedProfile.name || url);
+        status.className = 'scan-status done';
+
+        // Redirect to Google OAuth with the scan token
+        window.location.href = '/auth/gmail/start?setup=' + saveData.token;
+      } catch (err) {
+        status.textContent = 'Could not scan — try again or check the URL';
+        status.className = 'scan-status error';
+        btn.classList.remove('disabled');
+        btn.style.pointerEvents = '';
+      }
+    }
+  </script>
   </body></html>`);
+});
+
+// Save scanned profile temporarily for setup flow — returns a token to pass through OAuth
+app.post('/api/setup/save-scan', (req, res) => {
+  const { profile } = req.body;
+  if (!profile) return res.status(400).json({ error: 'profile required' });
+  const token = crypto.randomBytes(24).toString('hex');
+  pendingSetups.set(token, { profile, createdAt: Date.now() });
+  // Clean up old entries (> 30 minutes)
+  for (const [k, v] of pendingSetups) {
+    if (Date.now() - v.createdAt > 30 * 60 * 1000) pendingSetups.delete(k);
+  }
+  res.json({ token });
 });
 
 app.get('/connect/gmail', (req, res) => {
@@ -2843,13 +2925,17 @@ Example: You are Aria, the assistant for Smith Plumbing — a family plumbing bu
 app.get('/auth/gmail/callback', async (req, res) => {
   const { code, state: rawState, error } = req.query;
 
-  // Parse state — could be JSON { owner, onboard, quickSetup } or plain email string
+  // Parse state — could be JSON { owner, onboard, quickSetup, setupToken } or plain email string
   let ownerEmail = rawState || '';
   let onboardToken = null;
   let isQuickSetup = false;
+  let setupToken = null;
   try {
     const parsed = JSON.parse(rawState);
-    if (parsed && parsed.quickSetup) {
+    if (parsed && parsed.setupToken) {
+      setupToken = parsed.setupToken;
+      ownerEmail = '';
+    } else if (parsed && parsed.quickSetup) {
       isQuickSetup = true;
       ownerEmail = '';
     } else if (parsed && parsed.owner) {
@@ -2864,8 +2950,8 @@ app.get('/auth/gmail/callback', async (req, res) => {
     const client = makeOAuthClient();
     const { tokens } = await client.getToken(code);
 
-    // If quick setup or no email provided, fetch email from Google
-    if (!ownerEmail || isQuickSetup) {
+    // If no email known, fetch from Google
+    if (!ownerEmail || isQuickSetup || setupToken) {
       client.setCredentials(tokens);
       const oauth2 = google.oauth2({ version: 'v2', auth: client });
       const { data } = await oauth2.userinfo.get();
@@ -2879,7 +2965,37 @@ app.get('/auth/gmail/callback', async (req, res) => {
       return res.redirect(`/onboard?t=${encodeURIComponent(onboardToken)}&gmail_connected=1`);
     }
 
-    // Quick setup — auto-enable auto-reply with a generic prompt, show success
+    // Setup flow with website scan — link the scanned profile to this Google account
+    if (setupToken && pendingSetups.has(setupToken)) {
+      const { profile } = pendingSetups.get(setupToken);
+      pendingSetups.delete(setupToken);
+
+      // Build system prompt from scanned profile
+      const parts = [];
+      if (profile.name) parts.push(`You are the AI assistant for ${profile.name}.`);
+      if (profile.services) parts.push(`Services offered: ${profile.services}.`);
+      if (profile.location) parts.push(`Located at: ${profile.location}.`);
+      if (profile.phone) parts.push(`Phone: ${profile.phone}.`);
+      if (profile.email) parts.push(`Email: ${profile.email}.`);
+      if (profile.hours) parts.push(`Business hours: ${profile.hours}.`);
+      if (profile.summary) parts.push(profile.summary);
+      const systemPrompt = parts.length
+        ? parts.join(' ') + ' Answer customer questions helpfully and accurately based on this information.'
+        : 'You are Aria, a friendly AI assistant. Answer customer questions helpfully.';
+
+      // Save the client profile
+      const cacheKey = (profile.websiteUrl || '').toLowerCase().replace(/\/+$/, '') || ownerEmail;
+      clientProfiles.set(cacheKey, {
+        profile: { ...profile, systemPrompt },
+        scannedAt: new Date().toISOString(),
+      });
+      persistProfiles();
+
+      // Auto-enable auto-reply with the scanned business prompt
+      enableEmailAutoReply(ownerEmail, systemPrompt, { ownerEmail, businessName: profile.name || ownerEmail.split('@')[0] });
+    }
+
+    // Quick setup (no scan) — auto-enable auto-reply with a generic prompt
     if (isQuickSetup) {
       const genericPrompt = `You are Aria, a friendly AI assistant. You help manage emails by providing helpful, professional responses. Always be polite and try to understand what the customer needs. If you're unsure about something specific to the business, let the customer know someone will follow up with more details.`;
       enableEmailAutoReply(ownerEmail, genericPrompt, { ownerEmail, businessName: ownerEmail.split('@')[0] });
@@ -3820,9 +3936,26 @@ app.delete('/api/admin/invite/:token', (req, res) => {
 
 // ─── Onboarding Wizard ──────────────────────────────────────────────────────
 
-// Gmail OAuth start (for onboarding flow)
+// Gmail OAuth start (for onboarding flow + setup flow)
 app.get('/auth/gmail/start', (req, res) => {
-  const { owner, onboard } = req.query;
+  const { owner, onboard, setup } = req.query;
+  // Setup flow — no owner needed, token links to scanned profile
+  if (setup) {
+    const client = makeOAuthClient();
+    const url = client.generateAuthUrl({
+      access_type: 'offline',
+      prompt: 'consent',
+      scope: [
+        'https://www.googleapis.com/auth/gmail.send',
+        'https://www.googleapis.com/auth/gmail.readonly',
+        'https://www.googleapis.com/auth/gmail.modify',
+        'https://www.googleapis.com/auth/calendar',
+        'https://www.googleapis.com/auth/userinfo.email',
+      ],
+      state: JSON.stringify({ setupToken: setup }),
+    });
+    return res.redirect(url);
+  }
   if (!owner) return res.status(400).send('Missing owner parameter');
   const url = getAuthUrl(owner, onboard || null);
   res.redirect(url);
