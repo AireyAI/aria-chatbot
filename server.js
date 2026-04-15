@@ -897,11 +897,12 @@ app.get('/connect/gmail', (req, res) => {
         <button class="disconnect" type="submit">Disconnect Gmail</button>
       </form>
     ` : `
-      <p>Connect your Gmail so the chatbot can send lead alerts, booking confirmations, and follow-up emails <strong>from your own email address</strong>.</p>
+      <p>Connect your Gmail so the chatbot can <strong>read and reply to incoming emails automatically</strong>, send lead alerts, booking confirmations, and follow-ups — all from your own email address.</p>
       <div class="what"><h3>You're giving access to</h3><ul>
-        <li>Send emails on your behalf (only)</li>
-        <li>Cannot read your emails</li>
-        <li>Cannot delete or modify anything</li>
+        <li>Read incoming emails to generate smart replies</li>
+        <li>Send emails and replies on your behalf</li>
+        <li>Mark emails as read after replying</li>
+        <li>Manage your Google Calendar for bookings</li>
         <li>Revoke anytime in Google settings</li>
       </ul></div>
       <a href="${authUrl}" class="btn google">
