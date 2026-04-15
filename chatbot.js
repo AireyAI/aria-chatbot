@@ -695,6 +695,8 @@
     color:var(--text2);line-height:1;z-index:1;}
   .ac-msg.bot:hover .ac-copy-btn{opacity:1;}
   @media(hover:none){.ac-copy-btn{opacity:.5;}}
+  .ac-speak-btn{background:none;border:none;font-size:14px;cursor:pointer;opacity:.4;padding:2px 4px;transition:opacity .2s;}
+  .ac-speak-btn:hover{opacity:.8;}
 
   /* Offline banner */
   #_ac-offline{display:none;padding:8px 14px;background:#ff475718;border-bottom:1px solid #ff475730;
@@ -1762,6 +1764,17 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     insertBefore(d);
   }
 
+  function speakText(text, btn) {
+    if (!window.speechSynthesis) return;
+    if (speechSynthesis.speaking) { speechSynthesis.cancel(); btn.textContent = '🔊'; return; }
+    const utter = new SpeechSynthesisUtterance(text.replace(/[#*_`]/g, ''));
+    utter.rate = 1;
+    utter.pitch = 1;
+    btn.textContent = '⏹';
+    utter.onend = () => { btn.textContent = '🔊'; };
+    speechSynthesis.speak(utter);
+  }
+
   function makeBotBubble(text = '', animate = true) {
     const d = document.createElement('div');
     d.className = 'ac-msg bot';
@@ -1776,6 +1789,15 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
       navigator.clipboard?.writeText(text).then(() => { toast('Copied!', 1200); }).catch(() => {});
     };
     d.appendChild(cp);
+    // Speaker button (TTS)
+    if (window.speechSynthesis) {
+      const speakBtn = document.createElement('button');
+      speakBtn.className = 'ac-speak-btn';
+      speakBtn.textContent = '🔊';
+      speakBtn.setAttribute('aria-label', 'Read aloud');
+      speakBtn.onclick = (e) => { e.stopPropagation(); speakText(d.textContent, speakBtn); };
+      d.appendChild(speakBtn);
+    }
     // ARIA live announcement
     announceToScreenReader(text);
     insertBefore(d); return d;
