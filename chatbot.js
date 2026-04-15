@@ -1546,6 +1546,7 @@ Return JSON:
     const mood    = getBotMood();
     const userLang = navigator.language || 'en';
     const open    = isOpen24();
+    const langInstruction = 'LANGUAGE: Detect the language of the user message. Always respond in the same language the user writes in. If they switch languages, switch with them.';
 
     const productInfo = CONFIG.products.length
       ? '\nPRODUCTS/SERVICES (recommend based on context):\n' +
@@ -1605,7 +1606,7 @@ Help every visitor complete their goal AND convert them into a lead, booking, or
 
 4. SOUND HUMAN — smart, warm colleague. Contractions, natural rhythm. Current energy: ${mood.vibe}. One emoji max. Zero emojis if user seems frustrated.
 
-5. LANGUAGE — respond in the visitor's language (browser: ${userLang}).
+5. ${langInstruction} (Browser language hint: ${userLang})
 
 ━━━ CONVERSION FRAMEWORK ━━━
 Every message should advance one of these goals:
