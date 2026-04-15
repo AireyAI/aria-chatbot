@@ -101,8 +101,11 @@ function makeOAuthClient() {
   );
 }
 
-function getAuthUrl(ownerEmail) {
+function getAuthUrl(ownerEmail, onboardToken) {
   const client = makeOAuthClient();
+  const stateValue = onboardToken
+    ? JSON.stringify({ owner: ownerEmail, onboard: onboardToken })
+    : ownerEmail || '';
   return client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
@@ -112,7 +115,7 @@ function getAuthUrl(ownerEmail) {
       'https://www.googleapis.com/auth/gmail.modify',
       'https://www.googleapis.com/auth/calendar',
     ],
-    state: ownerEmail || '',
+    state: stateValue,
   });
 }
 
@@ -2775,13 +2778,31 @@ Example: You are Aria, the assistant for Smith Plumbing — a family plumbing bu
 
 // OAuth2 callback — Google redirects here after owner signs in
 app.get('/auth/gmail/callback', async (req, res) => {
-  const { code, state: ownerEmail, error } = req.query;
+  const { code, state: rawState, error } = req.query;
+
+  // Parse state — could be JSON { owner, onboard } or plain email string
+  let ownerEmail = rawState || '';
+  let onboardToken = null;
+  try {
+    const parsed = JSON.parse(rawState);
+    if (parsed && parsed.owner) {
+      ownerEmail = parsed.owner;
+      onboardToken = parsed.onboard || null;
+    }
+  } catch (_) { /* rawState is plain email string — already assigned */ }
+
   if (error) return res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center"><h2>❌ Access denied</h2><p>${error}</p><p><a href="/connect/gmail?owner=${ownerEmail}">Try again</a></p></body></html>`);
   if (!code) return res.status(400).send('No code received');
   try {
     const client = makeOAuthClient();
     const { tokens } = await client.getToken(code);
     await saveGmailTokens(ownerEmail, tokens);
+
+    // If coming from onboarding wizard, redirect back there
+    if (onboardToken) {
+      return res.redirect(`/onboard?t=${encodeURIComponent(onboardToken)}&gmail_connected=1`);
+    }
+
     // Create a session so they go straight to the dashboard
     const token = createSession(ownerEmail);
     res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><style>body{font-family:sans-serif;background:#0d0d1f;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;color:#eee}.box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:40px;text-align:center;max-width:440px;}</style></head>
@@ -3656,6 +3677,413 @@ app.delete('/api/admin/invite/:token', (req, res) => {
   invites.delete(req.params.token);
   persistInvites();
   res.json({ ok: true });
+});
+
+// ─── Onboarding Wizard ──────────────────────────────────────────────────────
+
+// Gmail OAuth start (for onboarding flow)
+app.get('/auth/gmail/start', (req, res) => {
+  const { owner, onboard } = req.query;
+  if (!owner) return res.status(400).send('Missing owner parameter');
+  const url = getAuthUrl(owner, onboard || null);
+  res.redirect(url);
+});
+
+// Save profile from onboarding wizard
+app.post('/api/onboard/save-profile', (req, res) => {
+  const { token, profile } = req.body;
+  if (!token || !profile) return res.status(400).json({ error: 'token and profile required' });
+  const invite = invites.get(token);
+  if (!invite) return res.status(400).json({ error: 'Invalid invite token' });
+
+  // Build system prompt from profile fields
+  const parts = [];
+  if (profile.businessName) parts.push(`You are the AI assistant for ${profile.businessName}.`);
+  if (profile.services) parts.push(`Services offered: ${profile.services}.`);
+  if (profile.location) parts.push(`Located at: ${profile.location}.`);
+  if (profile.phone) parts.push(`Phone: ${profile.phone}.`);
+  if (profile.email) parts.push(`Email: ${profile.email}.`);
+  if (profile.hours) parts.push(`Business hours: ${profile.hours}.`);
+  const systemPrompt = parts.length
+    ? parts.join(' ') + ' Answer customer questions helpfully and accurately based on this information.'
+    : 'You are a helpful business assistant.';
+
+  // Save profile keyed by invite email
+  const ownerEmail = invite.email;
+  const url = invite.url || profile.website || '';
+  const cacheKey = url ? url.toLowerCase().replace(/\/+$/, '') : ownerEmail;
+  clientProfiles.set(cacheKey, {
+    profile: { ...profile, systemPrompt },
+    scannedAt: new Date().toISOString(),
+  });
+  persistProfiles();
+
+  res.json({ ok: true });
+});
+
+// Complete onboarding
+app.post('/api/onboard/complete', (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: 'token required' });
+  const invite = invites.get(token);
+  if (!invite) return res.status(400).json({ error: 'Invalid invite token' });
+
+  // Mark invite as used
+  invite.used = true;
+  persistInvites();
+
+  const ownerEmail = invite.email;
+
+  // If Gmail is connected and profile exists, auto-enable email auto-reply
+  if (gmailTokens.has(ownerEmail)) {
+    // Find profile
+    const url = invite.url || '';
+    const cacheKey = url ? url.toLowerCase().replace(/\/+$/, '') : ownerEmail;
+    const cached = clientProfiles.get(cacheKey);
+    if (cached?.profile?.systemPrompt) {
+      enableEmailAutoReply(ownerEmail, cached.profile.systemPrompt, {
+        businessName: cached.profile.businessName || '',
+        phone: cached.profile.phone || '',
+        website: url,
+        ownerEmail,
+      });
+    }
+  }
+
+  res.json({ ok: true });
+});
+
+// Onboarding wizard page
+app.get('/onboard', (req, res) => {
+  const token = req.query.t;
+  const gmailConnected = req.query.gmail_connected === '1';
+  const serverUrl = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN
+    : process.env.GOOGLE_REDIRECT_URI?.replace('/auth/gmail/callback', '') || `http://localhost:${process.env.PORT || 3000}`;
+
+  // Validate token
+  if (!token) {
+    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#eee;}.box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:36px;max-width:400px;width:100%;text-align:center;}</style>
+    </head><body><div class="box">
+      <div style="font-size:36px;margin-bottom:16px;">&#10060;</div>
+      <h2>Invalid Link</h2>
+      <p style="color:#9898b8;margin:16px 0;">This onboarding link is missing a valid token. Please check your invite email and try again.</p>
+    </div></body></html>`);
+  }
+
+  const invite = invites.get(token);
+  if (!invite) {
+    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#eee;}.box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:36px;max-width:400px;width:100%;text-align:center;}</style>
+    </head><body><div class="box">
+      <div style="font-size:36px;margin-bottom:16px;">&#10060;</div>
+      <h2>Invalid Link</h2>
+      <p style="color:#9898b8;margin:16px 0;">This onboarding link is not valid. Please contact support for a new invite.</p>
+    </div></body></html>`);
+  }
+
+  if (invite.used) {
+    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#eee;}.box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:36px;max-width:400px;width:100%;text-align:center;}a{color:#00e5a0;text-decoration:none;}</style>
+    </head><body><div class="box">
+      <div style="font-size:36px;margin-bottom:16px;">&#9989;</div>
+      <h2>Already Set Up</h2>
+      <p style="color:#9898b8;margin:16px 0;">This invite link has already been used.</p>
+      <a href="/connect/gmail?owner=${encodeURIComponent(invite.email)}" style="display:inline-block;margin-top:8px;padding:14px 28px;background:#00e5a0;color:#0d0d1f;border-radius:12px;text-decoration:none;font-weight:600;">Go to Dashboard</a>
+    </div></body></html>`);
+  }
+
+  // Check if expired (7 days)
+  const ageMs = Date.now() - new Date(invite.createdAt).getTime();
+  if (ageMs > 7 * 24 * 60 * 60 * 1000) {
+    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#eee;}.box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:36px;max-width:400px;width:100%;text-align:center;}</style>
+    </head><body><div class="box">
+      <div style="font-size:36px;margin-bottom:16px;">&#9200;</div>
+      <h2>Link Expired</h2>
+      <p style="color:#9898b8;margin:16px 0;">This invite link has expired. Please contact AireyAI for a new invite.</p>
+    </div></body></html>`);
+  }
+
+  // Valid invite — serve the wizard
+  const inviteEmail = invite.email || '';
+  const inviteUrl = invite.url || '';
+  const isGmailConnected = gmailConnected || gmailTokens.has(inviteEmail);
+
+  res.send(`<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aria Setup - Get Started</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;color:#eee;display:flex;align-items:center;justify-content:center;padding:20px;}
+.container{max-width:520px;width:100%;}
+.logo{text-align:center;margin-bottom:28px;}
+.logo span{font-size:28px;font-weight:800;color:#fff;letter-spacing:-0.5px;}
+.logo span em{font-style:normal;color:#00e5a0;}
+.progress{display:flex;justify-content:center;gap:12px;margin-bottom:32px;}
+.dot{width:12px;height:12px;border-radius:50%;background:rgba(255,255,255,0.1);transition:background 0.3s,box-shadow 0.3s;}
+.dot.active{background:#00e5a0;box-shadow:0 0 12px rgba(0,229,160,0.4);}
+.dot.done{background:#00e5a0;opacity:0.5;}
+.card{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:32px;margin-bottom:16px;}
+h2{font-size:20px;font-weight:700;margin-bottom:8px;}
+p.sub{font-size:13px;color:#9898b8;margin-bottom:24px;line-height:1.6;}
+label{display:block;font-size:12px;color:#9898b8;margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;}
+input[type=text],input[type=email],input[type=url],input[type=password],input[type=tel],textarea{
+  width:100%;padding:13px 16px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);
+  border-radius:10px;font-size:14px;color:#eee;font-family:inherit;outline:none;margin-bottom:16px;transition:border-color 0.2s;
+}
+input:focus,textarea:focus{border-color:rgba(0,229,160,0.5);}
+textarea{min-height:80px;resize:vertical;}
+.btn{display:block;width:100%;padding:14px;background:#00e5a0;color:#0d0d1f;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit;transition:opacity 0.15s;}
+.btn:hover{opacity:0.88;}
+.btn:disabled{opacity:0.5;cursor:not-allowed;}
+.btn-outline{background:transparent;border:1px solid rgba(0,229,160,0.3);color:#00e5a0;}
+.btn-outline:hover{background:rgba(0,229,160,0.08);}
+.msg{padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:14px;display:none;}
+.msg.error{display:block;background:rgba(255,80,80,0.1);border:1px solid rgba(255,80,80,0.2);color:#ff6b6b;}
+.msg.success{display:block;background:rgba(0,229,160,0.1);border:1px solid rgba(0,229,160,0.25);color:#00e5a0;}
+.spinner{display:inline-block;width:18px;height:18px;border:2px solid rgba(0,229,160,0.3);border-top-color:#00e5a0;border-radius:50%;animation:spin 0.6s linear infinite;vertical-align:middle;margin-right:8px;}
+@keyframes spin{to{transform:rotate(360deg)}}
+.step{display:none;}.step.active{display:block;}
+.skip-link{display:block;text-align:center;margin-top:12px;font-size:12px;color:#6b6b8a;cursor:pointer;text-decoration:underline;}
+.skip-link:hover{color:#9898b8;}
+.gmail-btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:14px;background:#fff;color:#333;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit;transition:opacity 0.15s;}
+.gmail-btn:hover{opacity:0.9;}
+.gmail-btn svg{width:20px;height:20px;}
+.connected-badge{display:flex;align-items:center;gap:8px;padding:14px;background:rgba(0,229,160,0.08);border:1px solid rgba(0,229,160,0.25);border-radius:12px;color:#00e5a0;font-size:14px;font-weight:600;justify-content:center;margin-bottom:16px;}
+.field-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+@media(max-width:500px){.field-row{grid-template-columns:1fr;}}
+.complete-icon{font-size:64px;text-align:center;margin-bottom:16px;}
+</style>
+</head><body>
+<div class="container">
+  <div class="logo"><span>Aria <em>by AireyAI</em></span></div>
+  <div class="progress">
+    <div class="dot active" id="dot1"></div>
+    <div class="dot" id="dot2"></div>
+    <div class="dot" id="dot3"></div>
+    <div class="dot" id="dot4"></div>
+  </div>
+
+  <!-- STEP 1: Website Scan -->
+  <div class="step active" id="step1">
+    <div class="card">
+      <h2>Scan Your Website</h2>
+      <p class="sub">We'll pull your business info automatically so Aria knows how to help your customers.</p>
+      <div id="scanMsg" class="msg"></div>
+      <label>Website URL</label>
+      <input type="url" id="websiteUrl" placeholder="https://yourbusiness.com" value="${inviteUrl}">
+      <button class="btn" id="scanBtn" onclick="scanWebsite()">Scan My Website</button>
+      <span class="skip-link" onclick="skipScan()">Skip — I'll enter details manually</span>
+    </div>
+  </div>
+
+  <!-- STEP 2: Confirm Profile -->
+  <div class="step" id="step2">
+    <div class="card">
+      <h2>Confirm Your Profile</h2>
+      <p class="sub">Review and edit the details below. Aria will use this to answer your customers.</p>
+      <div id="profileMsg" class="msg"></div>
+      <label>Business Name</label>
+      <input type="text" id="pName" placeholder="Your Business Name">
+      <label>Services</label>
+      <textarea id="pServices" placeholder="List your main services or products..."></textarea>
+      <div class="field-row">
+        <div><label>Location</label><input type="text" id="pLocation" placeholder="City, State"></div>
+        <div><label>Phone</label><input type="tel" id="pPhone" placeholder="07xxx xxx xxx"></div>
+      </div>
+      <div class="field-row">
+        <div><label>Email</label><input type="email" id="pEmail" value="${inviteEmail}"></div>
+        <div><label>Hours</label><input type="text" id="pHours" placeholder="Mon-Fri 9am-5pm"></div>
+      </div>
+      <button class="btn" onclick="saveProfile()">Looks Good &#8212; Next</button>
+    </div>
+  </div>
+
+  <!-- STEP 3: Connect Gmail -->
+  <div class="step" id="step3">
+    <div class="card">
+      <h2>Connect Gmail</h2>
+      <p class="sub">Let Aria send and reply to emails on your behalf. This is optional but recommended.</p>
+      <div id="gmailMsg" class="msg"></div>
+      <div id="gmailNotConnected">
+        <a href="/auth/gmail/start?owner=${encodeURIComponent(inviteEmail)}&onboard=${encodeURIComponent(token)}" class="gmail-btn" style="text-decoration:none;">
+          <svg viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18A10.97 10.97 0 0 0 1 12c0 1.77.42 3.45 1.18 4.93l3.66-2.84z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+          Connect with Google
+        </a>
+        <span class="skip-link" onclick="skipGmail()">Skip for now</span>
+      </div>
+      <div id="gmailConnected" style="display:none;">
+        <div class="connected-badge">&#10003; Gmail Connected</div>
+        <button class="btn" onclick="goToStep(4)">Continue</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- STEP 4: Set Password -->
+  <div class="step" id="step4">
+    <div class="card">
+      <h2>Set Your Password</h2>
+      <p class="sub">Create a password for your Aria dashboard. You'll use this to log in and manage settings.</p>
+      <div id="pwMsg" class="msg"></div>
+      <label>Password</label>
+      <input type="password" id="pw1" placeholder="Choose a password (4+ characters)">
+      <label>Confirm Password</label>
+      <input type="password" id="pw2" placeholder="Confirm your password">
+      <button class="btn" onclick="completeSetup()">Complete Setup</button>
+    </div>
+  </div>
+
+  <!-- COMPLETE -->
+  <div class="step" id="stepDone">
+    <div class="card" style="text-align:center;">
+      <div class="complete-icon">&#127881;</div>
+      <h2 style="font-size:24px;">Aria Is Live!</h2>
+      <p class="sub" style="margin-bottom:28px;">Your AI assistant is ready to help your customers. Head to your dashboard to fine-tune settings.</p>
+      <a href="/connect/gmail?owner=${encodeURIComponent(inviteEmail)}" class="btn" style="text-decoration:none;display:block;text-align:center;">Go to Dashboard</a>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOKEN = '${token}';
+const OWNER = '${inviteEmail}';
+const PRE_URL = '${inviteUrl}';
+let currentStep = 1;
+let scannedProfile = null;
+
+// If gmail was just connected, jump to step 4
+if (${isGmailConnected ? 'true' : 'false'}) {
+  goToStep(4);
+}
+// If URL pre-filled, auto-trigger scan
+else if (PRE_URL) {
+  setTimeout(() => scanWebsite(), 300);
+}
+
+function goToStep(n) {
+  currentStep = n;
+  document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+  const stepEl = n <= 4 ? document.getElementById('step' + n) : document.getElementById('stepDone');
+  if (stepEl) stepEl.classList.add('active');
+  // Update dots
+  for (let i = 1; i <= 4; i++) {
+    const dot = document.getElementById('dot' + i);
+    dot.className = 'dot';
+    if (i < n) dot.classList.add('done');
+    if (i === n && n <= 4) dot.classList.add('active');
+  }
+}
+
+async function scanWebsite() {
+  const url = document.getElementById('websiteUrl').value.trim();
+  if (!url) { showMsg('scanMsg', 'Please enter a website URL.', 'error'); return; }
+  const btn = document.getElementById('scanBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Scanning...';
+  showMsg('scanMsg', '', '');
+  try {
+    const r = await fetch('/api/scan-website', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
+    const data = await r.json();
+    if (data.ok && data.profile) {
+      scannedProfile = data.profile;
+      // Pre-fill step 2
+      document.getElementById('pName').value = data.profile.businessName || '';
+      document.getElementById('pServices').value = (data.profile.services || []).join(', ');
+      document.getElementById('pLocation').value = data.profile.location || '';
+      document.getElementById('pPhone').value = data.profile.phone || '';
+      document.getElementById('pHours').value = data.profile.hours || '';
+      showMsg('scanMsg', 'Website scanned successfully!', 'success');
+      setTimeout(() => goToStep(2), 800);
+    } else {
+      showMsg('scanMsg', data.error || 'Scan failed. You can enter details manually.', 'error');
+      btn.disabled = false;
+      btn.textContent = 'Scan My Website';
+    }
+  } catch (e) {
+    showMsg('scanMsg', 'Network error. You can skip and enter details manually.', 'error');
+    btn.disabled = false;
+    btn.textContent = 'Scan My Website';
+  }
+}
+
+function skipScan() { goToStep(2); }
+
+async function saveProfile() {
+  const profile = {
+    businessName: document.getElementById('pName').value.trim(),
+    services: document.getElementById('pServices').value.trim(),
+    location: document.getElementById('pLocation').value.trim(),
+    phone: document.getElementById('pPhone').value.trim(),
+    email: document.getElementById('pEmail').value.trim(),
+    hours: document.getElementById('pHours').value.trim(),
+    website: document.getElementById('websiteUrl')?.value?.trim() || PRE_URL,
+  };
+  if (!profile.businessName) { showMsg('profileMsg', 'Please enter a business name.', 'error'); return; }
+  try {
+    const r = await fetch('/api/onboard/save-profile', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: TOKEN, profile }) });
+    const data = await r.json();
+    if (data.ok) {
+      goToStep(3);
+      // Check if Gmail already connected
+      checkGmailStatus();
+    } else {
+      showMsg('profileMsg', data.error || 'Failed to save profile.', 'error');
+    }
+  } catch (e) {
+    showMsg('profileMsg', 'Network error. Please try again.', 'error');
+  }
+}
+
+async function checkGmailStatus() {
+  try {
+    const r = await fetch('/connect/gmail/status?owner=' + encodeURIComponent(OWNER));
+    const data = await r.json();
+    if (data.connected) {
+      document.getElementById('gmailNotConnected').style.display = 'none';
+      document.getElementById('gmailConnected').style.display = 'block';
+    }
+  } catch (_) {}
+}
+
+function skipGmail() { goToStep(4); }
+
+async function completeSetup() {
+  const pw = document.getElementById('pw1').value;
+  const pw2 = document.getElementById('pw2').value;
+  if (!pw || pw.length < 4) { showMsg('pwMsg', 'Password must be at least 4 characters.', 'error'); return; }
+  if (pw !== pw2) { showMsg('pwMsg', 'Passwords do not match.', 'error'); return; }
+  try {
+    // Set password
+    const r1 = await fetch('/api/dashboard/set-password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ owner: OWNER, password: pw }) });
+    const d1 = await r1.json();
+    if (!d1.ok && d1.error !== 'Password already set. Use reset if needed.') {
+      showMsg('pwMsg', d1.error || 'Failed to set password.', 'error');
+      return;
+    }
+    // Complete onboarding
+    const r2 = await fetch('/api/onboard/complete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: TOKEN }) });
+    const d2 = await r2.json();
+    if (d2.ok) {
+      goToStep(5); // shows completion screen
+    } else {
+      showMsg('pwMsg', d2.error || 'Failed to complete setup.', 'error');
+    }
+  } catch (e) {
+    showMsg('pwMsg', 'Network error. Please try again.', 'error');
+  }
+}
+
+function showMsg(id, text, type) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'msg' + (type ? ' ' + type : '');
+  el.style.display = text ? 'block' : 'none';
+}
+</script>
+</body></html>`);
 });
 
 // ─── Admin dashboard ──────────────────────────────────────────────────────────
