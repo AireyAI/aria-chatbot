@@ -4187,6 +4187,7 @@ textarea{resize:vertical;min-height:60px;}
     <button class="tab" onclick="tab('usage')">📈 Usage</button>
     <button class="tab" onclick="tab('domains')">🔒 Domains</button>
     <button class="tab" onclick="tab('settings')">⚙️ Settings</button>
+    <button class="tab" onclick="tab('invites')">🔗 Invites</button>
   </div>
 
   <div id="p-convos" class="panel on"><div id="sessions"></div></div>
@@ -4494,6 +4495,52 @@ textarea{resize:vertical;min-height:60px;}
       <span id="cap-saved" style="display:none;margin-left:12px;font-size:12px;color:#2ecc71">✓ Saved</span>
     </div>
   </div>
+
+  <div id="p-invites" class="panel">
+    <div class="card">
+      <h3>🔗 Generate Invite Link</h3>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+        <label style="display:block">
+          <div style="font-size:12px;color:#8888aa;margin-bottom:5px">Client email <span style="color:#e74c3c">*</span></div>
+          <input id="inv-email" type="email" placeholder="client@example.com" required style="width:100%"/>
+        </label>
+        <label style="display:block">
+          <div style="font-size:12px;color:#8888aa;margin-bottom:5px">Website URL (optional)</div>
+          <input id="inv-url" type="url" placeholder="https://example.com" style="width:100%"/>
+        </label>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px">
+        <label style="display:block">
+          <div style="font-size:12px;color:#8888aa;margin-bottom:5px">Business type</div>
+          <select id="inv-type" class="status-sel" style="width:100%;padding:8px 12px;font-size:13px;border-radius:8px">
+            <option value="trades">Trades</option>
+            <option value="salon">Salon</option>
+            <option value="restaurant">Restaurant</option>
+            <option value="gym">Gym</option>
+            <option value="clinic">Clinic</option>
+            <option value="agency">Agency</option>
+            <option value="ecommerce">Ecommerce</option>
+            <option value="law">Law</option>
+          </select>
+        </label>
+        <div style="display:flex;align-items:flex-end">
+          <button class="btn" onclick="generateInvite()" style="width:100%">Generate Link</button>
+        </div>
+      </div>
+      <div id="inv-result" style="display:none;background:#13131f;border:1px solid #2a2a44;border-radius:8px;padding:14px;margin-bottom:14px">
+        <div style="font-size:12px;color:#8888aa;margin-bottom:6px">Invite link:</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input id="inv-link" readonly style="flex:1;background:#0f0f1a;border-color:#6C63FF;color:#6C63FF;font-size:12px"/>
+          <button class="btn ghost" onclick="copyInvite()" style="flex-shrink:0">📋 Copy</button>
+        </div>
+        <div id="inv-copied" style="display:none;font-size:11px;color:#2ecc71;margin-top:6px">✓ Copied to clipboard</div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>📋 Existing Invites</h3>
+      <div id="inv-list" style="font-size:13px;color:#8888aa">Loading...</div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -4723,7 +4770,7 @@ async function pollTracking() {
 }
 
 function tab(name) {
-  const names=['convos','leads','bookings','dropship','gaps','handoffs','faq','ab','nps','insights','gmail','usage','domains','settings'];
+  const names=['convos','leads','bookings','dropship','gaps','handoffs','faq','ab','nps','insights','gmail','usage','domains','settings','invites'];
   document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('on',names[i]===name));
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('on'));
   el('p-'+name).classList.add('on');
@@ -4731,6 +4778,7 @@ function tab(name) {
   if (name === 'usage') loadUsage();
   if (name === 'domains') loadDomains();
   if (name === 'settings') loadSettings();
+  if (name === 'invites') loadInvites();
 }
 
 async function loadDomains() {
@@ -4951,6 +4999,50 @@ function renderGmailConnections(){
 function copyConnectLink(email){
   navigator.clipboard?.writeText(BASE_URL+'/connect/gmail?owner='+encodeURIComponent(email));
   alert('Link copied for '+email);
+}
+
+// ── Invites ──
+async function generateInvite() {
+  const email = el('inv-email').value.trim();
+  if (!email) { alert('Email is required'); return; }
+  const body = { email, websiteUrl: el('inv-url').value.trim(), businessType: el('inv-type').value };
+  const r = await fetch('/api/admin/invite?pass='+PASS, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+  const d = await r.json();
+  if (d.link) {
+    el('inv-link').value = d.link;
+    el('inv-result').style.display = 'block';
+    el('inv-copied').style.display = 'none';
+    el('inv-email').value = '';
+    el('inv-url').value = '';
+    loadInvites();
+  } else { alert(d.error || 'Failed to generate invite'); }
+}
+function copyInvite() {
+  navigator.clipboard?.writeText(el('inv-link').value);
+  el('inv-copied').style.display = 'block';
+  setTimeout(() => el('inv-copied').style.display = 'none', 2000);
+}
+async function loadInvites() {
+  const r = await fetch('/api/admin/invites?pass='+PASS);
+  const invites = await r.json();
+  if (!invites.length) { el('inv-list').innerHTML = '<div style="padding:12px 0;color:#8888aa">No invites yet</div>'; return; }
+  el('inv-list').innerHTML = invites.map(inv => {
+    const date = new Date(inv.createdAt).toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'});
+    const status = inv.used ? 'Used' : (inv.expired ? 'Expired' : 'Active');
+    const badgeClass = inv.used ? 'b-converted' : (inv.expired ? 'b-lost' : 'b-new');
+    return '<div class="lead-row">'
+      + '<span class="lead-email">' + (inv.email||'—') + '</span>'
+      + '<span class="lead-meta">' + (inv.businessType||'') + (inv.websiteUrl ? ' · '+inv.websiteUrl : '') + '</span>'
+      + '<span class="badge '+badgeClass+'">' + status + '</span>'
+      + '<span style="font-size:11.5px;color:#8888aa">' + date + '</span>'
+      + '<button class="del-btn" onclick="deleteInvite(\\'' + inv.token + '\\')">Delete</button>'
+      + '</div>';
+  }).join('');
+}
+async function deleteInvite(token) {
+  if (!confirm('Delete this invite?')) return;
+  await fetch('/api/admin/invite/'+token+'?pass='+PASS, { method:'DELETE' });
+  loadInvites();
 }
 
 load();
