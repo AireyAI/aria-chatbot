@@ -2894,6 +2894,40 @@ app.post('/api/chat/stream', async (req, res) => {
   }
 });
 
+// ─── Image Upload ────────────────────────────────────────────────────────────
+app.post('/api/chat/upload', async (req, res) => {
+  try {
+    const { image, message, system, sessionId, model } = req.body;
+    if (!image) return res.status(400).json({ error: 'No image provided' });
+
+    const match = image.match(/^data:(image\/\w+);base64,(.+)$/);
+    if (!match) return res.status(400).json({ error: 'Invalid image format' });
+
+    const mediaType = match[1];
+    const data = match[2];
+
+    const messages = [{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: mediaType, data } },
+        { type: 'text', text: message || 'What do you see in this image? How can you help based on what you see?' },
+      ],
+    }];
+
+    const response = await claude.messages.create({
+      model: model || 'claude-haiku-4-5-20251001',
+      max_tokens: 800,
+      system: system || '',
+      messages,
+    });
+
+    trackUsage(response.usage?.input_tokens || 0, response.usage?.output_tokens || 0);
+    res.json(response);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── Session ──────────────────────────────────────────────────────────────────
 app.post('/api/session', (req, res) => {
   const { sessionId, messages, page, url, referrer, rating, nps, npsComment, sentiment, abVariant, journey } = req.body;

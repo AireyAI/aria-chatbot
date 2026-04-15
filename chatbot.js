@@ -583,6 +583,9 @@
   #_ac-mic:hover{border-color:var(--ab);color:var(--ab);}
   #_ac-mic.on{background:#ff4757;border-color:#ff4757;color:#fff;animation:_apls 1s infinite;}
   #_ac-mic.hide{display:none;}
+  #_ac-upload{background:none;border:none;font-size:18px;cursor:pointer;padding:4px 6px;opacity:.6;transition:opacity .2s;}
+  #_ac-upload:hover{opacity:1;}
+  .ac-img-preview{max-width:200px;max-height:150px;border-radius:8px;margin:8px 0;}
   #_ac-inp{flex:1;border:1.5px solid var(--border);border-radius:20px;padding:9px 15px;
     font-size:16px;outline:none;resize:none;max-height:90px;font-family:inherit;
     color:var(--text);background:var(--inp);transition:border-color .2s,background .2s,box-shadow .2s;line-height:1.4;}
@@ -1447,6 +1450,8 @@ Return JSON:
         <div id="_ac-toast"></div>
         <div id="_ac-inp-area">
           <button id="_ac-mic" class="${hasVoice ? '' : 'hide'}" aria-label="Voice input">🎙</button>
+          <button id="_ac-upload" aria-label="Upload image" title="Send an image">📎</button>
+          <input type="file" id="_ac-file" accept="image/jpeg,image/png,image/webp,image/gif" style="display:none">
           <textarea id="_ac-inp" placeholder="Message ${CONFIG.botName}..." rows="1" aria-label="Chat input"></textarea>
           <button id="_ac-send" aria-label="Send" disabled>➤</button>
         </div>
@@ -2612,6 +2617,63 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
       resetInactivity();
     });
     send.onclick = () => sendMessage(inp.value);
+
+    const uploadBtn = document.getElementById('_ac-upload');
+    const fileInput = document.getElementById('_ac-file');
+    if (uploadBtn && fileInput) {
+      uploadBtn.addEventListener('click', () => fileInput.click());
+      fileInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        if (file.size > 5 * 1024 * 1024) { showToast('Max file size is 5MB'); return; }
+
+        const reader = new FileReader();
+        reader.onload = async () => {
+          const dataUrl = reader.result;
+          // Show user's image in chat
+          const userDiv = document.createElement('div');
+          userDiv.className = 'ac-msg ac-user';
+          const img = document.createElement('img');
+          img.src = dataUrl;
+          img.className = 'ac-img-preview';
+          userDiv.appendChild(img);
+          const msgText = document.getElementById('_ac-inp').value.trim();
+          if (msgText) {
+            const p = document.createElement('p');
+            p.textContent = msgText;
+            userDiv.appendChild(p);
+          }
+          insertBefore(userDiv);
+          scrollBottom();
+          document.getElementById('_ac-inp').value = '';
+
+          showTyping();
+          try {
+            const res = await fetch(BASE + '/api/chat/upload', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                image: dataUrl,
+                message: msgText || undefined,
+                system: buildSystemPrompt(),
+                sessionId: SESSION_ID,
+                model: 'claude-haiku-4-5-20251001',
+              }),
+            });
+            const data = await res.json();
+            hideTyping();
+            if (data.content?.[0]?.text) {
+              addBotMessage(data.content[0].text);
+            }
+          } catch {
+            hideTyping();
+            addBotMessage("Sorry, I couldn't process that image. Could you try again?");
+          }
+        };
+        reader.readAsDataURL(file);
+        fileInput.value = '';
+      });
+    }
 
     // Mobile keyboard resize — adjust chat window height when virtual keyboard opens/closes
     if (window.visualViewport) {
