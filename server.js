@@ -116,6 +116,13 @@ function loadSavedTokens() {
       for (const [email, tokens] of Object.entries(saved)) {
         const auth = makeOAuthClient();
         auth.setCredentials(tokens);
+        auth.on('tokens', (newTokens) => {
+          const merged = { ...tokens, ...newTokens };
+          auth.setCredentials(merged);
+          gmailTokens.set(email, { auth, tokens: merged });
+          persistTokens();
+          console.log(`🔄 Refreshed Gmail tokens for ${email}`);
+        });
         gmailTokens.set(email, { auth, tokens });
         console.log(`✉️  Restored Gmail connection for ${email}`);
       }
@@ -157,6 +164,14 @@ function persistAutoReply() {
 async function saveGmailTokens(ownerEmail, tokens) {
   const auth = makeOAuthClient();
   auth.setCredentials(tokens);
+  // Auto-refresh tokens when they expire
+  auth.on('tokens', (newTokens) => {
+    const merged = { ...tokens, ...newTokens };
+    auth.setCredentials(merged);
+    gmailTokens.set(ownerEmail, { auth, tokens: merged });
+    persistTokens();
+    console.log(`🔄 Refreshed Gmail tokens for ${ownerEmail}`);
+  });
   gmailTokens.set(ownerEmail, { auth, tokens });
   persistTokens();
   console.log(`✉️  Gmail connected for ${ownerEmail}`);
@@ -205,7 +220,28 @@ async function smartSend({ ownerEmail, to, subject, html, replyTo }) {
 // ─── Email Auto-Reply ────────────────────────────────────────────────────────
 // Polls connected Gmail inboxes and auto-replies using Claude + the business prompt
 
+const REPLIED_FILE = resolve('data/replied-emails.json');
 const repliedEmails = new Set();       // track message IDs we've already replied to
+
+// Load replied emails from disk on startup
+function loadRepliedEmails() {
+  try {
+    if (existsSync(REPLIED_FILE)) {
+      const saved = JSON.parse(readFileSync(REPLIED_FILE, 'utf8'));
+      for (const id of saved) repliedEmails.add(id);
+      console.log(`📧 Restored ${repliedEmails.size} replied email IDs`);
+    }
+  } catch (e) { console.warn('Failed to load replied emails:', e.message); }
+}
+
+function persistRepliedEmails() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    // Only keep the last 500 IDs to prevent file bloat
+    const ids = [...repliedEmails].slice(-500);
+    writeFileSync(REPLIED_FILE, JSON.stringify(ids));
+  } catch (e) { console.warn('Failed to persist replied emails:', e.message); }
+}
 const EMAIL_POLL_INTERVAL = 3 * 60 * 1000; // check every 3 minutes
 const EMAIL_AUTO_REPLY_ENABLED = new Map(); // ownerEmail → { enabled, systemPrompt }
 
@@ -249,12 +285,24 @@ async function checkInboxAndReply(ownerEmail) {
       // Extract sender email
       const senderEmail = from.match(/<(.+?)>/)?.[1] || from.trim();
 
-      // Skip noreply, mailer-daemon, own emails
-      if (/noreply|no-reply|mailer-daemon|postmaster/i.test(senderEmail)) {
+      // Skip noreply, mailer-daemon, own emails, newsletters, automated senders
+      if (/noreply|no-reply|mailer-daemon|postmaster|notifications?@|newsletter|digest|updates?@/i.test(senderEmail)) {
         repliedEmails.add(msg.id);
         continue;
       }
       if (senderEmail.toLowerCase() === ownerEmail.toLowerCase()) {
+        repliedEmails.add(msg.id);
+        continue;
+      }
+
+      // Check if we already replied in this thread — prevents double-replies after restart
+      const thread = await gmail.users.threads.get({ userId: 'me', id: full.data.threadId, format: 'metadata', metadataHeaders: ['From'] });
+      const threadMsgs = thread.data.messages || [];
+      const weAlreadyReplied = threadMsgs.some(m => {
+        const f = m.payload.headers.find(h => h.name.toLowerCase() === 'from')?.value || '';
+        return f.toLowerCase().includes(ownerEmail.toLowerCase()) && m.id !== msg.id;
+      });
+      if (weAlreadyReplied) {
         repliedEmails.add(msg.id);
         continue;
       }
@@ -332,6 +380,7 @@ async function checkInboxAndReply(ownerEmail) {
 
       repliedEmails.add(msg.id);
     }
+    persistRepliedEmails();
   } catch (e) {
     console.warn(`📧 Inbox check failed for ${ownerEmail}:`, e.message);
   }
@@ -2913,6 +2962,7 @@ setInterval(async () => {
 // Restore persisted state before starting
 loadSavedTokens();
 loadSavedAutoReply();
+loadRepliedEmails();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`\n  ✦ Aria Chatbot Server v5.1\n  → Admin: http://localhost:${PORT}/admin?pass=${ADMIN}\n  → Health: http://localhost:${PORT}/health\n`));
