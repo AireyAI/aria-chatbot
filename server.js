@@ -59,6 +59,17 @@ app.use('/chatbot.js', (req, res, next) => {
   res.set('Expires', '0');
   next();
 });
+// Domain whitelist middleware — protects chatbot widget endpoints from unauthorized domains
+app.use((req, res, next) => {
+  // Only check widget-facing endpoints (chat, leads, bookings, handoffs, sessions, nps, gaps, faqs)
+  const widgetPaths = ['/api/chat', '/api/lead', '/api/booking', '/api/session', '/api/handoff', '/api/nps', '/api/gap', '/api/faqs', '/api/ab'];
+  const isWidgetReq = widgetPaths.some(p => req.path.startsWith(p));
+  if (isWidgetReq && !isDomainAllowed(req)) {
+    return res.status(403).json({ error: 'Unauthorized domain. Contact AireyAi to enable this site.' });
+  }
+  next();
+});
+
 app.use(express.static('.'));
 
 // ─── Email ────────────────────────────────────────────────────────────────────
@@ -1189,6 +1200,52 @@ app.get('/api/email-autoreply/reply-log', (req, res) => {
 });
 
 // ─── Knowledge Base ─────────────────────────────────────────────────────────
+// ─── Domain Whitelist ────────────────────────────────────────────────────────
+const DOMAINS_FILE = resolve('data/allowed-domains.json');
+const allowedDomains = new Set(); // e.g. "mysite.co.uk", "localhost:3000"
+
+function loadAllowedDomains() {
+  try {
+    if (existsSync(DOMAINS_FILE)) {
+      const saved = JSON.parse(readFileSync(DOMAINS_FILE, 'utf8'));
+      for (const d of saved) allowedDomains.add(d.toLowerCase());
+      console.log(`🔒 Loaded ${allowedDomains.size} allowed domains`);
+    }
+  } catch (e) { console.warn('Failed to load domains:', e.message); }
+}
+
+function persistAllowedDomains() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    writeFileSync(DOMAINS_FILE, JSON.stringify([...allowedDomains], null, 2));
+  } catch (e) { console.warn('Failed to persist domains:', e.message); }
+}
+
+// Check if a request origin is from an allowed domain
+function isDomainAllowed(req) {
+  // If no domains configured, allow all (backwards compatible)
+  if (allowedDomains.size === 0) return true;
+
+  const origin = req.headers.origin || req.headers.referer || '';
+  // Always allow admin, dashboard, and server-to-server requests (no origin)
+  if (!origin) return true;
+
+  try {
+    const url = new URL(origin);
+    const host = url.host.toLowerCase(); // includes port
+    const hostname = url.hostname.toLowerCase();
+    // Check exact host or hostname match
+    if (allowedDomains.has(host) || allowedDomains.has(hostname)) return true;
+    // Check if it's a subdomain of an allowed domain (e.g. www.mysite.co.uk matches mysite.co.uk)
+    for (const d of allowedDomains) {
+      if (hostname.endsWith('.' + d)) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 const KNOWLEDGE_BASE_FILE = resolve('data/knowledge-base.json');
 const knowledgeBase = new Map(); // ownerEmail → [{ id, question, answer, createdAt }]
 
@@ -3259,6 +3316,34 @@ app.patch('/admin/lead/:email/status', (req, res) => {
 });
 
 // ─── Usage & Settings ─────────────────────────────────────────────────────────
+// ─── Admin Domain Whitelist Endpoints ─────────────────────────────────────────
+app.get('/admin/domains', (req, res) => {
+  if (req.query.pass !== ADMIN) return res.status(403).json({ error: 'Unauthorised' });
+  res.json({ domains: [...allowedDomains] });
+});
+
+app.post('/admin/domains', (req, res) => {
+  if (req.query.pass !== ADMIN) return res.status(403).json({ error: 'Unauthorised' });
+  const { domain } = req.body;
+  if (!domain) return res.status(400).json({ error: 'domain required' });
+  const clean = domain.toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').trim();
+  if (!clean) return res.status(400).json({ error: 'invalid domain' });
+  allowedDomains.add(clean);
+  persistAllowedDomains();
+  console.log(`🔒 Domain added: ${clean}`);
+  res.json({ ok: true, domain: clean, total: allowedDomains.size });
+});
+
+app.delete('/admin/domains', (req, res) => {
+  if (req.query.pass !== ADMIN) return res.status(403).json({ error: 'Unauthorised' });
+  const { domain } = req.body;
+  if (!domain) return res.status(400).json({ error: 'domain required' });
+  allowedDomains.delete(domain.toLowerCase());
+  persistAllowedDomains();
+  console.log(`🔓 Domain removed: ${domain}`);
+  res.json({ ok: true, removed: domain, total: allowedDomains.size });
+});
+
 app.get('/admin/usage', (req, res) => {
   if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
   const cap = siteSettings.capEnabled ? siteSettings.capMessages : null;
@@ -3464,6 +3549,7 @@ textarea{resize:vertical;min-height:60px;}
     <button class="tab" onclick="tab('insights')">📊 Insights</button>
     <button class="tab" onclick="tab('gmail')">📧 Gmail</button>
     <button class="tab" onclick="tab('usage')">📈 Usage</button>
+    <button class="tab" onclick="tab('domains')">🔒 Domains</button>
     <button class="tab" onclick="tab('settings')">⚙️ Settings</button>
   </div>
 
@@ -3652,6 +3738,19 @@ textarea{resize:vertical;min-height:60px;}
         <p>2,000 chats/month ≈ <strong style="color:#2ecc71">~$6.00</strong></p>
         <p style="margin-top:10px;padding-top:10px;border-top:1px solid #2a2a44;color:#e8e8f8">You charge: £20–50/month. Margin: ~98%.</p>
       </div>
+    </div>
+  </div>
+
+  <div id="p-domains" class="panel">
+    <div class="card">
+      <h3>🔒 Allowed Domains</h3>
+      <p style="font-size:13px;color:#8888aa;margin-bottom:14px">Only websites on this list can use the Aria chatbot. If the list is empty, all domains are allowed (open mode).</p>
+      <div style="display:flex;gap:8px;margin-bottom:18px;">
+        <input id="newDomain" placeholder="e.g. myclient.co.uk" style="flex:1;padding:10px 14px;background:#13131f;border:1.5px solid #2a2a44;border-radius:10px;color:#fff;font-size:13px;outline:none;font-family:inherit;" onkeydown="if(event.key==='Enter')addDomain()">
+        <button class="btn" onclick="addDomain()">+ Add</button>
+      </div>
+      <div id="domainList" style="font-size:13px;color:#c0c0e0;"></div>
+      <p style="font-size:11px;color:#6b6b8a;margin-top:14px;">Subdomains are automatically included (e.g. adding mysite.co.uk also allows www.mysite.co.uk). Admin, dashboard, and Gmail callback URLs are always allowed.</p>
     </div>
   </div>
 
@@ -3988,13 +4087,45 @@ async function pollTracking() {
 }
 
 function tab(name) {
-  const names=['convos','leads','bookings','dropship','gaps','handoffs','faq','ab','nps','insights','gmail','usage','settings'];
+  const names=['convos','leads','bookings','dropship','gaps','handoffs','faq','ab','nps','insights','gmail','usage','domains','settings'];
   document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('on',names[i]===name));
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('on'));
   el('p-'+name).classList.add('on');
   if (name === 'dropship') loadDropship();
   if (name === 'usage') loadUsage();
+  if (name === 'domains') loadDomains();
   if (name === 'settings') loadSettings();
+}
+
+async function loadDomains() {
+  const r = await fetch('/admin/domains?pass='+PASS);
+  const data = await r.json();
+  const list = el('domainList');
+  if (!data.domains?.length) {
+    list.innerHTML = '<div style="padding:16px;text-align:center;color:#6b6b8a;background:#13131f;border-radius:10px;border:1px dashed #2a2a44;"><p style="margin-bottom:4px;">🌐 Open mode — all domains allowed</p><p style="font-size:11px;">Add a domain above to enable the whitelist.</p></div>';
+    return;
+  }
+  list.innerHTML = data.domains.map(d =>
+    '<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:#13131f;border:1px solid #2a2a44;border-radius:10px;margin-bottom:8px;">'
+    + '<div style="display:flex;align-items:center;gap:8px;"><span style="color:#2ecc71;font-size:10px;">●</span><span>' + d + '</span></div>'
+    + '<button class="btn red" style="font-size:11px;padding:4px 10px;" onclick="removeDomain(\'' + d + '\')">Remove</button>'
+    + '</div>'
+  ).join('');
+}
+
+async function addDomain() {
+  const input = el('newDomain');
+  const domain = input.value.trim();
+  if (!domain) return;
+  const r = await fetch('/admin/domains?pass='+PASS, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ domain }) });
+  const data = await r.json();
+  if (data.ok) { input.value = ''; loadDomains(); }
+}
+
+async function removeDomain(domain) {
+  if (!confirm('Remove ' + domain + ' from the whitelist?')) return;
+  await fetch('/admin/domains?pass='+PASS, { method:'DELETE', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ domain }) });
+  loadDomains();
 }
 
 async function loadUsage() {
@@ -4622,6 +4753,7 @@ loadPendingApprovals();
 loadReplyLog();
 loadKnowledgeBase();
 loadConversationMemory();
+loadAllowedDomains();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`\n  ✦ Aria Chatbot Server v5.1\n  → Admin: http://localhost:${PORT}/admin?pass=${ADMIN}\n  → Health: http://localhost:${PORT}/health\n`));
