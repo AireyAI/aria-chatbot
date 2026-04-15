@@ -258,8 +258,28 @@ const STATS_FILE = resolve('data/email-stats.json');
 const FOLLOWUP_FILE = resolve('data/email-followups.json');
 const PASSWORDS_FILE = resolve('data/dashboard-passwords.json');
 const SESSIONS_FILE = resolve('data/dashboard-sessions.json');
+const INVITES_FILE = resolve('data/invites.json');
 const dashboardPasswords = new Map(); // ownerEmail → hashed password
 const dashboardSessions = new Map();  // token → { ownerEmail, expiresAt }
+const invites = new Map();            // token → { email, url, type, createdAt, used }
+
+function loadInvites() {
+  try {
+    if (existsSync(INVITES_FILE)) {
+      const saved = JSON.parse(readFileSync(INVITES_FILE, 'utf8'));
+      for (const [token, invite] of Object.entries(saved)) invites.set(token, invite);
+    }
+  } catch (e) { console.warn('Failed to load invites:', e.message); }
+}
+
+function persistInvites() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [token, invite] of invites) obj[token] = invite;
+    writeFileSync(INVITES_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist invites:', e.message); }
+}
 
 function loadPasswords() {
   try {
@@ -3601,6 +3621,43 @@ app.get('/admin/data', (req, res) => {
     stats:{ total:all.length, today:todayS.length, leads:allLeads.length, leadsToday:todayLeads.length, avgRating, npsAvg, bookings:bookings.length, hotLeads:hotLeads.length, activeHandoffs:activeHandoffs.length, gaps:gaps.length } });
 });
 
+// ─── Invite system ───────────────────────────────────────────────────────────
+function adminAuth(req) {
+  return req.query.pass === ADMIN || req.headers['x-admin-pass'] === ADMIN;
+}
+
+app.post('/api/admin/invite', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  const { email, url, type } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'email is required' });
+  const token = crypto.randomBytes(16).toString('hex');
+  const serverUrl = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN
+    : 'http://localhost:' + (process.env.PORT || 3000);
+  invites.set(token, { email, url: url || null, type: type || null, createdAt: new Date().toISOString(), used: false });
+  persistInvites();
+  res.json({ ok: true, token, link: `${serverUrl}/onboard?t=${token}` });
+});
+
+app.get('/api/admin/invites', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
+  const list = [];
+  for (const [token, inv] of invites) {
+    const expired = !inv.used && (Date.now() - new Date(inv.createdAt).getTime()) > SEVEN_DAYS;
+    list.push({ token, ...inv, expired });
+  }
+  res.json(list);
+});
+
+app.delete('/api/admin/invite/:token', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  if (!invites.has(req.params.token)) return res.status(404).json({ error: 'Invite not found' });
+  invites.delete(req.params.token);
+  persistInvites();
+  res.json({ ok: true });
+});
+
 // ─── Admin dashboard ──────────────────────────────────────────────────────────
 app.get('/admin', (req, res) => {
   if (req.query.pass !== ADMIN) return res.send(`<!DOCTYPE html><html><head><title>Admin</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,sans-serif;background:#0f0f1a;display:flex;align-items:center;justify-content:center;min-height:100vh;}.box{background:#1a1a2e;border-radius:16px;padding:40px;width:320px;text-align:center;}h2{color:#fff;margin-bottom:24px;}input{width:100%;padding:11px 15px;border-radius:10px;border:1.5px solid #2a2a44;background:#13131f;color:#fff;font-size:14px;outline:none;margin-bottom:12px;}input:focus{border-color:#6C63FF;}button{width:100%;padding:11px;background:#6C63FF;color:#fff;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;}</style></head><body><div class="box"><h2>🔐 Admin Login</h2><form onsubmit="event.preventDefault();window.location='/admin?pass='+document.getElementById('p').value"><input id="p" type="password" placeholder="Admin password" autofocus><button>Enter →</button></form></div></body></html>`);
@@ -4905,6 +4962,7 @@ loadReplyLog();
 loadKnowledgeBase();
 loadConversationMemory();
 loadAllowedDomains();
+loadInvites();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`\n  ✦ Aria Chatbot Server v5.1\n  → Admin: http://localhost:${PORT}/admin?pass=${ADMIN}\n  → Health: http://localhost:${PORT}/health\n`));
