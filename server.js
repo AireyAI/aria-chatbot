@@ -5255,6 +5255,593 @@ update();
 </body></html>`);
 });
 
+// ─── Client Dashboard ─────────────────────────────────────────────────────────
+
+function requireDashboardAuth(req, res) {
+  const owner = req.query.owner || req.body?.owner;
+  const token = req.query.s || req.headers['x-session-token'];
+  if (!owner || !token || !validateSession(token, owner)) {
+    res.status(401).json({ error: 'Not authenticated' });
+    return null;
+  }
+  return owner;
+}
+
+// GET /api/dashboard/stats
+app.get('/api/dashboard/stats', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const stats = EMAIL_REPLY_STATS.get(owner) || { replied: 0, bookings: 0, followUps: 0, urgent: 0, lastReply: null, leads: { hot: 0, warm: 0, cold: 0 }, categories: {}, history: [] };
+  const now = Date.now();
+  const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
+  const history = stats.history || [];
+  const emailsWeek = history.filter(h => new Date(h.time) > weekAgo).length;
+  const bookingsWeek = history.filter(h => h.type === 'booking' && new Date(h.time) > weekAgo).length;
+  const totalLeads = (stats.leads?.hot || 0) + (stats.leads?.warm || 0) + (stats.leads?.cold || 0);
+  const autoReplyConfig = EMAIL_AUTO_REPLY_ENABLED.get(owner);
+  res.json({
+    emailsReplied: { week: emailsWeek, total: stats.replied || 0 },
+    bookings: { week: bookingsWeek, total: stats.bookings || 0 },
+    leads: { total: totalLeads, hot: stats.leads?.hot || 0, warm: stats.leads?.warm || 0, cold: stats.leads?.cold || 0 },
+    autoReplyEnabled: !!autoReplyConfig?.enabled,
+    gmailConnected: gmailTokens.has(owner)
+  });
+});
+
+// GET /api/dashboard/inbox-log
+app.get('/api/dashboard/inbox-log', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const perPage = 20;
+  const ownerLog = replyLog.filter(r => r.ownerEmail === owner).reverse();
+  const total = ownerLog.length;
+  const items = ownerLog.slice((page - 1) * perPage, page * perPage);
+  res.json({ items, page, perPage, total, totalPages: Math.ceil(total / perPage) || 1 });
+});
+
+// GET /api/dashboard/leads
+app.get('/api/dashboard/leads', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const leads = [];
+  const seen = new Set();
+  for (const [, s] of sessions) {
+    if (!s.leads || !s.leads.length) continue;
+    // Match by ownerEmail on session, or by page URL containing owner domain
+    const isOwner = s.ownerEmail === owner;
+    if (!isOwner) continue;
+    for (const leadEmail of s.leads) {
+      if (seen.has(leadEmail)) continue;
+      seen.add(leadEmail);
+      leads.push({
+        email: leadEmail,
+        name: s.leadName || null,
+        phone: s.leadPhone || null,
+        score: s.score || null,
+        tag: s.tag || null,
+        page: s.page || null,
+        date: s.lastActivity || s.startedAt
+      });
+    }
+  }
+  res.json({ leads });
+});
+
+// GET /api/dashboard/bookings
+app.get('/api/dashboard/bookings', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const ownerBookings = bookings.filter(b => {
+    const bookingOwner = b.ownerEmail || b.alertTo || '';
+    return bookingOwner.toLowerCase() === owner.toLowerCase();
+  }).reverse().slice(0, 50);
+  res.json({ bookings: ownerBookings });
+});
+
+// GET /api/dashboard/profile
+app.get('/api/dashboard/profile', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  // Find profile by owner email
+  let profile = null;
+  for (const [, v] of clientProfiles) {
+    if (v.profile?.email === owner) { profile = v.profile; break; }
+  }
+  res.json({ profile: profile || {} });
+});
+
+// POST /api/dashboard/profile
+app.post('/api/dashboard/profile', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { businessName, services, location, phone, email, hours, tone } = req.body;
+  // Find or create profile entry
+  let profileKey = null;
+  for (const [k, v] of clientProfiles) {
+    if (v.profile?.email === owner) { profileKey = k; break; }
+  }
+  const updatedProfile = {
+    businessName: businessName || '',
+    services: services || '',
+    location: location || '',
+    phone: phone || '',
+    email: email || owner,
+    hours: hours || '',
+    tone: tone || 'friendly'
+  };
+  if (profileKey) {
+    const existing = clientProfiles.get(profileKey);
+    existing.profile = { ...existing.profile, ...updatedProfile };
+    clientProfiles.set(profileKey, existing);
+  } else {
+    clientProfiles.set(owner, { profile: updatedProfile, scannedAt: new Date().toISOString() });
+  }
+  persistProfiles();
+
+  // Update auto-reply prompt if enabled
+  const autoReply = EMAIL_AUTO_REPLY_ENABLED.get(owner);
+  if (autoReply?.enabled) {
+    const prompt = `You are ${updatedProfile.businessName || 'a business assistant'}. Services: ${updatedProfile.services || 'various'}. Location: ${updatedProfile.location || 'N/A'}. Phone: ${updatedProfile.phone || 'N/A'}. Hours: ${updatedProfile.hours || 'N/A'}. Tone: ${updatedProfile.tone || 'friendly'}.`;
+    autoReply.systemPrompt = prompt;
+    EMAIL_AUTO_REPLY_ENABLED.set(owner, autoReply);
+    persistAutoReply();
+  }
+
+  res.json({ ok: true, profile: updatedProfile });
+});
+
+// GET /api/dashboard/settings
+app.get('/api/dashboard/settings', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const config = EMAIL_AUTO_REPLY_ENABLED.get(owner);
+  res.json({
+    autoReplyEnabled: !!config?.enabled,
+    approvalMode: !!config?.config?.approvalMode,
+    followUpsEnabled: config?.config?.followUpsEnabled !== false,
+    gmailConnected: gmailTokens.has(owner)
+  });
+});
+
+// POST /api/dashboard/settings
+app.post('/api/dashboard/settings', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { autoReplyEnabled, approvalMode, followUpsEnabled } = req.body;
+  const existing = EMAIL_AUTO_REPLY_ENABLED.get(owner) || { enabled: false, systemPrompt: 'You are a helpful business assistant.', config: {} };
+
+  if (autoReplyEnabled !== undefined) existing.enabled = !!autoReplyEnabled;
+  if (!existing.config) existing.config = {};
+  if (approvalMode !== undefined) existing.config.approvalMode = !!approvalMode;
+  if (followUpsEnabled !== undefined) existing.config.followUpsEnabled = !!followUpsEnabled;
+
+  EMAIL_AUTO_REPLY_ENABLED.set(owner, existing);
+  persistAutoReply();
+  res.json({ ok: true });
+});
+
+// GET /dashboard — Client Dashboard Page
+app.get('/dashboard', (req, res) => {
+  const ownerEmail = req.query.owner || '';
+  const sessionToken = req.query.s || '';
+
+  if (!ownerEmail) return res.redirect('/');
+
+  const hasPassword = dashboardPasswords.has(ownerEmail);
+
+  // No password → redirect to setup
+  if (!hasPassword) return res.redirect(`/connect/gmail?owner=${encodeURIComponent(ownerEmail)}`);
+
+  const isAuthenticated = sessionToken && validateSession(sessionToken, ownerEmail);
+
+  // Has password but not authenticated → show login
+  if (!isAuthenticated) {
+    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Aria — Login</title>
+    <style>
+      *{box-sizing:border-box;margin:0;padding:0}
+      body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#eee;}
+      .box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:36px;max-width:400px;width:100%;text-align:center;}
+      .logo span{font-size:28px;font-weight:800;color:#fff;letter-spacing:-0.5px;}
+      .logo span em{font-style:normal;color:#00e5a0;}
+      h2{font-size:18px;margin:24px 0 8px;}
+      p{font-size:13px;color:#9898b8;margin-bottom:20px;}
+      .email-badge{display:inline-block;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:5px 14px;font-size:13px;color:#fff;font-weight:600;margin-bottom:20px;}
+      input[type=password]{width:100%;padding:14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:15px;color:#eee;font-family:inherit;outline:none;text-align:center;letter-spacing:2px;margin-bottom:16px;}
+      input[type=password]:focus{border-color:rgba(0,229,160,0.4);}
+      .btn{display:block;width:100%;padding:14px;background:#00e5a0;color:#0d0d1f;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;}
+      .btn:hover{opacity:.88;}
+      .msg{padding:10px;border-radius:8px;font-size:13px;margin-bottom:14px;display:none;}
+      .msg.error{display:block;background:rgba(255,80,80,0.1);border:1px solid rgba(255,80,80,0.2);color:#ff6b6b;}
+      .footer{margin-top:24px;font-size:12px;color:#6b6b8a;}
+      .footer a{color:#00e5a0;text-decoration:none;}
+    </style>
+    </head><body>
+    <div class="box">
+      <div class="logo"><span>Aria<em>Ai</em></span></div>
+      <h2>Welcome back</h2>
+      <div class="email-badge">${ownerEmail}</div>
+      <div id="msg" class="msg"></div>
+      <input type="password" id="pw" placeholder="Enter your password" autofocus onkeydown="if(event.key==='Enter')login()">
+      <button class="btn" onclick="login()">Login</button>
+      <div class="footer">Powered by <a href="https://aireyai.co.uk">AireyAi</a></div>
+    </div>
+    <script>
+      async function login() {
+        const pw = document.getElementById('pw').value;
+        if (!pw) return;
+        const r = await fetch('/api/dashboard/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({owner:'${ownerEmail}',password:pw}) });
+        const data = await r.json();
+        if (data.ok) {
+          window.location.href = '/dashboard?owner=${encodeURIComponent(ownerEmail)}&s=' + data.token;
+        } else {
+          const el = document.getElementById('msg');
+          el.textContent = data.error || 'Wrong password';
+          el.className = 'msg error';
+        }
+      }
+    </script>
+    </body></html>`);
+  }
+
+  // Authenticated — serve the full dashboard
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aria — Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;color:#eee;}
+a{color:#00e5a0;text-decoration:none;}
+.topbar{position:sticky;top:0;z-index:100;background:rgba(13,13,31,0.95);backdrop-filter:blur(12px);border-bottom:1px solid rgba(255,255,255,0.06);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;}
+.topbar .logo span{font-size:22px;font-weight:800;color:#fff;letter-spacing:-0.5px;}
+.topbar .logo em{font-style:normal;color:#00e5a0;}
+.topbar .right{display:flex;align-items:center;gap:12px;}
+.email-badge{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:4px 12px;font-size:12px;color:#ccc;font-weight:500;}
+.btn-logout{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 14px;font-size:12px;color:#ff6b6b;cursor:pointer;font-family:inherit;font-weight:500;}
+.btn-logout:hover{background:rgba(255,80,80,0.1);}
+.container{max-width:960px;margin:0 auto;padding:24px 16px 60px;}
+.stats-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:28px;}
+.stat-card{background:#161630;border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:20px;text-align:center;}
+.stat-card .value{font-size:32px;font-weight:800;color:#00e5a0;line-height:1.1;}
+.stat-card .label{font-size:12px;color:#8888aa;margin-top:6px;text-transform:uppercase;letter-spacing:0.5px;}
+.stat-card .sub{font-size:11px;color:#6b6b8a;margin-top:4px;}
+.stat-card.status-on .value{color:#00e5a0;}
+.stat-card.status-off .value{color:#ff6b6b;}
+.section{background:#161630;border:1px solid rgba(255,255,255,0.06);border-radius:14px;margin-bottom:14px;overflow:hidden;}
+.section-header{padding:16px 20px;cursor:pointer;display:flex;align-items:center;justify-content:space-between;user-select:none;transition:background 0.15s;}
+.section-header:hover{background:rgba(255,255,255,0.02);}
+.section-header h3{font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px;}
+.section-header .arrow{font-size:12px;color:#6b6b8a;transition:transform 0.2s;}
+.section.open .arrow{transform:rotate(90deg);}
+.section-body{display:none;padding:0 20px 20px;animation:fadeIn 0.2s;}
+.section.open .section-body{display:block;}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+table{width:100%;border-collapse:collapse;font-size:13px;}
+th{text-align:left;padding:8px 10px;color:#6b6b8a;font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;border-bottom:1px solid rgba(255,255,255,0.06);}
+td{padding:10px;border-bottom:1px solid rgba(255,255,255,0.04);color:#ccc;}
+tr:last-child td{border-bottom:none;}
+.empty{text-align:center;padding:24px;color:#6b6b8a;font-size:13px;}
+.pagination{display:flex;justify-content:center;gap:8px;margin-top:12px;}
+.pagination button{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:6px 12px;color:#ccc;cursor:pointer;font-size:12px;font-family:inherit;}
+.pagination button:hover{background:rgba(0,229,160,0.1);border-color:rgba(0,229,160,0.3);}
+.pagination button.active{background:#00e5a0;color:#0d0d1f;border-color:#00e5a0;font-weight:600;}
+.form-group{margin-bottom:14px;}
+.form-group label{display:block;font-size:12px;color:#8888aa;margin-bottom:5px;font-weight:500;}
+.form-group input,.form-group select,.form-group textarea{width:100%;padding:10px 12px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:8px;font-size:14px;color:#eee;font-family:inherit;outline:none;}
+.form-group input:focus,.form-group select:focus,.form-group textarea:focus{border-color:rgba(0,229,160,0.4);}
+.form-group textarea{resize:vertical;min-height:60px;}
+.form-group select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238888aa' d='M6 8L1 3h10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;}
+.btn-save{background:#00e5a0;color:#0d0d1f;border:none;border-radius:10px;padding:12px 28px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;}
+.btn-save:hover{opacity:.88;}
+.toggle-row{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.04);}
+.toggle-row:last-child{border-bottom:none;}
+.toggle-row .info{font-size:13px;color:#ccc;}
+.toggle-row .info small{display:block;color:#6b6b8a;font-size:11px;margin-top:2px;}
+.toggle{position:relative;width:44px;height:24px;flex-shrink:0;}
+.toggle input{opacity:0;width:0;height:0;}
+.toggle .slider{position:absolute;inset:0;background:rgba(255,255,255,0.1);border-radius:24px;cursor:pointer;transition:background 0.2s;}
+.toggle .slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:transform 0.2s;}
+.toggle input:checked+.slider{background:#00e5a0;}
+.toggle input:checked+.slider:before{transform:translateX(20px);}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#00e5a0;color:#0d0d1f;padding:10px 24px;border-radius:10px;font-size:13px;font-weight:600;opacity:0;transition:opacity 0.3s;pointer-events:none;z-index:200;}
+.toast.show{opacity:1;}
+.badge-on{display:inline-block;background:rgba(0,229,160,0.15);color:#00e5a0;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;}
+.badge-off{display:inline-block;background:rgba(255,80,80,0.15);color:#ff6b6b;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;}
+.gmail-link{display:inline-block;margin-top:12px;padding:8px 16px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:8px;font-size:12px;color:#00e5a0;}
+.gmail-link:hover{background:rgba(0,229,160,0.08);}
+@media(max-width:600px){
+  .topbar{padding:12px 16px;}
+  .topbar .logo span{font-size:18px;}
+  .email-badge{display:none;}
+  .stats-row{grid-template-columns:1fr 1fr;}
+  .stat-card .value{font-size:24px;}
+  table{font-size:12px;}
+  td,th{padding:8px 6px;}
+}
+</style>
+</head><body>
+
+<div class="topbar">
+  <div class="logo"><span>Aria<em>Ai</em></span></div>
+  <div class="right">
+    <div class="email-badge">${ownerEmail}</div>
+    <button class="btn-logout" onclick="logout()">Logout</button>
+  </div>
+</div>
+
+<div class="container">
+  <!-- Stats Row -->
+  <div class="stats-row" id="stats-row">
+    <div class="stat-card"><div class="value">—</div><div class="label">Loading...</div></div>
+  </div>
+
+  <!-- Inbox Log -->
+  <div class="section" id="sec-inbox">
+    <div class="section-header" onclick="toggleSection('inbox')">
+      <h3>&#x1F4E7; Inbox Log</h3>
+      <span class="arrow">&#x25B6;</span>
+    </div>
+    <div class="section-body" id="body-inbox"><div class="empty">Loading...</div></div>
+  </div>
+
+  <!-- Leads -->
+  <div class="section" id="sec-leads">
+    <div class="section-header" onclick="toggleSection('leads')">
+      <h3>&#x1F464; Leads</h3>
+      <span class="arrow">&#x25B6;</span>
+    </div>
+    <div class="section-body" id="body-leads"><div class="empty">Loading...</div></div>
+  </div>
+
+  <!-- Bookings -->
+  <div class="section" id="sec-bookings">
+    <div class="section-header" onclick="toggleSection('bookings')">
+      <h3>&#x1F4C5; Upcoming Bookings</h3>
+      <span class="arrow">&#x25B6;</span>
+    </div>
+    <div class="section-body" id="body-bookings"><div class="empty">Loading...</div></div>
+  </div>
+
+  <!-- Business Profile -->
+  <div class="section" id="sec-profile">
+    <div class="section-header" onclick="toggleSection('profile')">
+      <h3>&#x1F3E2; Business Profile</h3>
+      <span class="arrow">&#x25B6;</span>
+    </div>
+    <div class="section-body" id="body-profile"><div class="empty">Loading...</div></div>
+  </div>
+
+  <!-- Settings -->
+  <div class="section" id="sec-settings">
+    <div class="section-header" onclick="toggleSection('settings')">
+      <h3>&#x2699;&#xFE0F; Settings</h3>
+      <span class="arrow">&#x25B6;</span>
+    </div>
+    <div class="section-body" id="body-settings"><div class="empty">Loading...</div></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const OWNER = '${ownerEmail}';
+const TOKEN = '${sessionToken}';
+const Q = 'owner=' + encodeURIComponent(OWNER) + '&s=' + encodeURIComponent(TOKEN);
+const loaded = {};
+
+function api(path) { return fetch(path + (path.includes('?') ? '&' : '?') + Q).then(r => r.json()); }
+function apiPost(path, body) {
+  return fetch(path + (path.includes('?') ? '&' : '?') + Q, {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+  }).then(r => r.json());
+}
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+function logout() {
+  window.location.href = '/dashboard?owner=' + encodeURIComponent(OWNER);
+}
+
+function timeAgo(dateStr) {
+  if (!dateStr) return '—';
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return mins + 'm ago';
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs + 'h ago';
+  const days = Math.floor(hrs / 24);
+  return days + 'd ago';
+}
+
+function escH(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// Load stats immediately
+async function loadStats() {
+  try {
+    const d = await api('/api/dashboard/stats');
+    document.getElementById('stats-row').innerHTML = \`
+      <div class="stat-card">
+        <div class="value">\${d.emailsReplied.total}</div>
+        <div class="label">Emails Replied</div>
+        <div class="sub">\${d.emailsReplied.week} this week</div>
+      </div>
+      <div class="stat-card">
+        <div class="value">\${d.leads.total}</div>
+        <div class="label">Leads</div>
+        <div class="sub">\${d.leads.hot} hot, \${d.leads.warm} warm</div>
+      </div>
+      <div class="stat-card">
+        <div class="value">\${d.bookings.total}</div>
+        <div class="label">Bookings</div>
+        <div class="sub">\${d.bookings.week} this week</div>
+      </div>
+      <div class="stat-card \${d.autoReplyEnabled ? 'status-on' : 'status-off'}">
+        <div class="value">\${d.autoReplyEnabled ? 'ON' : 'OFF'}</div>
+        <div class="label">Auto-Reply</div>
+        <div class="sub">\${d.gmailConnected ? '<span class="badge-on">Gmail connected</span>' : '<span class="badge-off">Gmail not connected</span>'}</div>
+      </div>
+    \`;
+  } catch (e) {
+    document.getElementById('stats-row').innerHTML = '<div class="stat-card"><div class="value">!</div><div class="label">Failed to load stats</div></div>';
+  }
+}
+loadStats();
+
+function toggleSection(name) {
+  const sec = document.getElementById('sec-' + name);
+  const isOpen = sec.classList.contains('open');
+  if (isOpen) { sec.classList.remove('open'); return; }
+  sec.classList.add('open');
+  if (!loaded[name]) { loaded[name] = true; loadSection(name); }
+}
+
+async function loadSection(name) {
+  if (name === 'inbox') await loadInbox(1);
+  else if (name === 'leads') await loadLeads();
+  else if (name === 'bookings') await loadBookings();
+  else if (name === 'profile') await loadProfile();
+  else if (name === 'settings') await loadSettings();
+}
+
+let inboxPage = 1;
+async function loadInbox(page) {
+  inboxPage = page;
+  const body = document.getElementById('body-inbox');
+  try {
+    const d = await api('/api/dashboard/inbox-log?page=' + page);
+    if (!d.items.length) { body.innerHTML = '<div class="empty">No emails replied yet.</div>'; return; }
+    let html = '<table><thead><tr><th>From</th><th>Subject</th><th>When</th></tr></thead><tbody>';
+    for (const r of d.items) {
+      html += '<tr><td>' + escH(r.senderEmail) + '</td><td>' + escH(r.subject) + '</td><td>' + timeAgo(r.sentAt) + '</td></tr>';
+    }
+    html += '</tbody></table>';
+    if (d.totalPages > 1) {
+      html += '<div class="pagination">';
+      for (let i = 1; i <= d.totalPages; i++) {
+        html += '<button class="' + (i === page ? 'active' : '') + '" onclick="loadInbox(' + i + ')">' + i + '</button>';
+      }
+      html += '</div>';
+    }
+    body.innerHTML = html;
+  } catch (e) { body.innerHTML = '<div class="empty">Failed to load inbox log.</div>'; }
+}
+
+async function loadLeads() {
+  const body = document.getElementById('body-leads');
+  try {
+    const d = await api('/api/dashboard/leads');
+    if (!d.leads.length) { body.innerHTML = '<div class="empty">No leads captured yet.</div>'; return; }
+    let html = '<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th></tr></thead><tbody>';
+    for (const l of d.leads) {
+      html += '<tr><td>' + escH(l.name || '—') + '</td><td>' + escH(l.email) + '</td><td>' + escH(l.phone || '—') + '</td></tr>';
+    }
+    html += '</tbody></table>';
+    body.innerHTML = html;
+  } catch (e) { body.innerHTML = '<div class="empty">Failed to load leads.</div>'; }
+}
+
+async function loadBookings() {
+  const body = document.getElementById('body-bookings');
+  try {
+    const d = await api('/api/dashboard/bookings');
+    if (!d.bookings.length) { body.innerHTML = '<div class="empty">No bookings yet.</div>'; return; }
+    let html = '<table><thead><tr><th>Date</th><th>Client</th><th>Service</th></tr></thead><tbody>';
+    for (const b of d.bookings) {
+      html += '<tr><td>' + escH(b.datetime || b.date || '—') + '</td><td>' + escH(b.name || '—') + '</td><td>' + escH(b.service || b.siteName || '—') + '</td></tr>';
+    }
+    html += '</tbody></table>';
+    body.innerHTML = html;
+  } catch (e) { body.innerHTML = '<div class="empty">Failed to load bookings.</div>'; }
+}
+
+async function loadProfile() {
+  const body = document.getElementById('body-profile');
+  try {
+    const d = await api('/api/dashboard/profile');
+    const p = d.profile || {};
+    body.innerHTML = \`
+      <div class="form-group"><label>Business Name</label><input type="text" id="pf-name" value="\${escH(p.businessName || '')}"></div>
+      <div class="form-group"><label>Services</label><textarea id="pf-services">\${escH(p.services || '')}</textarea></div>
+      <div class="form-group"><label>Location</label><input type="text" id="pf-location" value="\${escH(p.location || '')}"></div>
+      <div class="form-group"><label>Phone</label><input type="text" id="pf-phone" value="\${escH(p.phone || '')}"></div>
+      <div class="form-group"><label>Email</label><input type="text" id="pf-email" value="\${escH(p.email || OWNER)}"></div>
+      <div class="form-group"><label>Hours</label><input type="text" id="pf-hours" value="\${escH(p.hours || '')}"></div>
+      <div class="form-group"><label>Tone</label>
+        <select id="pf-tone">
+          <option value="friendly" \${p.tone==='friendly'?'selected':''}>Friendly</option>
+          <option value="professional" \${p.tone==='professional'?'selected':''}>Professional</option>
+          <option value="casual" \${p.tone==='casual'?'selected':''}>Casual</option>
+          <option value="formal" \${p.tone==='formal'?'selected':''}>Formal</option>
+        </select>
+      </div>
+      <button class="btn-save" onclick="saveProfile()">Save Profile</button>
+    \`;
+  } catch (e) { body.innerHTML = '<div class="empty">Failed to load profile.</div>'; }
+}
+
+async function saveProfile() {
+  const data = {
+    owner: OWNER,
+    businessName: document.getElementById('pf-name').value,
+    services: document.getElementById('pf-services').value,
+    location: document.getElementById('pf-location').value,
+    phone: document.getElementById('pf-phone').value,
+    email: document.getElementById('pf-email').value,
+    hours: document.getElementById('pf-hours').value,
+    tone: document.getElementById('pf-tone').value
+  };
+  try {
+    const r = await apiPost('/api/dashboard/profile', data);
+    if (r.ok) toast('Profile saved!');
+    else toast('Failed to save');
+  } catch (e) { toast('Error saving profile'); }
+}
+
+async function loadSettings() {
+  const body = document.getElementById('body-settings');
+  try {
+    const d = await api('/api/dashboard/settings');
+    body.innerHTML = \`
+      <div class="toggle-row">
+        <div class="info">Auto-Reply<small>Automatically reply to incoming emails using AI</small></div>
+        <label class="toggle"><input type="checkbox" id="tog-autoreply" \${d.autoReplyEnabled?'checked':''} onchange="saveSetting('autoReplyEnabled',this.checked)"><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div class="info">Approval Mode<small>Review AI drafts before they are sent</small></div>
+        <label class="toggle"><input type="checkbox" id="tog-approval" \${d.approvalMode?'checked':''} onchange="saveSetting('approvalMode',this.checked)"><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div class="info">Follow-Ups<small>Send automatic follow-up emails if no response</small></div>
+        <label class="toggle"><input type="checkbox" id="tog-followups" \${d.followUpsEnabled?'checked':''} onchange="saveSetting('followUpsEnabled',this.checked)"><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div class="info">Gmail Status<small>\${d.gmailConnected ? 'Connected and active' : 'Not connected'}</small></div>
+        <div>\${d.gmailConnected ? '<span class="badge-on">Connected</span>' : '<span class="badge-off">Disconnected</span>'}</div>
+      </div>
+      <a class="gmail-link" href="/connect/gmail?owner=\${encodeURIComponent(OWNER)}&s=\${encodeURIComponent(TOKEN)}">Gmail Settings &rarr;</a>
+    \`;
+  } catch (e) { body.innerHTML = '<div class="empty">Failed to load settings.</div>'; }
+}
+
+async function saveSetting(key, value) {
+  try {
+    const body = { owner: OWNER };
+    body[key] = value;
+    const r = await apiPost('/api/dashboard/settings', body);
+    if (r.ok) toast('Setting updated!');
+    else toast('Failed to update');
+  } catch (e) { toast('Error updating setting'); }
+}
+</script>
+</body></html>`);
+});
+
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ status:'ok', sessions:sessions.size, faqs:faqs.size, handoffs:handoffs.size }));
 
