@@ -5015,6 +5015,218 @@ function showMsg(id, text, type) {
 </body></html>`);
 });
 
+// ─── Client Health Dashboard ─────────────────────────────────────────────────
+app.get('/admin/clients', (req, res) => {
+  if (req.query.pass !== ADMIN) return res.redirect('/admin');
+
+  const clients = [];
+  for (const [email, config] of EMAIL_AUTO_REPLY_ENABLED) {
+    const stats = EMAIL_REPLY_STATS.get(email) || { replied: 0, bookings: 0, lastReply: null };
+    const hasTokens = gmailTokens.has(email);
+    const channels = channelConfigs.get(email) || {};
+    const lastActivity = stats.lastReply ? new Date(stats.lastReply) : null;
+    const daysInactive = lastActivity ? Math.floor((Date.now() - lastActivity.getTime()) / (1000 * 60 * 60 * 24)) : 999;
+
+    clients.push({
+      email,
+      enabled: config.enabled,
+      gmailConnected: hasTokens,
+      replied: stats.replied || 0,
+      bookings: stats.bookings || 0,
+      lastReply: stats.lastReply || 'Never',
+      daysInactive,
+      channels: Object.keys(channels).length,
+      status: !hasTokens ? 'disconnected' : daysInactive > 14 ? 'inactive' : daysInactive > 7 ? 'quiet' : 'active',
+      businessName: config.config?.businessName || email.split('@')[0],
+    });
+  }
+
+  clients.sort((a, b) => {
+    const order = { disconnected: 0, inactive: 1, quiet: 2, active: 3 };
+    return order[a.status] - order[b.status];
+  });
+
+  const statusColors = { active: '#00e5a0', quiet: '#ffa726', inactive: '#ff6b6b', disconnected: '#888' };
+
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Client Health — Aria Admin</title>
+    <style>
+      *{box-sizing:border-box;margin:0;padding:0}
+      body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;color:#eee;padding:20px;}
+      .container{max-width:800px;margin:0 auto;}
+      h1{font-size:22px;margin-bottom:4px;} .sub{color:#9898b8;font-size:13px;margin-bottom:24px;}
+      .back{color:#00e5a0;font-size:13px;text-decoration:none;display:inline-block;margin-bottom:16px;}
+      .client{background:#161630;border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:16px 20px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:16px;}
+      .client .info{flex:1;min-width:0;}
+      .client .name{font-weight:600;font-size:15px;margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+      .client .email{font-size:12px;color:#9898b8;}
+      .client .stats{display:flex;gap:16px;font-size:12px;color:#9898b8;}
+      .client .stats span{white-space:nowrap;}
+      .badge{display:inline-block;padding:3px 10px;border-radius:6px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;}
+      .summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px;}
+      .sum-card{background:#161630;border:1px solid rgba(255,255,255,0.06);border-radius:12px;padding:16px;text-align:center;}
+      .sum-card .val{font-size:28px;font-weight:800;color:#00e5a0;}
+      .sum-card .lbl{font-size:11px;color:#9898b8;text-transform:uppercase;margin-top:4px;}
+    </style>
+  </head><body>
+    <div class="container">
+      <a class="back" href="/admin?pass=${ADMIN}">← Back to Admin</a>
+      <h1>Client Health</h1>
+      <p class="sub">${clients.length} clients total</p>
+
+      <div class="summary">
+        <div class="sum-card"><div class="val">${clients.filter(c => c.status === 'active').length}</div><div class="lbl">Active</div></div>
+        <div class="sum-card"><div class="val" style="color:#ffa726">${clients.filter(c => c.status === 'quiet').length}</div><div class="lbl">Quiet</div></div>
+        <div class="sum-card"><div class="val" style="color:#ff6b6b">${clients.filter(c => c.status === 'inactive' || c.status === 'disconnected').length}</div><div class="lbl">Needs Attention</div></div>
+        <div class="sum-card"><div class="val">${clients.reduce((s, c) => s + c.replied, 0)}</div><div class="lbl">Total Replies</div></div>
+      </div>
+
+      ${clients.map(c => `<div class="client">
+        <div class="info">
+          <div class="name">${c.businessName}</div>
+          <div class="email">${c.email}</div>
+          <div class="stats">
+            <span>📧 ${c.replied} replies</span>
+            <span>📅 ${c.bookings} bookings</span>
+            <span>📡 ${c.channels} channels</span>
+            <span>🕐 ${c.daysInactive < 999 ? c.daysInactive + 'd ago' : 'Never'}</span>
+          </div>
+        </div>
+        <span class="badge" style="background:${statusColors[c.status]}22;color:${statusColors[c.status]}">${c.status}</span>
+      </div>`).join('')}
+    </div>
+  </body></html>`);
+});
+
+// ─── Bulk Embed Generator ────────────────────────────────────────────────────
+app.get('/admin/embed', (req, res) => {
+  if (req.query.pass !== ADMIN) return res.redirect('/admin');
+  const serverUrl = process.env.GOOGLE_REDIRECT_URI?.replace('/auth/gmail/callback', '') || `http://localhost:${process.env.PORT || 3000}`;
+
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Embed Generator — Aria Admin</title>
+    <style>
+      *{box-sizing:border-box;margin:0;padding:0}
+      body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;color:#eee;padding:20px;}
+      .container{max-width:600px;margin:0 auto;}
+      h1{font-size:22px;margin-bottom:4px;} .sub{color:#9898b8;font-size:13px;margin-bottom:24px;}
+      .back{color:#00e5a0;font-size:13px;text-decoration:none;display:inline-block;margin-bottom:16px;}
+      label{display:block;font-size:13px;color:#9898b8;margin-bottom:6px;margin-top:16px;}
+      input,select{width:100%;padding:12px 14px;background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#eee;font-size:14px;outline:none;font-family:inherit;}
+      input:focus,select:focus{border-color:#00e5a0;}
+      input::placeholder{color:#555;}
+      .btn{width:100%;padding:14px;background:#00e5a0;color:#0d0d1f;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;margin-top:24px;}
+      .btn:hover{opacity:.88;}
+      .output{margin-top:24px;background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;position:relative;}
+      .output pre{font-size:12px;color:#00e5a0;white-space:pre-wrap;word-break:break-all;line-height:1.6;font-family:'SF Mono',monospace;}
+      .copy{position:absolute;top:8px;right:8px;background:rgba(0,229,160,0.15);color:#00e5a0;border:none;border-radius:6px;padding:6px 12px;font-size:11px;cursor:pointer;font-weight:600;}
+    </style>
+  </head><body>
+    <div class="container">
+      <a class="back" href="/admin?pass=${ADMIN}">← Back to Admin</a>
+      <h1>Embed Generator</h1>
+      <p class="sub">Generate the embed code for a client's website</p>
+
+      <label>Client Name / Business Name</label>
+      <input id="e-name" placeholder="e.g. Harper Hair Studio" />
+
+      <label>Client Email (owner)</label>
+      <input id="e-email" type="email" placeholder="e.g. client@gmail.com" />
+
+      <label>Brand Colour</label>
+      <input id="e-color" type="color" value="#6C63FF" style="height:44px;padding:4px;" />
+
+      <label>Business Type</label>
+      <select id="e-type">
+        <option value="generic">Generic</option>
+        <option value="trades">Trades</option>
+        <option value="salon">Salon / Beauty</option>
+        <option value="restaurant">Restaurant / Food</option>
+        <option value="gym">Gym / Fitness</option>
+        <option value="clinic">Clinic / Health</option>
+        <option value="agency">Agency</option>
+        <option value="ecommerce">Ecommerce / Shop</option>
+        <option value="law">Legal</option>
+        <option value="realestate">Real Estate</option>
+      </select>
+
+      <label>Phone Number (optional)</label>
+      <input id="e-phone" placeholder="+44..." />
+
+      <label>WhatsApp Number (optional)</label>
+      <input id="e-wa" placeholder="+44..." />
+
+      <label>Location / Address (optional)</label>
+      <input id="e-location" placeholder="e.g. 123 High Street, London" />
+
+      <button class="btn" onclick="generate()">Generate Embed Code</button>
+
+      <div class="output" id="output" style="display:none;">
+        <button class="copy" onclick="navigator.clipboard.writeText(document.getElementById('code').textContent);this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)">Copy</button>
+        <pre id="code"></pre>
+      </div>
+    </div>
+    <script>
+      function generate() {
+        const name = document.getElementById('e-name').value.trim();
+        const email = document.getElementById('e-email').value.trim();
+        const color = document.getElementById('e-color').value;
+        const type = document.getElementById('e-type').value;
+        const phone = document.getElementById('e-phone').value.trim();
+        const wa = document.getElementById('e-wa').value.trim();
+        const loc = document.getElementById('e-location').value.trim();
+        if (!name || !email) return alert('Name and email are required.');
+
+        let code = '<script src="${serverUrl}/chatbot.js"\\n';
+        code += '    data-name="Aria"\\n';
+        code += '    data-color="' + color + '"\\n';
+        code += '    data-server="${serverUrl}"\\n';
+        code += '    data-type="' + type + '"\\n';
+        code += '    data-owner-email="' + email + '"\\n';
+        code += '    data-site-name="' + name + '"\\n';
+        code += '    data-booking=\\'{"ownerName":"' + name + '","ownerEmail":"' + email + '"}\\'\\n';
+        if (phone) code += '    data-phone="' + phone + '"\\n';
+        if (wa) code += '    data-whatsapp="' + wa + '"\\n    data-handoff-wa="' + wa + '"\\n';
+        if (loc) code += '    data-location="' + loc + '"\\n';
+        code += '    data-handoff-email="' + email + '"\\n';
+        code += '><\\/script>';
+
+        document.getElementById('code').textContent = code.replace(/\\n/g, '\\n');
+        document.getElementById('output').style.display = 'block';
+      }
+    </script>
+  </body></html>`);
+});
+
+// ─── Token Health Check (error alerts) ───────────────────────────────────────
+// Check Google token health every hour, alert if any are broken
+setInterval(async () => {
+  for (const [email, entry] of gmailTokens) {
+    try {
+      const oauth2 = google.oauth2({ version: 'v2', auth: entry.auth });
+      await oauth2.userinfo.get();
+    } catch (e) {
+      if (e.message?.includes('invalid_grant') || e.message?.includes('Token has been expired')) {
+        console.warn('Token expired for:', email);
+        const alertTo = process.env.NOTIFY_EMAIL;
+        if (alertTo) {
+          smartSend({
+            ownerEmail: null,
+            to: alertTo,
+            subject: `⚠️ Aria Alert: Google token expired for ${email}`,
+            html: `<div style="font-family:-apple-system,sans-serif;padding:24px;">
+              <h2 style="color:#ff6b6b;">⚠️ Token Expired</h2>
+              <p>${email} needs to reconnect their Google account.</p>
+              <p>Their auto-reply and calendar integration will not work until reconnected.</p>
+              <p><a href="${process.env.GOOGLE_REDIRECT_URI?.replace('/auth/gmail/callback', '') || 'http://localhost:3000'}/connect/gmail?owner=${encodeURIComponent(email)}">Reconnect link</a></p>
+            </div>`,
+          }).catch(() => {});
+        }
+      }
+    }
+  }
+}, 60 * 60 * 1000);
+
 // ─── Admin dashboard ──────────────────────────────────────────────────────────
 app.get('/admin', (req, res) => {
   if (req.query.pass !== ADMIN) return res.send(`<!DOCTYPE html><html><head><title>Admin</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,sans-serif;background:#0f0f1a;display:flex;align-items:center;justify-content:center;min-height:100vh;}.box{background:#1a1a2e;border-radius:16px;padding:40px;width:320px;text-align:center;}h2{color:#fff;margin-bottom:24px;}input{width:100%;padding:11px 15px;border-radius:10px;border:1.5px solid #2a2a44;background:#13131f;color:#fff;font-size:14px;outline:none;margin-bottom:12px;}input:focus{border-color:#6C63FF;}button{width:100%;padding:11px;background:#6C63FF;color:#fff;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;}</style></head><body><div class="box"><h2>🔐 Admin Login</h2><form onsubmit="event.preventDefault();window.location='/admin?pass='+document.getElementById('p').value"><input id="p" type="password" placeholder="Admin password" autofocus><button>Enter →</button></form></div></body></html>`);
@@ -6620,6 +6832,7 @@ tr:last-child td{border-bottom:none;}
   <div class="logo"><span>Aria<em>Ai</em></span></div>
   <div class="right">
     <div class="email-badge">${ownerEmail}</div>
+    <button onclick="localStorage.removeItem('_aria_tutorial_done');location.reload()" style="background:rgba(0,229,160,0.1);color:#00e5a0;border:1px solid rgba(0,229,160,0.2);border-radius:8px;padding:6px 14px;font-size:12px;cursor:pointer;font-family:inherit;font-weight:500;">? Tutorial</button>
     <button class="btn-logout" onclick="logout()">Logout</button>
   </div>
 </div>
@@ -6814,6 +7027,40 @@ async function loadStats() {
   }
 }
 loadStats();
+
+// Welcome tutorial — show on first visit
+if (!localStorage.getItem('_aria_tutorial_done')) {
+  const overlay = document.createElement('div');
+  overlay.id = 'tutorial-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;';
+  const steps = [
+    { title: 'Welcome to your Aria Dashboard! 👋', text: 'This is your control centre. Everything Aria does — emails replied, leads captured, bookings made — shows up here.' },
+    { title: 'Status Cards 📊', text: 'At the top you can see your key stats at a glance. Emails replied, leads captured, bookings made, and whether auto-reply is on or off.' },
+    { title: 'Inbox Log 📧', text: 'Click "Inbox Log" to see every email Aria has replied to. You can see what she said, check it was right, and filter by date.' },
+    { title: 'Settings ⚙️', text: 'Toggle auto-reply on/off, enable approval mode (review before sending), and manage follow-ups. You are in control.' },
+    { title: 'Channels 📡', text: 'Connect WhatsApp, Instagram, SMS, and Facebook so Aria can manage all your messages from one place.' },
+    { title: 'You\\'re all set! 🎉', text: 'Aria is working for you 24/7. Any questions? Just reply to any email from Aria and Kyle will help you out.' },
+  ];
+  let stepIdx = 0;
+  function showTutorialStep() {
+    const s = steps[stepIdx];
+    overlay.innerHTML = '<div style="background:#161630;border-radius:20px;padding:32px;max-width:420px;width:100%;text-align:center;">' +
+      '<h2 style="font-size:20px;margin-bottom:12px;">' + s.title + '</h2>' +
+      '<p style="font-size:14px;color:#9898b8;line-height:1.7;margin-bottom:24px;">' + s.text + '</p>' +
+      '<div style="display:flex;gap:8px;justify-content:center;">' +
+      (stepIdx > 0 ? '<button onclick="prevStep()" style="padding:10px 20px;background:rgba(255,255,255,0.06);color:#eee;border:1px solid rgba(255,255,255,0.1);border-radius:10px;cursor:pointer;font-size:13px;">← Back</button>' : '') +
+      '<button onclick="nextStep()" style="padding:10px 24px;background:#00e5a0;color:#0d0d1f;border:none;border-radius:10px;cursor:pointer;font-size:14px;font-weight:600;">' + (stepIdx === steps.length - 1 ? 'Get Started →' : 'Next →') + '</button>' +
+      '</div>' +
+      '<div style="margin-top:16px;display:flex;gap:6px;justify-content:center;">' + steps.map((_, i) => '<div style="width:8px;height:8px;border-radius:50%;background:' + (i === stepIdx ? '#00e5a0' : '#333') + '"></div>').join('') + '</div>' +
+      '</div>';
+  }
+  window.nextStep = () => { stepIdx++; if (stepIdx >= steps.length) { overlay.remove(); localStorage.setItem('_aria_tutorial_done', '1'); } else showTutorialStep(); };
+  window.prevStep = () => { if (stepIdx > 0) { stepIdx--; showTutorialStep(); } };
+  showTutorialStep();
+  document.body.appendChild(overlay);
+}
+
+// One-click test button (already in topbar)
 
 function toggleSection(name) {
   const sec = document.getElementById('sec-' + name);

@@ -119,7 +119,7 @@
     canned:       _j('canned',       {}),
     pageMessages: _j('pageMessages', {}),
     pageTriggers: _j('pageTriggers', []),
-    quickReplies: _j('quickReplies', ['I need help 🙋', 'Pricing 💰', 'Show me around 🗺', 'Talk to a human 👋']),
+    quickReplies: _j('quickReplies', ['📅 Book Now', '💰 Get a Quote', '📞 Call Us', '❓ I have a question']),
     customPrompt: _a('prompt', ''),
 
     // Fun
@@ -325,11 +325,11 @@
   // =====================================================
   //  THINKING MESSAGES (rotates each time bot thinks)
   // =====================================================
+  const _bn = CONFIG.botName || 'Aria';
   const THINKING = [
-    'Thinking... ✦',  'On it! ⚡',      'Let me check 🔍',
-    'Cooking that up 🍳','Processing 🧠', 'Great question ✨',
-    'Consulting the oracle 🔮', 'Almost there...',
-    'Looking into it 👀', 'On the case 🕵️',
+    `${_bn} is thinking...`,  `${_bn} is on it...`,  `${_bn} is checking...`,
+    `${_bn} is looking into it...`, `${_bn} is figuring this out...`,
+    `Just a sec...`, `One moment...`, `${_bn} is working on it...`,
   ];
   let thinkIdx = 0;
   const nextThink = () => THINKING[thinkIdx++ % THINKING.length];
@@ -445,9 +445,9 @@
     width:385px;height:585px;background:var(--bg);border-radius:24px;
     box-shadow:0 20px 80px rgba(0,0,0,0.22),0 2px 12px rgba(0,0,0,0.1);
     display:flex;flex-direction:column;overflow:hidden;
-    transform:scale(.88) translateY(24px);transform-origin:bottom ${P};
-    opacity:0;pointer-events:none;transition:transform .32s cubic-bezier(.34,1.56,.64,1),opacity .25s ease;}
-  #_ac-win.open{transform:scale(1) translateY(0);opacity:1;pointer-events:all;}
+    transform:translateY(20px) scale(.96);transform-origin:bottom ${P};
+    opacity:0;pointer-events:none;transition:transform .35s cubic-bezier(.22,1,.36,1),opacity .25s ease;}
+  #_ac-win.open{transform:translateY(0) scale(1);opacity:1;pointer-events:all;}
 
   /* Header */
   #_ac-hdr{background:var(--ab);padding:14px 16px;display:flex;align-items:center;gap:11px;flex-shrink:0;
@@ -2019,7 +2019,13 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
   function addUserMessage(text) {
     const d = document.createElement('div');
     d.className = 'ac-msg user'; d.textContent = text;
+    const tick = document.createElement('span');
+    tick.className = 'ac-read-tick'; tick.textContent = '✓';
+    tick.style.cssText = 'display:block;text-align:right;font-size:10px;color:var(--text2);opacity:0.5;margin-top:2px;';
+    d.appendChild(tick);
     insertBefore(d); scrollBottom();
+    // Animate to "seen" after bot responds
+    setTimeout(() => { tick.textContent = '✓✓'; tick.style.opacity = '0.8'; tick.style.color = 'var(--accent,#6C63FF)'; }, 1500);
   }
 
   function addTimestamp() {
