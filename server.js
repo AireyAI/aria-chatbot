@@ -3236,10 +3236,22 @@ app.post('/api/lead', async (req, res) => {
     }, 24 * 60 * 60 * 1000);
   }
 
-  // 3. Slack alert to owner channel
+  // 3. Add to Google Calendar as a lead event (timestamped now)
+  if (alertTo && gmailTokens.has(alertTo)) {
+    createCalendarEvent(alertTo, {
+      name: `🎯 Lead: ${name || email}`,
+      email: email,
+      datetime: new Date().toISOString(),
+      notes: `Lead from ${siteName || page || 'website'}\nEmail: ${email}${name ? '\nName: ' + name : ''}${qualification?.need ? '\nNeed: ' + qualification.need : ''}${insight?.score ? '\nScore: ' + insight.score + '/10' : ''}`,
+      siteName: siteName || page,
+      timezone: 'Europe/London',
+    }).catch(() => {});
+  }
+
+  // 4. Slack alert to owner channel
   await slack(slackLeadBlocks({ email, score:insight?.score, tag:insight?.tag, page, adminUrl }), `New lead: ${email}${siteName ? ' ('+siteName+')' : ''}`);
 
-  // 4. Mailchimp sync
+  // 5. Mailchimp sync
   if (process.env.MAILCHIMP_API_KEY && process.env.MAILCHIMP_LIST_ID) {
     const dc = process.env.MAILCHIMP_API_KEY.split('-')[1];
     fetch(`https://${dc}.api.mailchimp.com/3.0/lists/${process.env.MAILCHIMP_LIST_ID}/members`, {
@@ -3382,6 +3394,18 @@ app.post('/api/chat/callback', async (req, res) => {
     { type: 'section', text: { type: 'mrkdwn', text: `*${name || 'Visitor'}* wants a call back\nPhone: ${phone}\nSite: ${siteName || 'Website'}${notes ? '\nContext: ' + notes : ''}` } },
   ], `Callback: ${name || phone}`);
 
+  // Add to Google Calendar
+  if (alertTo && gmailTokens.has(alertTo)) {
+    createCalendarEvent(alertTo, {
+      name: `📞 Callback: ${name || 'Visitor'} — ${phone}`,
+      email: '',
+      datetime: new Date().toISOString(),
+      notes: `Callback requested\nPhone: ${phone}${name ? '\nName: ' + name : ''}${notes ? '\nContext: ' + notes : ''}\nSite: ${siteName || 'website'}`,
+      siteName: siteName,
+      timezone: 'Europe/London',
+    }).catch(() => {});
+  }
+
   res.json({ ok: true });
 });
 
@@ -3419,6 +3443,18 @@ app.post('/api/chat/quote', async (req, res) => {
     { type: 'header', text: { type: 'plain_text', text: '💰 Quote Request' } },
     { type: 'section', text: { type: 'mrkdwn', text: `*${name || 'Visitor'}*${email ? ' (' + email + ')' : ''}\nSite: ${siteName || 'Website'}\n${details.slice(0, 300)}` } },
   ], `Quote request: ${name || 'Visitor'}`);
+
+  // Add to Google Calendar
+  if (alertTo && gmailTokens.has(alertTo)) {
+    createCalendarEvent(alertTo, {
+      name: `💰 Quote: ${name || 'Visitor'}${email ? ' (' + email + ')' : ''}`,
+      email: email || '',
+      datetime: new Date().toISOString(),
+      notes: `Quote request\n${name ? 'Name: ' + name : ''}${email ? '\nEmail: ' + email : ''}${phone ? '\nPhone: ' + phone : ''}\nDetails: ${details.slice(0, 300)}\nSite: ${siteName || 'website'}`,
+      siteName: siteName,
+      timezone: 'Europe/London',
+    }).catch(() => {});
+  }
 
   res.json({ ok: true });
 });
@@ -3492,6 +3528,18 @@ app.post('/api/chat/auto-lead', async (req, res) => {
       { type: 'header', text: { type: 'plain_text', text: '🎯 Auto-Captured Lead' } },
       { type: 'section', text: { type: 'mrkdwn', text: `*${name || 'Unknown'}*\n${email ? 'Email: ' + email + '\n' : ''}${phone ? 'Phone: ' + phone : ''}\nSite: ${siteName || 'Website'}` } },
     ], `Auto-lead: ${email || phone}`);
+
+    // Add to Google Calendar
+    if (alertTo && gmailTokens.has(alertTo)) {
+      createCalendarEvent(alertTo, {
+        name: `🎯 Lead: ${name || email || phone}`,
+        email: email || '',
+        datetime: new Date().toISOString(),
+        notes: `Auto-captured from chat\n${email ? 'Email: ' + email : ''}${phone ? '\nPhone: ' + phone : ''}\nSite: ${siteName || page || 'website'}`,
+        siteName: siteName || page,
+        timezone: 'Europe/London',
+      }).catch(() => {});
+    }
   }
 
   res.json({ ok: true });
