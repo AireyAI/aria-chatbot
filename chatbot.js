@@ -186,6 +186,7 @@
     phone:           _a('phone',        ''),       // phone number for contact card
     contactEmail:    _a('contactEmail', ''),       // contact email (defaults to ownerEmail)
     whatsapp:        _a('whatsapp',     ''),       // WhatsApp number for contact card
+    upsells:         _j('upsells',      []),       // [{trigger:"Haircut",offer:"Beard Trim",price:"£5",desc:"Quick 5-min add-on"}]
   };
 
   // Apply business type preset (any explicit data-* overrides the preset)
@@ -1408,6 +1409,25 @@ Return JSON:
         const msg = CONFIG.booking?.confirmMsg || "You're all booked in ✦ We'll be in touch to confirm!";
         makeBotBubble(`Done! 🎉 ${msg}`);
         sounds.celebrate(); confetti({ count: 60, y: 0.6 });
+        sessionConverted = true;
+        // Upsell — check if there's an add-on to offer
+        if (CONFIG.upsells?.length) {
+          const match = CONFIG.upsells.find(u => d.notes?.toLowerCase().includes(u.trigger.toLowerCase()) || d.datetime?.toLowerCase().includes(u.trigger.toLowerCase()));
+          if (match) {
+            await delay(1200);
+            const upsellCard = document.createElement('div');
+            upsellCard.className = 'ac-action-card';
+            upsellCard.innerHTML = `<div style="background:linear-gradient(135deg,rgba(108,99,255,0.08),rgba(0,229,160,0.08));border-radius:12px;padding:16px;">
+              <p style="font-size:14px;font-weight:600;margin:0 0 6px;">Want to add ${match.offer}? ${match.price || ''}</p>
+              <p style="font-size:12px;color:#888;margin:0 0 12px;">${match.desc || ''}</p>
+              <div style="display:flex;gap:8px;">
+                <button onclick="this.closest('.ac-action-card').innerHTML='<p style=\\'font-size:13px;color:#00c853;font-weight:600;\\'>✓ Added! Your booking has been updated.</p>';window.AriaChat.send('Add ${match.offer.replace(/'/g,'')}')" style="flex:1;padding:10px;background:var(--ac-color,#6C63FF);color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;">Yes, add it</button>
+                <button onclick="this.closest('.ac-action-card').remove()" style="padding:10px 16px;background:none;border:1px solid rgba(0,0,0,0.1);border-radius:8px;cursor:pointer;font-size:13px;color:#888;">No thanks</button>
+              </div>
+            </div>`;
+            insertBefore(upsellCard); scrollBottom();
+          }
+        }
       } else {
         bookingState = null;
         await delay(350);
@@ -1510,6 +1530,84 @@ Return JSON:
   }
 
   // =====================================================
+  //  RESCHEDULE / CANCEL FLOW
+  // =====================================================
+  let rescheduleState = null;
+
+  async function startReschedule() {
+    rescheduleState = { step: 'email', data: {} };
+    await delay(300);
+    makeBotBubble("I can help with that. What email did you book under?");
+    sounds.pop(); addTimestamp(); scrollBottom();
+  }
+
+  async function handleRescheduleStep(text) {
+    addUserMessage(text);
+    const step = rescheduleState.step;
+    if (step === 'email') {
+      if (!text.includes('@')) { makeBotBubble("That doesn't look right — can you check the email?"); sounds.pop(); addTimestamp(); scrollBottom(); return; }
+      rescheduleState.data.email = text.trim();
+      rescheduleState.step = 'lookup';
+      await delay(350);
+      makeBotBubble("Looking up your booking...");
+      scrollBottom();
+      try {
+        const r = await fetch(`${BASE}/api/booking/lookup?owner=${encodeURIComponent(CONFIG.ownerEmail || '')}&email=${encodeURIComponent(text.trim())}`);
+        const data = await r.json();
+        if (!data.booking) {
+          rescheduleState = null;
+          makeBotBubble("I couldn't find a booking under that email. Want to try a different email or book a new appointment?");
+          sounds.pop(); addTimestamp(); scrollBottom();
+          return;
+        }
+        rescheduleState.data.booking = data.booking;
+        rescheduleState.step = 'action';
+        await delay(350);
+        makeBotBubble(`Found it! 📅 ${data.booking.summary}\n${data.booking.date}\n\nWould you like to reschedule or cancel?`);
+        setTimeout(() => renderQuickReplies(['📅 Reschedule', '✕ Cancel booking']), 100);
+      } catch {
+        rescheduleState = null;
+        makeBotBubble("Sorry, I couldn't look that up right now. Please give us a call to rearrange.");
+        sounds.pop();
+      }
+      addTimestamp(); scrollBottom();
+    } else if (step === 'action') {
+      if (/cancel/i.test(text)) {
+        // Cancel the booking
+        try {
+          await fetch(`${BASE}/api/booking/cancel`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ owner: CONFIG.ownerEmail, eventId: rescheduleState.data.booking.id }),
+          });
+        } catch {}
+        rescheduleState = null;
+        await delay(350);
+        makeBotBubble("Done — your booking has been cancelled. Want to rebook for another time?");
+        sounds.pop(); addTimestamp(); scrollBottom();
+      } else {
+        // Reschedule — show available slots
+        rescheduleState.step = 'newslot';
+        await delay(350);
+        fetchAvailability();
+        makeBotBubble("Pick a new time from the available slots above, or tell me when works for you.");
+        sounds.pop(); addTimestamp(); scrollBottom();
+      }
+    } else if (step === 'newslot') {
+      // They picked a new time
+      try {
+        await fetch(`${BASE}/api/booking/reschedule`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ owner: CONFIG.ownerEmail, eventId: rescheduleState.data.booking.id, newDatetime: text.trim() }),
+        });
+      } catch {}
+      rescheduleState = null;
+      await delay(350);
+      makeBotBubble("All sorted! 📅 Your booking has been moved. You'll get an updated confirmation email.");
+      sounds.pop(); addTimestamp(); scrollBottom();
+    }
+  }
+
+  // =====================================================
   //  BUILD DOM
   // =====================================================
   function buildWidget() {
@@ -1578,7 +1676,7 @@ Return JSON:
   const LS_HIST    = '_ac_hist_v4', LS_LEAD = '_ac_lead', LS_NAME = '_ac_name', LS_GDPR = '_ac_gdpr';
 
   let isOpen = false, isBusy = false, hasOpened = false;
-  let botMsgs = 0, msgStreak = 0, leadDone = false, ratingShown = false, menuOpen = false;
+  let botMsgs = 0, msgStreak = 0, leadDone = false, ratingShown = false, menuOpen = false, sessionConverted = false;
   let awaitingName = false, gdprConsented = !!localStorage.getItem(LS_GDPR);
   let userName = localStorage.getItem(LS_NAME) || '';
   let inactTimer = null, history = [];
@@ -1726,6 +1824,7 @@ C) CLOSE → once you understand their need, guide to the natural next step:
    - Asking for contact info / phone number → output ::CONTACT
    - Asking "what do you offer" / services → output ::SERVICES then discuss
    - Wants to buy/order a product → output ::ORDER to collect details and place the order
+   - Wants to reschedule/cancel/move appointment → output ::RESCHEDULE
 
 SOFT CLOSE PHRASES (use naturally, not every message — rotate them):
 - "Want me to get that booked in for you?"
@@ -1775,6 +1874,7 @@ Use sparingly — only when genuinely helpful:
 ::CONTACT                  — show contact card with phone, email, WhatsApp
 ::SERVICES                 — show all services as clickable cards
 ::ORDER                    — start order flow (collect item, size/colour, name, email, delivery address — for product/clothing/ecommerce sites)
+::RESCHEDULE               — reschedule or cancel an existing booking (asks for their email, looks it up, offers to move or cancel)
 
 ━━━ FOLLOW-UPS ━━━
 End every response with this line. Make them the NEXT LOGICAL STEP in the visitor's journey toward a decision — not generic questions.
@@ -1851,6 +1951,11 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     if (/::BOOKING/.test(text) && CONFIG.booking) {
       text = text.replace(/::BOOKING/g, '');
       setTimeout(() => startBooking(), 400);
+    }
+    // Reschedule flow — find booking and offer new slots
+    if (/::RESCHEDULE/.test(text)) {
+      text = text.replace(/::RESCHEDULE/g, '');
+      setTimeout(() => startReschedule(), 400);
     }
     // Order flow — collect item details and place order
     if (/::ORDER/.test(text)) {
@@ -2208,11 +2313,12 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     trackEvent('auto_lead_captured', { email: emailMatch?.[0], phone: phoneMatch?.[0] });
   }
 
-  // Send chat summary to owner on conversation end
+  // Send chat summary + abandoned chat recovery on conversation end
   let _summarySent = false;
   function sendChatSummary() {
     if (_summarySent || history.length < 6) return;
     _summarySent = true;
+    // Chat summary to owner
     fetch(SUMMARY_URL, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2223,6 +2329,21 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
         page: document.title,
       }),
     }).catch(() => {});
+    // Abandoned chat recovery — if they chatted but didn't book/order/leave contact
+    if (!sessionConverted && !leadDone && !_autoLeadSent && history.length >= 4) {
+      fetch(BASE + '/api/chat/abandoned', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: history.slice(-20),
+          ownerEmail: CONFIG.ownerEmail,
+          siteName: CONFIG.siteName || document.title,
+          botName: CONFIG.botName,
+          visitorName: userName || null,
+          page: document.title,
+          sessionId: SESSION_ID,
+        }),
+      }).catch(() => {});
+    }
   }
 
   // =====================================================
@@ -2317,6 +2438,8 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     if (bookingState) { el('_ac-inp').value = ''; el('_ac-inp').style.height = 'auto'; el('_ac-send').disabled = true; await handleBookingStep(text); el('_ac-send').disabled = !el('_ac-inp').value.trim(); return; }
     // Order flow intercept
     if (orderState) { el('_ac-inp').value = ''; el('_ac-inp').style.height = 'auto'; el('_ac-send').disabled = true; await handleOrderStep(text); el('_ac-send').disabled = !el('_ac-inp').value.trim(); return; }
+    // Reschedule flow intercept
+    if (rescheduleState) { el('_ac-inp').value = ''; el('_ac-inp').style.height = 'auto'; el('_ac-send').disabled = true; await handleRescheduleStep(text); el('_ac-send').disabled = !el('_ac-inp').value.trim(); return; }
 
     resetInactivity(); sounds.send();
 

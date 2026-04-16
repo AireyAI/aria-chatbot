@@ -3573,6 +3573,149 @@ app.post('/api/order', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── Booking Lookup / Reschedule / Cancel ────────────────────────────────────
+
+// Look up a booking by visitor email in Google Calendar
+app.get('/api/booking/lookup', async (req, res) => {
+  const { owner, email } = req.query;
+  if (!owner || !email) return res.json({ booking: null });
+  const entry = gmailTokens.get(owner);
+  if (!entry) return res.json({ booking: null });
+
+  try {
+    const calendar = google.calendar({ version: 'v3', auth: entry.auth });
+    const now = new Date();
+    const { data } = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin: now.toISOString(),
+      maxResults: 50,
+      singleEvents: true,
+      orderBy: 'startTime',
+      q: email,
+    });
+
+    const event = data.items?.find(e =>
+      e.description?.toLowerCase().includes(email.toLowerCase()) ||
+      e.attendees?.some(a => a.email?.toLowerCase() === email.toLowerCase())
+    );
+
+    if (!event) return res.json({ booking: null });
+
+    res.json({
+      booking: {
+        id: event.id,
+        summary: event.summary || 'Appointment',
+        date: event.start?.dateTime
+          ? new Date(event.start.dateTime).toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+          : event.start?.date || 'Unknown date',
+        description: event.description || '',
+      },
+    });
+  } catch (e) {
+    console.warn('Booking lookup failed:', e.message);
+    res.json({ booking: null });
+  }
+});
+
+// Cancel a booking
+app.post('/api/booking/cancel', async (req, res) => {
+  const { owner, eventId } = req.body;
+  if (!owner || !eventId) return res.status(400).json({ error: 'Missing owner or eventId' });
+  const entry = gmailTokens.get(owner);
+  if (!entry) return res.status(400).json({ error: 'Calendar not connected' });
+
+  try {
+    const calendar = google.calendar({ version: 'v3', auth: entry.auth });
+    await calendar.events.delete({ calendarId: 'primary', eventId, sendUpdates: 'all' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.warn('Cancel failed:', e.message);
+    res.status(500).json({ error: 'Could not cancel' });
+  }
+});
+
+// Reschedule a booking
+app.post('/api/booking/reschedule', async (req, res) => {
+  const { owner, eventId, newDatetime } = req.body;
+  if (!owner || !eventId || !newDatetime) return res.status(400).json({ error: 'Missing fields' });
+  const entry = gmailTokens.get(owner);
+  if (!entry) return res.status(400).json({ error: 'Calendar not connected' });
+
+  try {
+    const calendar = google.calendar({ version: 'v3', auth: entry.auth });
+    const parsed = await parseBookingDatetime(newDatetime);
+
+    const patch = parsed
+      ? { start: { dateTime: parsed.start, timeZone: 'Europe/London' }, end: { dateTime: parsed.end, timeZone: 'Europe/London' } }
+      : { summary: `📅 Rescheduled — ${newDatetime}` };
+
+    await calendar.events.patch({ calendarId: 'primary', eventId, requestBody: patch, sendUpdates: 'all' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.warn('Reschedule failed:', e.message);
+    res.status(500).json({ error: 'Could not reschedule' });
+  }
+});
+
+// ─── Abandoned Chat Recovery ─────────────────────────────────────────────────
+
+// Stores abandoned chats and sends recovery email after 30 minutes
+app.post('/api/chat/abandoned', async (req, res) => {
+  const { messages, ownerEmail, siteName, botName, visitorName, page, sessionId } = req.body;
+  if (!messages?.length || messages.length < 4) return res.json({ ok: true });
+  const alertTo = ownerTo(ownerEmail);
+
+  // Try to find visitor email from conversation
+  const allText = messages.filter(m => m.role === 'user').map(m => m.content).join(' ');
+  const emailMatch = allText.match(/[\w.+-]+@[\w.-]+\.\w{2,}/);
+  const visitorEmail = emailMatch?.[0];
+
+  // Alert owner immediately
+  await smartSend({
+    ownerEmail: alertTo,
+    to: alertTo,
+    subject: `⚠️ Abandoned Chat${visitorName ? ': ' + visitorName : ''} — ${siteName || 'Website'}`,
+    html: `<div style="font-family:-apple-system,sans-serif;max-width:500px;margin:0 auto;padding:24px;">
+      <h2 style="margin:0 0 16px;color:#1a1a2e">⚠️ Visitor Left Without Booking</h2>
+      <p style="font-size:14px;color:#666;margin-bottom:16px;">Someone chatted on ${siteName || 'your website'} but didn't book, leave contact info, or place an order.</p>
+      ${visitorName ? `<p style="font-size:14px;"><strong>Name:</strong> ${visitorName}</p>` : ''}
+      ${visitorEmail ? `<p style="font-size:14px;"><strong>Email found in chat:</strong> ${visitorEmail}</p>` : ''}
+      <p style="font-size:14px;"><strong>Page:</strong> ${page || 'Unknown'}</p>
+      <div style="margin:16px 0;border-top:1px solid #eee;padding-top:16px;">
+        <p style="font-size:13px;font-weight:600;margin-bottom:8px;">Conversation:</p>
+        ${messages.slice(-10).map(m => `<p style="font-size:13px;color:${m.role === 'user' ? '#333' : '#888'};margin:4px 0;"><strong>${m.role === 'user' ? (visitorName || 'Visitor') : 'Aria'}:</strong> ${m.content.slice(0, 200)}</p>`).join('')}
+      </div>
+    </div>`,
+  });
+
+  // If we found their email, schedule a recovery email in 30 minutes
+  if (visitorEmail) {
+    setTimeout(async () => {
+      // Check they haven't converted since (became a lead)
+      if (leadStatuses.has(visitorEmail)) return;
+
+      await smartSend({
+        ownerEmail: alertTo,
+        to: visitorEmail,
+        replyTo: alertTo,
+        subject: `Still interested? — ${siteName || botName || 'us'}`,
+        html: `<div style="font-family:-apple-system,sans-serif;max-width:500px;margin:0 auto;padding:24px;">
+          <h2 style="margin:0 0 16px;color:#1a1a2e">Hey${visitorName ? ' ' + visitorName : ''} 👋</h2>
+          <p style="font-size:14px;color:#444;line-height:1.7;margin-bottom:16px;">
+            I noticed you were chatting with us earlier but didn't get a chance to finish up.
+            If you'd like to book in or have any questions, just reply to this email — happy to help!
+          </p>
+          <p style="font-size:14px;color:#444;line-height:1.7;">
+            ${siteName ? `The team at <strong>${siteName}</strong> is` : 'We are'} here whenever you're ready.
+          </p>
+        </div>`,
+      });
+    }, 30 * 60 * 1000);
+  }
+
+  res.json({ ok: true });
+});
+
 // ─── Smart Chat Actions ──────────────────────────────────────────────────────
 
 // Calendar availability check — returns free slots for the next 5 days
@@ -6299,6 +6442,37 @@ app.post('/api/dashboard/settings', (req, res) => {
   res.json({ ok: true });
 });
 
+// Channel config storage
+const CHANNELS_FILE = resolve('data/channels.json');
+const channelConfigs = new Map(); // ownerEmail → { whatsapp, instagram, sms, facebook }
+try {
+  const raw = JSON.parse(readFileSync(CHANNELS_FILE, 'utf8'));
+  for (const [k, v] of Object.entries(raw)) channelConfigs.set(k, v);
+} catch {}
+function persistChannels() {
+  try { mkdirSync(resolve('data'), { recursive: true }); writeFileSync(CHANNELS_FILE, JSON.stringify(Object.fromEntries(channelConfigs), null, 2)); } catch {}
+}
+
+// GET /api/dashboard/channels
+app.get('/api/dashboard/channels', (req, res) => {
+  const owner = req.query.owner;
+  if (!owner) return res.json({ channels: {} });
+  res.json({ channels: channelConfigs.get(owner) || {} });
+});
+
+// POST /api/dashboard/channels
+app.post('/api/dashboard/channels', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { channel, value } = req.body;
+  if (!channel || !value) return res.status(400).json({ error: 'channel and value required' });
+  const existing = channelConfigs.get(owner) || {};
+  existing[channel] = value;
+  channelConfigs.set(owner, existing);
+  persistChannels();
+  res.json({ ok: true });
+});
+
 // GET /dashboard — Client Dashboard Page
 app.get('/dashboard', (req, res) => {
   const ownerEmail = req.query.owner || '';
@@ -6508,6 +6682,64 @@ tr:last-child td{border-bottom:none;}
       <span class="arrow">&#x25B6;</span>
     </div>
     <div class="section-body" id="body-settings"><div class="empty">Loading...</div></div>
+  </div>
+
+  <div class="section" id="sec-channels">
+    <div class="section-header" onclick="toggleSection('channels')">
+      <h3>&#x1F4E1; Channels</h3>
+      <span class="arrow">&#x25B6;</span>
+    </div>
+    <div class="section-body" id="body-channels">
+      <div style="padding:16px 20px;">
+        <p style="font-size:13px;color:#9898b8;margin-bottom:16px;">Connect additional channels so Aria can manage them all from one place.</p>
+
+        <div style="display:flex;flex-direction:column;gap:12px;">
+          <!-- Google (already connected) -->
+          <div style="background:rgba(0,229,160,0.05);border:1px solid rgba(0,229,160,0.2);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;">
+            <div style="display:flex;align-items:center;gap:12px;">
+              <span style="font-size:24px;">&#x1F4E7;</span>
+              <div><div style="font-weight:600;font-size:14px;">Gmail & Calendar</div><div style="font-size:12px;color:#00e5a0;">Connected &#x2713;</div></div>
+            </div>
+          </div>
+
+          <!-- WhatsApp -->
+          <div id="wa-channel" style="background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;">
+            <div style="display:flex;align-items:center;gap:12px;">
+              <span style="font-size:24px;">&#x1F4AC;</span>
+              <div><div style="font-weight:600;font-size:14px;">WhatsApp Business</div><div style="font-size:12px;color:#9898b8;" id="wa-status">Not connected</div></div>
+            </div>
+            <button onclick="connectChannel('whatsapp')" id="wa-btn" style="background:rgba(37,211,102,0.15);color:#25D366;border:1px solid rgba(37,211,102,0.3);border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;">Connect</button>
+          </div>
+
+          <!-- Instagram -->
+          <div id="ig-channel" style="background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;">
+            <div style="display:flex;align-items:center;gap:12px;">
+              <span style="font-size:24px;">&#x1F4F7;</span>
+              <div><div style="font-weight:600;font-size:14px;">Instagram DMs</div><div style="font-size:12px;color:#9898b8;" id="ig-status">Not connected</div></div>
+            </div>
+            <button onclick="connectChannel('instagram')" id="ig-btn" style="background:rgba(225,48,108,0.15);color:#E1306C;border:1px solid rgba(225,48,108,0.3);border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;">Connect</button>
+          </div>
+
+          <!-- SMS -->
+          <div id="sms-channel" style="background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;">
+            <div style="display:flex;align-items:center;gap:12px;">
+              <span style="font-size:24px;">&#x1F4F1;</span>
+              <div><div style="font-weight:600;font-size:14px;">SMS</div><div style="font-size:12px;color:#9898b8;" id="sms-status">Not connected</div></div>
+            </div>
+            <button onclick="connectChannel('sms')" id="sms-btn" style="background:rgba(108,99,255,0.15);color:#6C63FF;border:1px solid rgba(108,99,255,0.3);border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;">Connect</button>
+          </div>
+
+          <!-- Facebook Messenger -->
+          <div id="fb-channel" style="background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;">
+            <div style="display:flex;align-items:center;gap:12px;">
+              <span style="font-size:24px;">&#x1F4AC;</span>
+              <div><div style="font-weight:600;font-size:14px;">Facebook Messenger</div><div style="font-size:12px;color:#9898b8;" id="fb-status">Not connected</div></div>
+            </div>
+            <button onclick="connectChannel('facebook')" id="fb-btn" style="background:rgba(24,119,242,0.15);color:#1877F2;border:1px solid rgba(24,119,242,0.3);border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;">Connect</button>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -6731,6 +6963,52 @@ async function saveSetting(key, value) {
     else toast('Failed to update');
   } catch (e) { toast('Error updating setting'); }
 }
+
+// Channel connection
+async function connectChannel(channel) {
+  const labels = { whatsapp: 'WhatsApp Business', instagram: 'Instagram', sms: 'SMS', facebook: 'Facebook Messenger' };
+  const fields = {
+    whatsapp: { label: 'WhatsApp Business phone number', placeholder: '+447000000000', key: 'phone' },
+    instagram: { label: 'Instagram username', placeholder: '@yourbusiness', key: 'username' },
+    sms: { label: 'Business phone number for SMS', placeholder: '+447000000000', key: 'phone' },
+    facebook: { label: 'Facebook Page ID', placeholder: '123456789', key: 'pageId' },
+  };
+  const field = fields[channel];
+  const value = prompt(field.label + ':');
+  if (!value) return;
+
+  try {
+    const r = await apiPost('/api/dashboard/channels', { owner: OWNER, channel, value: value.trim() });
+    if (r.ok) {
+      document.getElementById(channel.slice(0,2) + '-status').textContent = 'Connected: ' + value.trim();
+      document.getElementById(channel.slice(0,2) + '-btn').textContent = 'Update';
+      document.getElementById(channel.slice(0,2) + '-btn').style.opacity = '0.6';
+      toast(labels[channel] + ' connected!');
+    } else {
+      toast('Failed to connect');
+    }
+  } catch (e) { toast('Error connecting channel'); }
+}
+
+// Load channel statuses
+async function loadChannels() {
+  try {
+    const d = await api('/api/dashboard/channels?owner=' + encodeURIComponent(OWNER));
+    if (d.channels) {
+      for (const [ch, val] of Object.entries(d.channels)) {
+        const prefix = ch.slice(0,2);
+        const statusEl = document.getElementById(prefix + '-status');
+        const btnEl = document.getElementById(prefix + '-btn');
+        if (statusEl && val) {
+          statusEl.textContent = 'Connected: ' + val;
+          statusEl.style.color = '#00e5a0';
+          if (btnEl) { btnEl.textContent = 'Update'; btnEl.style.opacity = '0.6'; }
+        }
+      }
+    }
+  } catch {}
+}
+loadChannels();
 </script>
 </body></html>`);
 });
