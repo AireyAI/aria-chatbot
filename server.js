@@ -3308,6 +3308,271 @@ app.post('/api/booking', async (req, res) => {
   res.json({ ok:true, calendarAdded: !!calEvent, calendarLink: b.calendarLink });
 });
 
+// ─── Standalone Booking Page ──────────────────────────────────────────────────
+
+app.get('/book', async (req, res) => {
+  const owner = req.query.owner || '';
+  if (!owner) return res.status(400).send('Missing owner parameter');
+
+  // Load client profile for business name and services
+  let businessName = owner.split('@')[0];
+  let services = [];
+  let brandColor = '#6C63FF';
+  for (const [, v] of clientProfiles) {
+    if (v.profile?.email === owner || v.profile?.name) {
+      businessName = v.profile.name || businessName;
+      if (v.profile.services) {
+        services = v.profile.services.split(/,|;|\n/).map(s => s.trim()).filter(Boolean);
+      }
+      break;
+    }
+  }
+
+  res.send(`<!DOCTYPE html><html><head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Book — ${businessName}</title>
+    <style>
+      *{box-sizing:border-box;margin:0;padding:0}
+      body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;color:#eee;padding:20px;}
+      .container{max-width:480px;margin:0 auto;}
+      .logo{text-align:center;margin-bottom:24px;}
+      .logo h1{font-size:24px;font-weight:800;letter-spacing:-0.5px;}
+      .logo em{font-style:normal;color:${brandColor};}
+      .logo p{font-size:13px;color:#9898b8;margin-top:4px;}
+      .step{display:none;} .step.active{display:block;}
+      .step h2{font-size:18px;margin-bottom:16px;font-weight:600;}
+      .services{display:flex;flex-direction:column;gap:8px;margin-bottom:20px;}
+      .svc{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px 16px;cursor:pointer;transition:all .15s;font-size:14px;}
+      .svc:hover,.svc.selected{border-color:${brandColor};background:rgba(108,99,255,0.08);}
+      .svc.selected::after{content:'✓';float:right;color:${brandColor};font-weight:700;}
+      .slots{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:20px;max-height:320px;overflow-y:auto;}
+      .slot{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:12px;cursor:pointer;text-align:center;transition:all .15s;font-size:13px;}
+      .slot:hover,.slot.selected{border-color:${brandColor};background:rgba(108,99,255,0.08);}
+      .slot .day{font-weight:600;font-size:14px;margin-bottom:2px;}
+      .slot .time{color:#9898b8;font-size:12px;}
+      input{width:100%;padding:14px 16px;background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;color:#eee;font-size:14px;margin-bottom:12px;outline:none;}
+      input:focus{border-color:${brandColor};}
+      input::placeholder{color:#666;}
+      .btn{width:100%;padding:14px;background:${brandColor};color:#fff;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;transition:all .15s;}
+      .btn:hover{opacity:.88;transform:translateY(-1px);}
+      .btn:disabled{opacity:.4;cursor:not-allowed;transform:none;}
+      .back{background:none;border:none;color:#9898b8;font-size:13px;cursor:pointer;margin-bottom:16px;padding:0;}
+      .back:hover{color:#eee;}
+      .loading{text-align:center;padding:40px;color:#9898b8;font-size:14px;}
+      .success{text-align:center;padding:40px 0;}
+      .success .icon{font-size:48px;margin-bottom:16px;}
+      .success h2{margin-bottom:8px;}
+      .success p{color:#9898b8;font-size:14px;line-height:1.6;}
+      .success .email{display:inline-block;background:rgba(108,99,255,0.1);border:1px solid rgba(108,99,255,0.25);border-radius:8px;padding:6px 16px;font-size:14px;color:${brandColor};font-weight:600;margin:12px 0;}
+    </style>
+  </head><body>
+    <div class="container">
+      <div class="logo">
+        <h1>${businessName}</h1>
+        <p>Book an appointment online</p>
+      </div>
+
+      <!-- Step 1: Service -->
+      <div class="step active" id="step-service">
+        <h2>What would you like to book?</h2>
+        <div class="services" id="service-list">
+          ${services.length ? services.map(s => `<div class="svc" onclick="selectService(this,'${s.replace(/'/g, "\\'")}')">${s}</div>`).join('') : '<input id="custom-service" placeholder="What do you need? (e.g. Haircut, Massage, Consultation)" />'}
+        </div>
+        <button class="btn" onclick="goToSlots()">Next →</button>
+      </div>
+
+      <!-- Step 2: Time slot -->
+      <div class="step" id="step-slots">
+        <button class="back" onclick="goBack('step-service')">← Back</button>
+        <h2>Pick a time</h2>
+        <div id="slots-container"><div class="loading">Loading available slots...</div></div>
+        <button class="btn" id="slots-next" disabled onclick="goToDetails()">Next →</button>
+      </div>
+
+      <!-- Step 3: Details -->
+      <div class="step" id="step-details">
+        <button class="back" onclick="goBack('step-slots')">← Back</button>
+        <h2>Your details</h2>
+        <input id="b-name" placeholder="Your name" />
+        <input id="b-email" type="email" placeholder="Email address" />
+        <input id="b-phone" type="tel" placeholder="Phone number (optional)" />
+        <div id="confirm-summary" style="background:#161630;border-radius:12px;padding:16px;margin-bottom:16px;font-size:13px;color:#9898b8;"></div>
+        <button class="btn" onclick="confirmBooking()">Confirm Booking ✓</button>
+      </div>
+
+      <!-- Step 4: Success -->
+      <div class="step" id="step-done">
+        <div class="success">
+          <div class="icon">🎉</div>
+          <h2>You're booked in!</h2>
+          <p>A confirmation email is on its way.<br>We'll see you soon.</p>
+          <div class="email" id="done-summary"></div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const OWNER = '${owner}';
+      let selectedService = '';
+      let selectedSlot = null;
+
+      function selectService(el, name) {
+        document.querySelectorAll('.svc').forEach(s => s.classList.remove('selected'));
+        el.classList.add('selected');
+        selectedService = name;
+      }
+
+      function showStep(id) {
+        document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+        document.getElementById(id).classList.add('active');
+      }
+
+      function goBack(stepId) { showStep(stepId); }
+
+      async function goToSlots() {
+        if (!selectedService) {
+          const custom = document.getElementById('custom-service');
+          if (custom) selectedService = custom.value.trim();
+        }
+        if (!selectedService) return;
+        showStep('step-slots');
+        const container = document.getElementById('slots-container');
+        container.innerHTML = '<div class="loading">Checking availability...</div>';
+        try {
+          const r = await fetch('/api/calendar/availability?owner=' + encodeURIComponent(OWNER));
+          const data = await r.json();
+          if (!data.slots?.length) {
+            container.innerHTML = '<div class="loading">No slots available right now — please call us to arrange.</div>';
+            return;
+          }
+          container.innerHTML = '<div class="slots">' + data.slots.map((s, i) =>
+            '<div class="slot" onclick="selectSlot(this,' + i + ')">' +
+              '<div class="day">' + s.date + '</div>' +
+              '<div class="time">' + s.time + '</div>' +
+            '</div>'
+          ).join('') + '</div>';
+          window._slots = data.slots;
+        } catch {
+          container.innerHTML = '<div class="loading">Could not load slots — please try again.</div>';
+        }
+      }
+
+      function selectSlot(el, idx) {
+        document.querySelectorAll('.slot').forEach(s => s.classList.remove('selected'));
+        el.classList.add('selected');
+        selectedSlot = window._slots[idx];
+        document.getElementById('slots-next').disabled = false;
+      }
+
+      function goToDetails() {
+        if (!selectedSlot) return;
+        showStep('step-details');
+        document.getElementById('confirm-summary').innerHTML =
+          '<strong>' + selectedService + '</strong><br>' + selectedSlot.date + ' — ' + selectedSlot.time;
+      }
+
+      async function confirmBooking() {
+        const name = document.getElementById('b-name').value.trim();
+        const email = document.getElementById('b-email').value.trim();
+        const phone = document.getElementById('b-phone').value.trim();
+        if (!name || !email) return alert('Please enter your name and email.');
+        try {
+          await fetch('/api/booking', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name, email, phone,
+              datetime: selectedSlot.date + ' ' + selectedSlot.time.split(' - ')[0],
+              notes: selectedService,
+              ownerEmail: OWNER,
+              siteName: '${businessName.replace(/'/g, "\\'")}',
+              page: 'Booking Page',
+            }),
+          });
+          document.getElementById('done-summary').textContent = selectedSlot.date + ' — ' + selectedSlot.time;
+          showStep('step-done');
+        } catch {
+          alert('Something went wrong — please try again.');
+        }
+      }
+    </script>
+  </body></html>`);
+});
+
+// ─── Order Endpoint ──────────────────────────────────────────────────────────
+
+app.post('/api/order', async (req, res) => {
+  const { name, email, phone, item, variant, address, notes, ownerEmail, siteName } = req.body;
+  if (!item) return res.status(400).json({ error: 'Item required' });
+  const alertTo = ownerTo(ownerEmail);
+
+  // Save as lead
+  const key = email || phone || name;
+  if (key && !leadStatuses.has(key)) {
+    leadStatuses.set(key, { status: 'new', notes: 'Order: ' + item, updatedAt: new Date(), name, siteName });
+    save('leadStatuses', Array.from(leadStatuses.entries()));
+  }
+
+  // Email the owner
+  await smartSend({
+    ownerEmail: alertTo,
+    to: alertTo,
+    replyTo: email || undefined,
+    subject: `🛒 New Order: ${item}${variant ? ' (' + variant + ')' : ''} — ${name || 'Visitor'}`,
+    html: `<div style="font-family:-apple-system,sans-serif;max-width:500px;margin:0 auto;padding:24px;">
+      <h2 style="margin:0 0 16px;color:#1a1a2e">🛒 New Order</h2>
+      <div style="background:#f8f8fc;border-radius:12px;padding:20px;margin-bottom:16px;">
+        <p style="margin:0 0 8px;font-size:14px;"><strong>Item:</strong> ${item}${variant ? ' — ' + variant : ''}</p>
+        <p style="margin:0 0 8px;font-size:14px;"><strong>Name:</strong> ${name || 'Not provided'}</p>
+        ${email ? `<p style="margin:0 0 8px;font-size:14px;"><strong>Email:</strong> <a href="mailto:${email}">${email}</a></p>` : ''}
+        ${phone ? `<p style="margin:0 0 8px;font-size:14px;"><strong>Phone:</strong> <a href="tel:${phone}">${phone}</a></p>` : ''}
+        ${address ? `<p style="margin:0 0 8px;font-size:14px;"><strong>Delivery:</strong> ${address}</p>` : ''}
+        ${notes ? `<p style="margin:0;font-size:14px;"><strong>Notes:</strong> ${notes}</p>` : ''}
+      </div>
+      <p style="font-size:13px;color:#666;">From ${siteName || 'your website'} • ${new Date().toLocaleString('en-GB')}</p>
+    </div>`,
+  });
+
+  // Add to Google Calendar
+  if (alertTo && gmailTokens.has(alertTo)) {
+    createCalendarEvent(alertTo, {
+      name: `🛒 Order: ${item}${variant ? ' (' + variant + ')' : ''} — ${name || 'Visitor'}`,
+      email: email || '',
+      datetime: new Date().toISOString(),
+      notes: `Order placed\nItem: ${item}${variant ? '\nVariant: ' + variant : ''}\n${name ? 'Name: ' + name : ''}${email ? '\nEmail: ' + email : ''}${phone ? '\nPhone: ' + phone : ''}${address ? '\nDelivery: ' + address : ''}${notes ? '\nNotes: ' + notes : ''}\nSite: ${siteName || 'website'}`,
+      siteName: siteName,
+      timezone: 'Europe/London',
+    }).catch(() => {});
+  }
+
+  // Slack
+  await slack([
+    { type: 'header', text: { type: 'plain_text', text: '🛒 New Order' } },
+    { type: 'section', text: { type: 'mrkdwn', text: `*${item}*${variant ? ' (' + variant + ')' : ''}\n${name || 'Visitor'}${email ? ' — ' + email : ''}\n${address ? 'Delivery: ' + address : 'No address'}\nSite: ${siteName || 'Website'}` } },
+  ], `Order: ${item}`);
+
+  // Confirmation email to visitor
+  if (email) {
+    await smartSend({
+      ownerEmail: alertTo,
+      to: email,
+      replyTo: alertTo,
+      subject: `🛒 Order received — ${item}`,
+      html: `<div style="font-family:-apple-system,sans-serif;max-width:500px;margin:0 auto;padding:24px;">
+        <h2 style="margin:0 0 16px;color:#1a1a2e">Order Received ✓</h2>
+        <p style="font-size:14px;color:#444;line-height:1.7;margin-bottom:16px;">Thanks${name ? ' ' + name : ''}! Your order has been received and someone will be in touch to confirm.</p>
+        <div style="background:#f8f8fc;border-radius:12px;padding:16px;font-size:14px;">
+          <strong>${item}</strong>${variant ? ' — ' + variant : ''}
+          ${address ? '<br>Delivering to: ' + address : ''}
+        </div>
+        <p style="font-size:13px;color:#666;margin-top:16px;">From ${siteName || 'the team'}</p>
+      </div>`,
+    });
+  }
+
+  res.json({ ok: true });
+});
+
 // ─── Smart Chat Actions ──────────────────────────────────────────────────────
 
 // Calendar availability check — returns free slots for the next 5 days

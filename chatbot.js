@@ -208,6 +208,7 @@
   const QUOTE_URL   = BASE + '/api/chat/quote';
   const SUMMARY_URL = BASE + '/api/chat/summary';
   const AUTOLEAD_URL = BASE + '/api/chat/auto-lead';
+  const ORDER_URL    = BASE + '/api/order';
 
   const SESSION_ID = (() => {
     const k = '_ac_sid'; let id = sessionStorage.getItem(k);
@@ -1418,6 +1419,97 @@ Return JSON:
   }
 
   // =====================================================
+  //  ORDER FLOW (for ecommerce / product orders)
+  // =====================================================
+  let orderState = null;
+
+  async function startOrder() {
+    orderState = { step: 'item', data: {} };
+    await delay(300);
+    if (CONFIG.products.length) {
+      makeBotBubble("What would you like to order?");
+      sounds.pop(); addTimestamp();
+      // Show products as selectable options
+      const card = document.createElement('div');
+      card.className = 'ac-services-card';
+      card.innerHTML = `<div style="display:flex;flex-direction:column;gap:6px;">
+        ${CONFIG.products.map(p => `<div style="background:#f8f8fc;border-radius:10px;padding:12px 14px;cursor:pointer;transition:all .15s;" onclick="this.style.border='2px solid var(--ac-color,#6C63FF)';window._orderItem='${p.name.replace(/'/g, "\\'")}';document.querySelectorAll('.ac-services-card div[onclick]').forEach(d=>d.style.border='none');this.style.border='2px solid var(--ac-color,#6C63FF)';window.AriaChat.send('${p.name.replace(/'/g, "\\'")}')">
+          <div style="font-size:14px;font-weight:600;margin-bottom:2px;">${p.name}</div>
+          ${p.desc ? `<div style="font-size:12px;color:#666;">${p.desc}</div>` : ''}
+          ${p.price ? `<div style="font-size:13px;color:var(--ac-color,#6C63FF);font-weight:600;margin-top:4px;">${p.price}</div>` : ''}
+        </div>`).join('')}
+      </div>`;
+      insertBefore(card);
+    } else {
+      makeBotBubble("What item would you like to order?");
+      sounds.pop(); addTimestamp();
+    }
+    scrollBottom();
+  }
+
+  async function handleOrderStep(text) {
+    addUserMessage(text);
+    const step = orderState.step;
+    if (step === 'item') {
+      orderState.data.item = text.trim();
+      orderState.step = 'variant';
+      await delay(350);
+      makeBotBubble("Any specific size, colour, or option? (or say 'no' if not applicable)");
+    } else if (step === 'variant') {
+      orderState.data.variant = /^no$/i.test(text.trim()) ? '' : text.trim();
+      orderState.step = 'name';
+      await delay(350);
+      if (userName) {
+        orderState.data.name = userName;
+        orderState.step = 'email';
+        makeBotBubble(`Got it, ${userName}. What's your email? 📧`);
+      } else {
+        makeBotBubble("What's your name?");
+      }
+    } else if (step === 'name') {
+      orderState.data.name = text.trim();
+      userName = text.trim().split(' ')[0];
+      localStorage.setItem(LS_NAME, userName);
+      orderState.step = 'email';
+      await delay(350);
+      makeBotBubble(`Thanks ${userName}! What's your email? 📧`);
+    } else if (step === 'email') {
+      if (!text.includes('@')) { makeBotBubble("That doesn't look right — can you check your email?"); sounds.pop(); addTimestamp(); scrollBottom(); return; }
+      orderState.data.email = text.trim();
+      orderState.step = 'address';
+      await delay(350);
+      makeBotBubble("What's the delivery address? 📦");
+    } else if (step === 'address') {
+      orderState.data.address = text.trim();
+      orderState.step = 'confirm';
+      const d = orderState.data;
+      await delay(350);
+      makeBotBubble(`Here's your order:\n\n🛒 ${d.item}${d.variant ? ' — ' + d.variant : ''}\n📧 ${d.email}\n📦 ${d.address}\n\nLook good?`);
+      setTimeout(() => renderQuickReplies(['✓ Place order', '✕ Cancel']), 100);
+    } else if (step === 'confirm') {
+      if (/yes|place|confirm|✓/i.test(text)) {
+        const d = orderState.data;
+        orderState = null;
+        try {
+          await fetch(ORDER_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+            ...d, sessionId: SESSION_ID, ownerEmail: CONFIG.ownerEmail,
+            siteName: CONFIG.siteName || document.title,
+          }) });
+        } catch {}
+        await delay(350);
+        makeBotBubble("Order placed! 🎉 You'll get a confirmation email shortly. We'll be in touch about delivery.");
+        sounds.celebrate(); confetti({ count: 60, y: 0.6 });
+      } else {
+        orderState = null;
+        await delay(350);
+        makeBotBubble("No problem! Is there anything else you'd like?");
+        sounds.pop();
+      }
+    }
+    addTimestamp(); scrollBottom();
+  }
+
+  // =====================================================
   //  BUILD DOM
   // =====================================================
   function buildWidget() {
@@ -1633,6 +1725,7 @@ C) CLOSE → once you understand their need, guide to the natural next step:
    - Asking "where are you" / directions → output ::DIRECTIONS
    - Asking for contact info / phone number → output ::CONTACT
    - Asking "what do you offer" / services → output ::SERVICES then discuss
+   - Wants to buy/order a product → output ::ORDER to collect details and place the order
 
 SOFT CLOSE PHRASES (use naturally, not every message — rotate them):
 - "Want me to get that booked in for you?"
@@ -1681,6 +1774,7 @@ Use sparingly — only when genuinely helpful:
 ::DIRECTIONS               — show clickable Google Maps directions to the business
 ::CONTACT                  — show contact card with phone, email, WhatsApp
 ::SERVICES                 — show all services as clickable cards
+::ORDER                    — start order flow (collect item, size/colour, name, email, delivery address — for product/clothing/ecommerce sites)
 
 ━━━ FOLLOW-UPS ━━━
 End every response with this line. Make them the NEXT LOGICAL STEP in the visitor's journey toward a decision — not generic questions.
@@ -1757,6 +1851,11 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     if (/::BOOKING/.test(text) && CONFIG.booking) {
       text = text.replace(/::BOOKING/g, '');
       setTimeout(() => startBooking(), 400);
+    }
+    // Order flow — collect item details and place order
+    if (/::ORDER/.test(text)) {
+      text = text.replace(/::ORDER/g, '');
+      setTimeout(() => startOrder(), 400);
     }
     // Check availability — fetch real calendar slots
     if (/::CHECK_AVAILABILITY/.test(text)) {
@@ -2216,6 +2315,8 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
 
     // Booking flow intercept
     if (bookingState) { el('_ac-inp').value = ''; el('_ac-inp').style.height = 'auto'; el('_ac-send').disabled = true; await handleBookingStep(text); el('_ac-send').disabled = !el('_ac-inp').value.trim(); return; }
+    // Order flow intercept
+    if (orderState) { el('_ac-inp').value = ''; el('_ac-inp').style.height = 'auto'; el('_ac-send').disabled = true; await handleOrderStep(text); el('_ac-send').disabled = !el('_ac-inp').value.trim(); return; }
 
     resetInactivity(); sounds.send();
 
