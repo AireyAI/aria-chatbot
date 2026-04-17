@@ -8373,6 +8373,48 @@ setInterval(async () => {
   }
 }, 60_000);
 
+// ─── Meta Token Refresh (daily) ──────────────────────────────────────────────
+let lastTokenRefreshDay = null;
+setInterval(async () => {
+  const now = new Date();
+  if (now.getHours() !== 3 || lastTokenRefreshDay === now.toDateString()) return;
+  lastTokenRefreshDay = now.toDateString();
+
+  for (const [ownerEmail, tokens] of metaTokens) {
+    const daysUntilExpiry = (tokens.userTokenExpiry - Date.now()) / (24 * 60 * 60 * 1000);
+    if (daysUntilExpiry > 7) continue;
+
+    console.log(`🔄 Refreshing Meta token for ${ownerEmail} (expires in ${Math.floor(daysUntilExpiry)} days)`);
+    try {
+      const url = `https://graph.facebook.com/v21.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${process.env.META_APP_ID}&client_secret=${process.env.META_APP_SECRET}&fb_exchange_token=${tokens.userToken}`;
+      const r = await fetch(url);
+      const data = await r.json();
+      if (data.error) throw new Error(data.error.message);
+
+      tokens.userToken = data.access_token;
+      tokens.userTokenExpiry = Date.now() + (data.expires_in || 5184000) * 1000;
+      metaTokens.set(ownerEmail, tokens);
+      persistMetaTokens();
+
+      const chConfig = channelConfigs.get(ownerEmail);
+      if (chConfig?.whatsapp?.accessToken) {
+        chConfig.whatsapp.accessToken = data.access_token;
+        channelConfigs.set(ownerEmail, chConfig);
+        persistChannels();
+      }
+
+      console.log(`✅ Refreshed Meta token for ${ownerEmail}`);
+    } catch (e) {
+      console.warn(`❌ Failed to refresh Meta token for ${ownerEmail}:`, e.message);
+      await sendEmail({
+        to: process.env.NOTIFY_EMAIL,
+        subject: `⚠️ Meta token refresh failed for ${ownerEmail}`,
+        html: `<p>The Meta token for <strong>${ownerEmail}</strong> failed to refresh: ${e.message}</p><p>They may need to reconnect via the dashboard.</p>`,
+      });
+    }
+  }
+}, 60_000);
+
 // ─── Abandoned recovery ───────────────────────────────────────────────────────
 setInterval(async () => {
   if (!process.env.NOTIFY_EMAIL) return;
@@ -8404,7 +8446,14 @@ loadAllowedDomains();
 loadInvites();
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`\n  ✦ Aria Chatbot Server v5.1\n  → Admin: http://localhost:${PORT}/admin?pass=${ADMIN}\n  → Health: http://localhost:${PORT}/health\n`));
+app.listen(PORT, () => {
+  const meta = process.env.META_APP_ID ? '✅' : '❌';
+  console.log(`\n  ✦ Aria Chatbot Server v5.2`);
+  console.log(`  → Admin: http://localhost:${PORT}/admin?pass=${ADMIN}`);
+  console.log(`  → Health: http://localhost:${PORT}/health`);
+  console.log(`  → Meta channels: ${meta} (${metaTokens.size} connected accounts)`);
+  console.log('');
+});
 
 // ─── Global error handlers — prevent unhandled errors from crashing the process
 process.on('uncaughtException', (err) => {
