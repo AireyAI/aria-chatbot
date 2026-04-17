@@ -54,6 +54,7 @@ app.use(cors(corsOpts));
 app.options('*', cors(corsOpts));
 // Raw body capture for Shopify webhook HMAC verification — must run before express.json()
 app.use('/api/shopify/webhook', express.raw({ type: 'application/json' }));
+app.use('/api/meta/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use('/chatbot.js', (req, res, next) => {
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
@@ -233,6 +234,79 @@ async function smartSend({ ownerEmail, to, subject, html, replyTo }) {
   }
   // Fallback to server SMTP
   await sendEmail({ to, subject, html, replyTo });
+}
+
+// ─── Multi-Channel Send ─────────────────────────────────────────────────────
+async function sendChannelReply(channel, channelConfig, recipientId, text) {
+  try {
+    if (channel === 'whatsapp') return await sendWhatsAppMessage(channelConfig, recipientId, text);
+    if (channel === 'instagram') return await sendInstagramMessage(channelConfig, recipientId, text);
+    if (channel === 'facebook') return await sendFacebookMessage(channelConfig, recipientId, text);
+    return false;
+  } catch (e) {
+    console.warn(`📱 [${channel}] Send failed:`, e.message);
+    return false;
+  }
+}
+
+async function sendWhatsAppMessage(config, recipientPhone, text) {
+  const r = await fetch(`https://graph.facebook.com/v21.0/${config.phoneNumberId}/messages`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${config.accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      to: recipientPhone,
+      type: 'text',
+      text: { body: text },
+    }),
+  });
+  if (!r.ok) {
+    const err = await r.text();
+    console.warn('WhatsApp send error:', err);
+    return false;
+  }
+  return true;
+}
+
+async function sendInstagramMessage(config, recipientId, text) {
+  const r = await fetch(`https://graph.facebook.com/v21.0/${config.igUserId}/messages`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${config.accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      recipient: { id: recipientId },
+      message: { text },
+    }),
+  });
+  if (!r.ok) {
+    const err = await r.text();
+    console.warn('Instagram send error:', err);
+    return false;
+  }
+  return true;
+}
+
+async function sendFacebookMessage(config, recipientId, text) {
+  const r = await fetch(`https://graph.facebook.com/v21.0/me/messages?access_token=${config.accessToken}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      messaging_type: 'RESPONSE',
+      recipient: { id: recipientId },
+      message: { text },
+    }),
+  });
+  if (!r.ok) {
+    const err = await r.text();
+    console.warn('Facebook send error:', err);
+    return false;
+  }
+  return true;
 }
 
 // ─── Email Auto-Reply ────────────────────────────────────────────────────────
@@ -4176,6 +4250,15 @@ function verifyShopifyHmac(rawBody, hmacHeader) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
 }
 
+function verifyMetaSignature(rawBody, signatureHeader) {
+  if (!process.env.META_APP_SECRET || !signatureHeader) return false;
+  const expected = crypto
+    .createHmac('sha256', process.env.META_APP_SECRET)
+    .update(rawBody)
+    .digest('hex');
+  return signatureHeader === `sha256=${expected}`;
+}
+
 // Auto-fulfil a Shopify order through CJ
 async function autoFulfil(shopifyOrder) {
   const ship = shopifyOrder.shipping_address;
@@ -7534,6 +7617,309 @@ loadChannels();
 </script>
 </body></html>`);
 });
+
+// ─── Meta Webhook ────────────────────────────────────────────────────────────
+app.get('/api/meta/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === process.env.META_VERIFY_TOKEN) {
+    console.log('✅ Meta webhook verified');
+    return res.status(200).send(challenge);
+  }
+  res.status(403).send('Forbidden');
+});
+
+app.post('/api/meta/webhook', (req, res) => {
+  const rawBody = req.body;
+  const sig = req.headers['x-hub-signature-256'];
+
+  if (!verifyMetaSignature(rawBody, sig)) {
+    console.warn('⚠️ Meta webhook: invalid signature');
+    return res.status(401).send('Invalid signature');
+  }
+
+  res.status(200).send('EVENT_RECEIVED');
+
+  let payload;
+  try { payload = JSON.parse(rawBody.toString()); }
+  catch { return; }
+
+  setImmediate(() => processMetaWebhook(payload));
+});
+
+function findChannelByRecipientId(recipientId) {
+  for (const [ownerEmail, config] of channelConfigs) {
+    if (config.facebook?.pageId === recipientId) {
+      return { type: 'facebook', ownerEmail, config: config.facebook };
+    }
+    if (config.instagram?.igUserId === recipientId) {
+      return { type: 'instagram', ownerEmail, config: config.instagram };
+    }
+  }
+  return null;
+}
+
+function findOwnerByWhatsAppPhoneId(phoneNumberId) {
+  for (const [ownerEmail, config] of channelConfigs) {
+    if (config.whatsapp?.phoneNumberId === phoneNumberId) {
+      return { ownerEmail, config: config.whatsapp };
+    }
+  }
+  return null;
+}
+
+function getOwnerProfile(ownerEmail) {
+  const arConfig = EMAIL_AUTO_REPLY_ENABLED.get(ownerEmail);
+  if (arConfig?.systemPrompt) return { systemPrompt: arConfig.systemPrompt, config: arConfig.config };
+  for (const [key, val] of clientProfiles) {
+    if (val.email === ownerEmail || key === ownerEmail) return val;
+  }
+  return null;
+}
+
+async function processMetaWebhook(payload) {
+  if (!payload.entry) return;
+
+  for (const entry of payload.entry) {
+    // WhatsApp messages
+    if (entry.changes) {
+      for (const change of entry.changes) {
+        if (change.field === 'messages' && change.value?.messages) {
+          for (const msg of change.value.messages) {
+            if (msg.type !== 'text') continue;
+            const phoneNumberId = change.value.metadata?.phone_number_id;
+            const senderId = msg.from;
+            const senderName = change.value.contacts?.[0]?.profile?.name || senderId;
+            const messageText = msg.text?.body || '';
+            const messageId = msg.id;
+            await handleIncomingChannelMessage({
+              channel: 'whatsapp', recipientId: phoneNumberId,
+              senderId, senderName, messageText, messageId,
+            });
+          }
+        }
+      }
+    }
+
+    // Instagram & Facebook Messenger messages
+    if (entry.messaging) {
+      for (const event of entry.messaging) {
+        if (!event.message?.text) continue;
+        const recipientId = event.recipient?.id;
+        const senderId = event.sender?.id;
+        const messageText = event.message.text;
+        const messageId = event.message.mid;
+
+        const channel = findChannelByRecipientId(recipientId);
+        if (!channel) continue;
+
+        await handleIncomingChannelMessage({
+          channel: channel.type, recipientId,
+          senderId, senderName: senderId,
+          messageText, messageId,
+        });
+      }
+    }
+  }
+}
+
+async function generateChannelReply(systemPrompt, senderName, messageText) {
+  try {
+    const r = await claude.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 500,
+      messages: [{ role: 'user', content: `You received this message from ${senderName}:
+
+"${messageText}"
+
+Respond with valid JSON only:
+{
+  "text": "Your plain text reply here (no HTML)",
+  "booking": null or { "name": "customer name", "datetime": "date/time mentioned", "notes": "what they need" }
+}
+
+Rules:
+- Be friendly, helpful, and concise
+- If asking for a quote or booking, confirm and ask for missing details
+- If you can answer directly, do so
+- Offer to arrange a call or visit when appropriate
+- Sign off with the business name
+- Plain text only, no HTML tags
+- If a date/time/appointment is mentioned, extract into booking object` }],
+      system: systemPrompt,
+    });
+    const text = r.content[0]?.text || '';
+    try {
+      const parsed = JSON.parse(text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim());
+      return parsed;
+    } catch {
+      return { text, booking: null };
+    }
+  } catch (e) {
+    console.warn('Channel reply generation failed:', e.message);
+    return null;
+  }
+}
+
+function trackChannelReply(ownerEmail, channel) {
+  const stats = channelStats.get(ownerEmail) || {
+    whatsapp: { replied: 0, week: 0, lastReply: null },
+    instagram: { replied: 0, week: 0, lastReply: null },
+    facebook: { replied: 0, week: 0, lastReply: null },
+    total: 0,
+  };
+  if (!stats[channel]) stats[channel] = { replied: 0, week: 0, lastReply: null };
+  stats[channel].replied++;
+  stats[channel].week++;
+  stats[channel].lastReply = new Date().toISOString();
+  stats.total++;
+  channelStats.set(ownerEmail, stats);
+  persistChannelStats();
+}
+
+async function handleIncomingChannelMessage({ channel, recipientId, senderId, senderName, messageText, messageId }) {
+  // Dedup
+  if (processedMetaMessages.has(messageId)) return;
+  processedMetaMessages.add(messageId);
+  if (processedMetaMessages.size > 5000) {
+    const first = processedMetaMessages.values().next().value;
+    processedMetaMessages.delete(first);
+  }
+
+  // Find owner
+  let ownerEmail, channelConfig;
+  if (channel === 'whatsapp') {
+    const found = findOwnerByWhatsAppPhoneId(recipientId);
+    if (!found) return;
+    ownerEmail = found.ownerEmail;
+    channelConfig = found.config;
+  } else {
+    const found = findChannelByRecipientId(recipientId);
+    if (!found) return;
+    ownerEmail = found.ownerEmail;
+    channelConfig = found.config;
+  }
+
+  // Check channel enabled
+  const ownerChannels = channelConfigs.get(ownerEmail);
+  if (!ownerChannels?.[channel]?.enabled) return;
+
+  console.log(`📱 [${channel}] Message from ${senderName} (${senderId}) for ${ownerEmail}: "${messageText.substring(0, 80)}"`);
+
+  // Build system prompt from client profile
+  const profile = getOwnerProfile(ownerEmail);
+  const systemPrompt = profile?.systemPrompt || `You are a helpful business assistant for ${ownerEmail}.`;
+
+  // Knowledge base
+  const kbEntries = knowledgeBase.get(ownerEmail) || [];
+  const kbContext = kbEntries.length
+    ? '\n\nFREQUENTLY ASKED QUESTIONS:\n' + kbEntries.map(e => `Q: ${e.question}\nA: ${e.answer}`).join('\n\n')
+    : '';
+
+  // Conversation memory
+  const memKey = `${ownerEmail}::${channel}::${senderId}`;
+  const history = conversationMemory.get(memKey) || [];
+  const convContext = history.length
+    ? '\n\nPREVIOUS MESSAGES with this person (most recent last):\n' +
+      history.map(h => `[${h.role === 'sender' ? 'THEM' : 'US'}] ${h.preview}`).join('\n---\n')
+    : '';
+
+  // Channel-specific instructions
+  const channelLimits = {
+    whatsapp: 'Keep replies under 300 words. Use short paragraphs. No HTML.',
+    instagram: 'Keep replies under 200 words. Casual, friendly tone. No HTML.',
+    facebook: 'Keep replies under 300 words. Friendly and professional. No HTML.',
+  };
+  const channelInstructions = `\n\nYou are replying via ${channel}. ${channelLimits[channel]} Never mention you are AI — write as a team member.`;
+
+  // Generate reply
+  const reply = await generateChannelReply(
+    systemPrompt + kbContext + convContext + channelInstructions,
+    senderName, messageText
+  );
+
+  if (!reply) {
+    console.warn(`📱 [${channel}] Failed to generate reply for ${senderId}`);
+    return;
+  }
+
+  // Save incoming to conversation memory
+  history.push({ role: 'sender', preview: messageText.substring(0, 300), date: new Date().toISOString() });
+  if (history.length > 20) history.splice(0, history.length - 20);
+  conversationMemory.set(memKey, history);
+  persistConversationMemory();
+
+  // Check approval mode
+  const approvalMode = ownerChannels.approvalMode || ownerChannels[channel]?.approvalMode;
+  if (approvalMode) {
+    const approvalId = generateSessionToken();
+    channelApprovals.set(approvalId, {
+      ownerEmail, channel, senderId, senderName, messageText,
+      draftReply: reply.text, booking: reply.booking, createdAt: Date.now(),
+    });
+    persistChannelApprovals();
+
+    const serverUrl = process.env.GOOGLE_REDIRECT_URI?.replace('/auth/gmail/callback', '') || `http://localhost:${process.env.PORT || 3000}`;
+    await smartSend({
+      ownerEmail, to: ownerEmail,
+      subject: `✏️ Review Aria's ${channel} reply to ${senderName}`,
+      html: `<div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:20px;">
+        <h2 style="color:#1a1a2e;margin-bottom:4px;">New ${channel} message from ${senderName}</h2>
+        <div style="background:#f8f8fc;border-radius:10px;padding:16px;margin-bottom:20px;">
+          <p style="font-size:12px;color:#999;margin-bottom:8px;">THEIR MESSAGE:</p>
+          <p style="color:#333;font-size:14px;line-height:1.6;">${messageText.substring(0, 500)}</p>
+        </div>
+        <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:16px;margin-bottom:20px;">
+          <p style="font-size:12px;color:#999;margin-bottom:8px;">ARIA'S DRAFT REPLY:</p>
+          <p style="color:#333;font-size:14px;line-height:1.6;">${reply.text}</p>
+        </div>
+        <div style="display:flex;gap:12px;">
+          <a href="${serverUrl}/api/channel/approve?id=${approvalId}" style="display:inline-block;padding:12px 24px;background:#00e5a0;color:#0d0d1f;border-radius:10px;text-decoration:none;font-weight:600;">✓ Send</a>
+          <a href="${serverUrl}/api/channel/reject?id=${approvalId}" style="display:inline-block;padding:12px 24px;background:#ff6b6b;color:#fff;border-radius:10px;text-decoration:none;font-weight:600;">✗ Discard</a>
+        </div>
+      </div>`,
+    });
+    console.log(`✏️ [${channel}] Approval sent to ${ownerEmail}`);
+    return;
+  }
+
+  // Send reply directly
+  const sent = await sendChannelReply(channel, channelConfig, senderId, reply.text);
+  if (!sent) {
+    console.warn(`📱 [${channel}] Failed to send reply to ${senderId}`);
+    return;
+  }
+
+  // Save our reply to conversation memory
+  const updatedHistory = conversationMemory.get(memKey) || [];
+  updatedHistory.push({ role: 'us', preview: reply.text.substring(0, 300), date: new Date().toISOString() });
+  if (updatedHistory.length > 20) updatedHistory.splice(0, updatedHistory.length - 20);
+  conversationMemory.set(memKey, updatedHistory);
+  persistConversationMemory();
+
+  // Log message
+  const msgs = channelMessages.get(ownerEmail) || [];
+  msgs.push({
+    id: messageId, channel, senderId, senderName,
+    message: messageText, reply: reply.text,
+    timestamp: new Date().toISOString(), status: 'sent',
+  });
+  if (msgs.length > 500) msgs.splice(0, msgs.length - 500);
+  channelMessages.set(ownerEmail, msgs);
+  persistChannelMessages();
+
+  // Update stats
+  trackChannelReply(ownerEmail, channel);
+
+  // Detect booking
+  if (reply.booking) {
+    bookings.push({ ...reply.booking, channel, ownerEmail, ts: new Date().toISOString() });
+    save('bookings', bookings);
+  }
+
+  console.log(`📱 [${channel}] Replied to ${senderName}: "${reply.text.substring(0, 60)}..."`);
+}
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ status:'ok', sessions:sessions.size, faqs:faqs.size, handoffs:handoffs.size }));
