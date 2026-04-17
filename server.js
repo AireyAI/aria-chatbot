@@ -7921,6 +7921,229 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
   console.log(`📱 [${channel}] Replied to ${senderName}: "${reply.text.substring(0, 60)}..."`);
 }
 
+// ─── Channel Approval ────────────────────────────────────────────────────────
+app.get('/api/channel/approve', async (req, res) => {
+  const { id } = req.query;
+  const approval = channelApprovals.get(id);
+  if (!approval) {
+    return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center"><h2>Expired or already handled</h2></body></html>');
+  }
+
+  const { ownerEmail, channel, senderId, draftReply, booking } = approval;
+  const ownerChannels = channelConfigs.get(ownerEmail);
+  const channelConfig = ownerChannels?.[channel];
+
+  if (!channelConfig) {
+    return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center"><h2>Channel no longer connected</h2></body></html>');
+  }
+
+  const sent = await sendChannelReply(channel, channelConfig, senderId, draftReply);
+
+  channelApprovals.delete(id);
+  persistChannelApprovals();
+
+  if (sent) {
+    const msgs = channelMessages.get(ownerEmail) || [];
+    msgs.push({
+      id: crypto.randomUUID(), channel, senderId, senderName: approval.senderName,
+      message: approval.messageText, reply: draftReply,
+      timestamp: new Date().toISOString(), status: 'sent',
+    });
+    channelMessages.set(ownerEmail, msgs);
+    persistChannelMessages();
+    trackChannelReply(ownerEmail, channel);
+
+    if (booking) {
+      bookings.push({ ...booking, channel, ownerEmail, ts: new Date().toISOString() });
+      save('bookings', bookings);
+    }
+
+    const memKey = `${ownerEmail}::${channel}::${senderId}`;
+    const history = conversationMemory.get(memKey) || [];
+    history.push({ role: 'us', preview: draftReply.substring(0, 300), date: new Date().toISOString() });
+    conversationMemory.set(memKey, history);
+    persistConversationMemory();
+  }
+
+  res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;">
+    <h2 style="color:#00e5a0;">${sent ? '✓ Reply sent!' : '✗ Failed to send'}</h2>
+    <p style="color:#9898b8;">You can close this tab.</p>
+  </body></html>`);
+});
+
+app.get('/api/channel/reject', (req, res) => {
+  const { id } = req.query;
+  channelApprovals.delete(id);
+  persistChannelApprovals();
+  res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;">
+    <h2 style="color:#ff6b6b;">✗ Reply discarded</h2>
+    <p style="color:#9898b8;">You can close this tab.</p>
+  </body></html>`);
+});
+
+// ─── Meta OAuth (Facebook Login) ─────────────────────────────────────────────
+app.get('/auth/meta/start', (req, res) => {
+  if (!process.env.META_APP_ID || !process.env.META_APP_SECRET) {
+    return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><h2>Meta app not configured</h2></body></html>');
+  }
+  const ownerEmail = req.query.owner || '';
+  const sessionToken = req.query.s || '';
+  if (!ownerEmail || !validateSession(sessionToken, ownerEmail)) {
+    return res.redirect('/dashboard?owner=' + encodeURIComponent(ownerEmail));
+  }
+
+  const redirectUri = (process.env.GOOGLE_REDIRECT_URI?.replace('/auth/gmail/callback', '') || `http://localhost:${process.env.PORT || 3000}`) + '/auth/meta/callback';
+  const state = JSON.stringify({ owner: ownerEmail, s: sessionToken });
+  const scopes = [
+    'pages_show_list', 'pages_messaging',
+    'instagram_basic', 'instagram_manage_messages',
+    'whatsapp_business_management', 'whatsapp_business_messaging',
+    'business_management',
+  ].join(',');
+
+  const url = `https://www.facebook.com/v21.0/dialog/oauth?client_id=${process.env.META_APP_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state)}&scope=${encodeURIComponent(scopes)}&response_type=code`;
+  res.redirect(url);
+});
+
+app.get('/auth/meta/callback', async (req, res) => {
+  const { code, state } = req.query;
+  let ownerEmail = '', sessionToken = '';
+  try {
+    const parsed = JSON.parse(state);
+    ownerEmail = parsed.owner;
+    sessionToken = parsed.s;
+  } catch {}
+
+  if (!code || !ownerEmail) {
+    return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><h2>Connection failed</h2><p style="color:#9898b8">Missing authorization code.</p></body></html>');
+  }
+
+  const redirectUri = (process.env.GOOGLE_REDIRECT_URI?.replace('/auth/gmail/callback', '') || `http://localhost:${process.env.PORT || 3000}`) + '/auth/meta/callback';
+
+  try {
+    // Exchange code for short-lived user token
+    const tokenUrl = `https://graph.facebook.com/v21.0/oauth/access_token?client_id=${process.env.META_APP_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&client_secret=${process.env.META_APP_SECRET}&code=${code}`;
+    const tokenRes = await fetch(tokenUrl);
+    const tokenData = await tokenRes.json();
+    if (tokenData.error) throw new Error(tokenData.error.message);
+
+    // Exchange for long-lived token (60 days)
+    const longUrl = `https://graph.facebook.com/v21.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${process.env.META_APP_ID}&client_secret=${process.env.META_APP_SECRET}&fb_exchange_token=${tokenData.access_token}`;
+    const longRes = await fetch(longUrl);
+    const longData = await longRes.json();
+    if (longData.error) throw new Error(longData.error.message);
+
+    const userToken = longData.access_token;
+    const expiresIn = longData.expires_in || 5184000;
+
+    // Fetch pages the user manages
+    const pagesRes = await fetch(`https://graph.facebook.com/v21.0/me/accounts?access_token=${userToken}&fields=id,name,access_token,instagram_business_account{id,username}`);
+    const pagesData = await pagesRes.json();
+    if (pagesData.error) throw new Error(pagesData.error.message);
+
+    const pages = (pagesData.data || []).map(p => ({
+      pageId: p.id,
+      pageName: p.name,
+      accessToken: p.access_token,
+      igUserId: p.instagram_business_account?.id || null,
+      igUsername: p.instagram_business_account?.username || null,
+      wabaId: null,
+      waPhoneNumberId: null,
+      waDisplayPhone: null,
+    }));
+
+    // Check for WhatsApp Business accounts
+    const wabaRes = await fetch(`https://graph.facebook.com/v21.0/me/businesses?access_token=${userToken}&fields=id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number}}`);
+    const wabaData = await wabaRes.json();
+
+    if (wabaData.data) {
+      for (const biz of wabaData.data) {
+        const wabas = biz.owned_whatsapp_business_accounts?.data || [];
+        for (const waba of wabas) {
+          const phones = waba.phone_numbers?.data || [];
+          if (phones.length > 0) {
+            const target = pages[0] || { pageId: null, pageName: biz.name, accessToken: userToken };
+            target.wabaId = waba.id;
+            target.waPhoneNumberId = phones[0].id;
+            target.waDisplayPhone = phones[0].display_phone_number;
+            if (!pages.length) pages.push(target);
+          }
+        }
+      }
+    }
+
+    // Store tokens
+    metaTokens.set(ownerEmail, {
+      userToken,
+      userTokenExpiry: Date.now() + expiresIn * 1000,
+      pages,
+    });
+    persistMetaTokens();
+
+    // Update channelConfigs with available channels
+    const existing = channelConfigs.get(ownerEmail) || {};
+    const page = pages[0];
+    if (page) {
+      if (page.pageId) {
+        existing.facebook = {
+          enabled: existing.facebook?.enabled ?? true,
+          pageId: page.pageId,
+          pageName: page.pageName,
+          accessToken: page.accessToken,
+          connectedAt: new Date().toISOString(),
+        };
+
+        // Subscribe page to webhook
+        try {
+          await fetch(`https://graph.facebook.com/v21.0/${page.pageId}/subscribed_apps?access_token=${page.accessToken}&subscribed_fields=messages,messaging_postbacks`, { method: 'POST' });
+          console.log(`📱 Subscribed page ${page.pageName} to webhook`);
+        } catch (e) { console.warn('Page subscription failed:', e.message); }
+      }
+      if (page.igUserId) {
+        existing.instagram = {
+          enabled: existing.instagram?.enabled ?? true,
+          igUserId: page.igUserId,
+          igUsername: page.igUsername,
+          accessToken: page.accessToken,
+          connectedAt: new Date().toISOString(),
+        };
+      }
+      if (page.waPhoneNumberId) {
+        existing.whatsapp = {
+          enabled: existing.whatsapp?.enabled ?? true,
+          phoneNumberId: page.waPhoneNumberId,
+          wabaId: page.wabaId,
+          accessToken: userToken,
+          displayPhone: page.waDisplayPhone,
+          connectedAt: new Date().toISOString(),
+        };
+
+        try {
+          await fetch(`https://graph.facebook.com/v21.0/${page.wabaId}/subscribed_apps`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${userToken}` },
+          });
+          console.log(`📱 Subscribed WhatsApp ${page.waDisplayPhone} to webhook`);
+        } catch (e) { console.warn('WA subscription failed:', e.message); }
+      }
+    }
+    channelConfigs.set(ownerEmail, existing);
+    persistChannels();
+
+    console.log(`📱 Meta connected for ${ownerEmail}: ${pages.length} page(s), FB=${!!page?.pageId}, IG=${!!page?.igUserId}, WA=${!!page?.waPhoneNumberId}`);
+
+    res.redirect(`/dashboard?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}&meta_connected=1`);
+
+  } catch (e) {
+    console.error('Meta OAuth error:', e.message);
+    res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;">
+      <h2 style="color:#ff6b6b;">Connection failed</h2>
+      <p style="color:#9898b8;">${e.message}</p>
+      <a href="/dashboard?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}" style="color:#00e5a0;">Back to Dashboard</a>
+    </body></html>`);
+  }
+});
+
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ status:'ok', sessions:sessions.size, faqs:faqs.size, handoffs:handoffs.size }));
 
