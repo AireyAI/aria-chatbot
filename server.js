@@ -12,6 +12,8 @@
  *   SHOPIFY_WEBHOOK_SECRET Shopify webhook signing secret (from webhook settings)
  *   CJ_EMAIL               CJ Dropshipping account email
  *   CJ_API_KEY             CJ Dropshipping API key (from CJ developer dashboard)
+ *   BRANDSGATEWAY_API_KEY  BrandsGateway REST API key (from account settings)
+ *   PRINTFUL_API_KEY       Printful API token (from Printful dashboard → API)
  *   MAILCHIMP_API_KEY      e.g. abc123-us1
  *   MAILCHIMP_LIST_ID      audience/list ID
  *   DIGEST_HOUR            hour for daily digest (default 8)
@@ -270,6 +272,53 @@ const dashboardPasswords = new Map(); // ownerEmail → hashed password
 const dashboardSessions = new Map();  // token → { ownerEmail, expiresAt }
 const invites = new Map();            // token → { email, url, type, createdAt, used }
 const pendingSetups = new Map();      // token → { profile, createdAt } — temporary store for setup scan results
+
+// ─── Multi-Channel Messaging ─────────────────────────────────────────────────
+const CHANNEL_MESSAGES_FILE = resolve('data/channel-messages.json');
+const CHANNEL_STATS_FILE = resolve('data/channel-stats.json');
+const META_TOKENS_FILE = resolve('data/meta-tokens.json');
+const CHANNEL_APPROVALS_FILE = resolve('data/channel-approvals.json');
+const channelMessages = new Map();      // ownerEmail → [{ id, channel, senderId, senderName, message, reply, timestamp, status }]
+const channelStats = new Map();         // ownerEmail → { whatsapp: { replied, week, lastReply }, instagram: {...}, facebook: {...}, total }
+const metaTokens = new Map();           // ownerEmail → { userToken, userTokenExpiry, pages: [{ pageId, pageName, accessToken, igUserId, igUsername, wabaId, waPhoneNumberId, waDisplayPhone }] }
+const channelApprovals = new Map();     // approvalId → { ownerEmail, channel, senderId, senderName, draftReply, createdAt }
+const processedMetaMessages = new Set(); // dedup — message IDs already handled
+
+function persistChannelMessages() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [k, v] of channelMessages) obj[k] = v;
+    writeFileSync(CHANNEL_MESSAGES_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist channel messages:', e.message); }
+}
+
+function persistChannelStats() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [k, v] of channelStats) obj[k] = v;
+    writeFileSync(CHANNEL_STATS_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist channel stats:', e.message); }
+}
+
+function persistMetaTokens() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [k, v] of metaTokens) obj[k] = v;
+    writeFileSync(META_TOKENS_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist Meta tokens:', e.message); }
+}
+
+function persistChannelApprovals() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [k, v] of channelApprovals) obj[k] = v;
+    writeFileSync(CHANNEL_APPROVALS_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist channel approvals:', e.message); }
+}
 
 function loadInvites() {
   try {
@@ -1652,6 +1701,39 @@ function save(name, data, delay = 500) {
   // Site settings
   const savedSettings = loadFile('siteSettings', null);
   if (savedSettings) Object.assign(siteSettings, savedSettings);
+
+  // Channel messages
+  try {
+    if (existsSync(CHANNEL_MESSAGES_FILE)) {
+      const saved = JSON.parse(readFileSync(CHANNEL_MESSAGES_FILE, 'utf8'));
+      for (const [k, v] of Object.entries(saved)) channelMessages.set(k, v);
+    }
+  } catch (e) { console.warn('Failed to load channel messages:', e.message); }
+
+  // Channel stats
+  try {
+    if (existsSync(CHANNEL_STATS_FILE)) {
+      const saved = JSON.parse(readFileSync(CHANNEL_STATS_FILE, 'utf8'));
+      for (const [k, v] of Object.entries(saved)) channelStats.set(k, v);
+    }
+  } catch (e) { console.warn('Failed to load channel stats:', e.message); }
+
+  // Meta OAuth tokens
+  try {
+    if (existsSync(META_TOKENS_FILE)) {
+      const saved = JSON.parse(readFileSync(META_TOKENS_FILE, 'utf8'));
+      for (const [k, v] of Object.entries(saved)) metaTokens.set(k, v);
+      console.log(`📱 Loaded Meta tokens for ${metaTokens.size} accounts`);
+    }
+  } catch (e) { console.warn('Failed to load Meta tokens:', e.message); }
+
+  // Channel approvals
+  try {
+    if (existsSync(CHANNEL_APPROVALS_FILE)) {
+      const saved = JSON.parse(readFileSync(CHANNEL_APPROVALS_FILE, 'utf8'));
+      for (const [k, v] of Object.entries(saved)) channelApprovals.set(k, v);
+    }
+  } catch (e) { console.warn('Failed to load channel approvals:', e.message); }
 
   console.log(`📂 Loaded: ${savedFaqs.length} FAQs, ${savedBookings.length} bookings, ${savedProducts.length} products, ${savedDsOrders.length} dropship orders, ${usage.messages} msgs this month`);
 })();
@@ -4020,6 +4102,66 @@ async function cjGetTracking(trackNumber) {
   return cjAPI(`/logistic/getTrackInfo?trackNumber=${encodeURIComponent(trackNumber)}`);
 }
 
+// ─── BrandsGateway API ───────────────────────────────────────────────────────
+const BG_BASE = 'https://api.brandsgateway.com/api/v1';
+
+async function bgAPI(path, method = 'GET', body = null) {
+  const key = process.env.BRANDSGATEWAY_API_KEY;
+  if (!key) throw new Error('BrandsGateway not configured');
+  const opts = { method, headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(`${BG_BASE}${path}`, opts);
+  return r.json();
+}
+
+async function bgSearchProducts(keyword, page = 1) {
+  return bgAPI(`/products?search=${encodeURIComponent(keyword)}&page=${page}&per_page=20`);
+}
+
+async function bgGetProduct(id) {
+  return bgAPI(`/products/${encodeURIComponent(id)}`);
+}
+
+async function bgPlaceOrder(orderData) {
+  return bgAPI('/orders', 'POST', orderData);
+}
+
+async function bgGetOrder(orderId) {
+  return bgAPI(`/orders/${encodeURIComponent(orderId)}`);
+}
+
+// ─── Printful API ────────────────────────────────────────────────────────────
+const PF_BASE = 'https://api.printful.com';
+
+async function pfAPI(path, method = 'GET', body = null) {
+  const key = process.env.PRINTFUL_API_KEY;
+  if (!key) throw new Error('Printful not configured');
+  const opts = { method, headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(`${PF_BASE}${path}`, opts);
+  return r.json();
+}
+
+async function pfSearchProducts(keyword) {
+  // Printful catalog = their printable product templates
+  const data = await pfAPI('/products');
+  const all = data.result || [];
+  const kw = keyword.toLowerCase();
+  return all.filter(p => p.title?.toLowerCase().includes(kw) || p.type_name?.toLowerCase().includes(kw));
+}
+
+async function pfGetProduct(id) {
+  return pfAPI(`/products/${encodeURIComponent(id)}`);
+}
+
+async function pfPlaceOrder(orderData) {
+  return pfAPI('/orders', 'POST', orderData);
+}
+
+async function pfGetOrder(orderId) {
+  return pfAPI(`/orders/${encodeURIComponent(orderId)}`);
+}
+
 // Verify Shopify webhook HMAC signature
 function verifyShopifyHmac(rawBody, hmacHeader) {
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
@@ -4039,55 +4181,113 @@ async function autoFulfil(shopifyOrder) {
   const ship = shopifyOrder.shipping_address;
   if (!ship) return { skipped: true, reason: 'No shipping address' };
 
-  // Build CJ line items from mapped products
-  const cjProducts = [];
+  // Build line items grouped by supplier
+  const supplierItems = { cj: [], brandsgateway: [], printful: [] };
   const unmapped   = [];
   for (const item of shopifyOrder.line_items || []) {
     const mapped = dsProducts.get(String(item.variant_id)) || dsProducts.get(String(item.product_id));
     if (!mapped) { unmapped.push(item.name); continue; }
-    cjProducts.push({ vid: mapped.cjSku, quantity: item.quantity });
+    const supplier = mapped.supplier || 'cj';
+    if (!supplierItems[supplier]) supplierItems[supplier] = [];
+    supplierItems[supplier].push({ ...mapped, quantity: item.quantity, name: item.name });
   }
 
-  if (!cjProducts.length) {
+  const allItems = [...supplierItems.cj, ...supplierItems.brandsgateway, ...supplierItems.printful];
+  if (!allItems.length) {
     console.log(`Order #${shopifyOrder.order_number}: no mapped products (unmapped: ${unmapped.join(', ')})`);
     return { skipped: true, reason: `Products not in catalogue: ${unmapped.join(', ')}`, unmapped };
   }
 
-  const orderPayload = {
-    orderNumber:          String(shopifyOrder.order_number),
-    shippingZip:          ship.zip          || '',
-    shippingCountryCode:  ship.country_code  || '',
-    shippingCountry:      ship.country       || '',
-    shippingProvince:     ship.province      || '',
-    shippingCity:         ship.city          || '',
-    shippingAddress:      ship.address1      || '',
-    shippingAddress2:     ship.address2      || '',
-    shippingCustomerName: `${ship.first_name || ''} ${ship.last_name || ''}`.trim(),
-    shippingPhone:        ship.phone || shopifyOrder.phone || '',
-    remark:               `Shopify #${shopifyOrder.order_number} — auto via Aria`,
-    products:             cjProducts,
-  };
+  const customerName = `${ship.first_name || ''} ${ship.last_name || ''}`.trim();
+  const results = {};
+
+  // ── CJ fulfilment ──
+  if (supplierItems.cj.length) {
+    try {
+      const cjPayload = {
+        orderNumber: String(shopifyOrder.order_number),
+        shippingZip: ship.zip || '', shippingCountryCode: ship.country_code || '',
+        shippingCountry: ship.country || '', shippingProvince: ship.province || '',
+        shippingCity: ship.city || '', shippingAddress: ship.address1 || '',
+        shippingAddress2: ship.address2 || '',
+        shippingCustomerName: customerName,
+        shippingPhone: ship.phone || shopifyOrder.phone || '',
+        remark: `Shopify #${shopifyOrder.order_number} — auto via Aria`,
+        products: supplierItems.cj.map(i => ({ vid: i.cjSku, quantity: i.quantity })),
+      };
+      const r = await cjPlaceOrder(cjPayload);
+      if (!r.result) throw new Error(r.message || 'CJ order failed');
+      results.cj = { ok: true, orderId: r.data?.orderId };
+    } catch (e) { results.cj = { error: e.message }; }
+  }
+
+  // ── BrandsGateway fulfilment ──
+  if (supplierItems.brandsgateway.length) {
+    try {
+      const bgPayload = {
+        order_number: String(shopifyOrder.order_number),
+        shipping_address: {
+          first_name: ship.first_name || '', last_name: ship.last_name || '',
+          address1: ship.address1 || '', address2: ship.address2 || '',
+          city: ship.city || '', province: ship.province || '',
+          zip: ship.zip || '', country_code: ship.country_code || '',
+          phone: ship.phone || shopifyOrder.phone || '',
+        },
+        line_items: supplierItems.brandsgateway.map(i => ({
+          product_id: i.supplierProductId, variant_id: i.supplierVariantId, quantity: i.quantity,
+        })),
+      };
+      const r = await bgPlaceOrder(bgPayload);
+      if (r.error) throw new Error(r.error?.message || r.message || 'BrandsGateway order failed');
+      results.brandsgateway = { ok: true, orderId: r.data?.id || r.id };
+    } catch (e) { results.brandsgateway = { error: e.message }; }
+  }
+
+  // ── Printful fulfilment ──
+  if (supplierItems.printful.length) {
+    try {
+      const pfPayload = {
+        external_id: String(shopifyOrder.order_number),
+        recipient: {
+          name: customerName, address1: ship.address1 || '', address2: ship.address2 || '',
+          city: ship.city || '', state_code: ship.province_code || ship.province || '',
+          country_code: ship.country_code || '', zip: ship.zip || '',
+          phone: ship.phone || shopifyOrder.phone || '', email: shopifyOrder.email || '',
+        },
+        items: supplierItems.printful.map(i => ({
+          sync_variant_id: parseInt(i.supplierVariantId), quantity: i.quantity,
+        })),
+      };
+      const r = await pfPlaceOrder(pfPayload);
+      if (r.error) throw new Error(r.error?.message || 'Printful order failed');
+      results.printful = { ok: true, orderId: r.result?.id };
+    } catch (e) { results.printful = { error: e.message }; }
+  }
+
+  const anyOk = Object.values(results).some(r => r.ok);
+  const supplierOrderId = results.cj?.orderId || results.brandsgateway?.orderId || results.printful?.orderId;
+
+  const suppliers = Object.entries(results).filter(([,r]) => r.ok).map(([s]) => s);
+  const supplierLabel = suppliers.length ? suppliers.join(' + ').toUpperCase() : 'UNKNOWN';
 
   try {
-    const result = await cjPlaceOrder(orderPayload);
-    if (!result.result) throw new Error(result.message || 'CJ order failed');
-
-    const cjOrderId = result.data?.orderId;
     const record = {
       shopifyOrderId:     shopifyOrder.id,
       shopifyOrderNumber: shopifyOrder.order_number,
-      cjOrderId,
-      status:       'processing',
-      customer:     { name: orderPayload.shippingCustomerName, email: shopifyOrder.email },
-      items:        shopifyOrder.line_items?.map(i => i.name),
+      cjOrderId:          supplierOrderId,
+      suppliers:          results,
+      supplier:           suppliers[0] || 'cj',
+      status:             anyOk ? 'processing' : 'error',
+      customer:           { name: customerName, email: shopifyOrder.email },
+      items:              shopifyOrder.line_items?.map(i => i.name),
       unmapped,
-      createdAt:    new Date(),
-      tracking:     null,
-      trackNumber:  null,
+      createdAt:          new Date(),
+      tracking:           null,
+      trackNumber:        null,
     };
     dsOrders.push(record);
     save('dsOrders', dsOrders);
-    console.log(`✅ Auto-fulfilled Shopify #${shopifyOrder.order_number} → CJ ${cjOrderId}`);
+    console.log(`✅ Auto-fulfilled Shopify #${shopifyOrder.order_number} → ${supplierLabel} ${supplierOrderId || ''}`);
 
     // Notify store owner
     const adminUrl = `http://localhost:${process.env.PORT||3000}/admin?pass=${ADMIN}`;
@@ -4097,11 +4297,11 @@ async function autoFulfil(shopifyOrder) {
         to: alertTo, subject: `📦 Auto-fulfilled: Order #${shopifyOrder.order_number}`,
         html: wrap(`
           <h2 style="margin:0 0 16px;color:#1a1a2e">📦 Order Auto-Fulfilled</h2>
-          <p style="font-size:14px;color:#444;margin-bottom:16px">Shopify order <strong>#${shopifyOrder.order_number}</strong> was automatically placed with CJ Dropshipping.</p>
+          <p style="font-size:14px;color:#444;margin-bottom:16px">Shopify order <strong>#${shopifyOrder.order_number}</strong> was automatically placed with <strong>${supplierLabel}</strong>.</p>
           <table style="width:100%;border-collapse:collapse">
             <tr><td style="padding:6px 0;color:#999;width:120px">Customer</td><td style="font-weight:600">${record.customer.name}</td></tr>
             <tr><td style="padding:6px 0;color:#999">Email</td><td><a href="mailto:${record.customer.email}" style="color:#6C63FF">${record.customer.email}</a></td></tr>
-            <tr><td style="padding:6px 0;color:#999">CJ Order ID</td><td style="font-family:monospace">${cjOrderId}</td></tr>
+            <tr><td style="padding:6px 0;color:#999">Supplier(s)</td><td style="font-family:monospace">${supplierLabel}</td></tr>
             <tr><td style="padding:6px 0;color:#999">Items</td><td>${record.items?.join(', ')}</td></tr>
             ${unmapped.length ? `<tr><td style="padding:6px 0;color:#999">⚠️ Unmapped</td><td style="color:#e74c3c">${unmapped.join(', ')}</td></tr>` : ''}
           </table>
@@ -4230,41 +4430,70 @@ app.post('/api/shopify/webhook', async (req, res) => {
 
 // ─── Dropship admin: product catalogue ───────────────────────────────────────
 
-// Search CJ catalogue from admin
+// Search supplier catalogue from admin (supports cj, brandsgateway, printful)
 app.get('/admin/dropship/search', async (req, res) => {
   if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
-  const keyword = req.query.q;
+  const keyword = req.query.q, supplier = req.query.supplier || 'cj';
   if (!keyword) return res.status(400).json({ error:'Missing q' });
   try {
-    const r = await cjSearchProducts(keyword);
-    if (!r.result) return res.json({ products: [], message: r.message });
-    res.json({ products: (r.data?.list || []).map(p => ({
-      pid:       p.pid,
-      title:     p.productNameEn,
-      image:     p.productImage,
-      category:  p.categoryName,
-      sellPrice: p.sellPrice,
-      variants:  p.variants?.length || 0,
-    })) });
+    if (supplier === 'brandsgateway') {
+      const r = await bgSearchProducts(keyword);
+      const items = r.data || r.products || r || [];
+      res.json({ supplier: 'brandsgateway', products: (Array.isArray(items) ? items : []).slice(0, 20).map(p => ({
+        pid: String(p.id), title: p.name || p.title, image: p.images?.[0]?.src || p.image,
+        category: p.product_type || p.category || '', sellPrice: p.variants?.[0]?.price || p.price || '',
+        brand: p.vendor || p.brand || '', variants: p.variants?.length || 0,
+      })) });
+    } else if (supplier === 'printful') {
+      const items = await pfSearchProducts(keyword);
+      res.json({ supplier: 'printful', products: items.slice(0, 20).map(p => ({
+        pid: String(p.id), title: p.title, image: p.image,
+        category: p.type_name || '', sellPrice: '', brand: 'Printful',
+        variants: p.variant_count || 0,
+      })) });
+    } else {
+      const r = await cjSearchProducts(keyword);
+      if (!r.result) return res.json({ supplier: 'cj', products: [], message: r.message });
+      res.json({ supplier: 'cj', products: (r.data?.list || []).map(p => ({
+        pid: p.pid, title: p.productNameEn, image: p.productImage,
+        category: p.categoryName, sellPrice: p.sellPrice, brand: '',
+        variants: p.variants?.length || 0,
+      })) });
+    }
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get CJ product variants
+// Get product variants (any supplier)
 app.get('/admin/dropship/product/:pid', async (req, res) => {
   if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  const supplier = req.query.supplier || 'cj';
   try {
-    const r = await cjGetProduct(req.params.pid);
-    if (!r.result) return res.json({ error: r.message });
-    res.json({ product: r.data });
+    if (supplier === 'brandsgateway') {
+      const r = await bgGetProduct(req.params.pid);
+      res.json({ product: r.data || r });
+    } else if (supplier === 'printful') {
+      const r = await pfGetProduct(req.params.pid);
+      res.json({ product: r.result || r });
+    } else {
+      const r = await cjGetProduct(req.params.pid);
+      if (!r.result) return res.json({ error: r.message });
+      res.json({ product: r.data });
+    }
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Add/update a product mapping (Shopify variant → CJ variant)
+// Add/update a product mapping (Shopify variant → supplier variant)
 app.post('/admin/dropship/map', (req, res) => {
   if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
-  const { shopifyVariantId, cjSku, cjPid, title, costPrice, sellPrice, imageUrl } = req.body;
-  if (!shopifyVariantId || !cjSku) return res.status(400).json({ error:'Missing fields' });
-  dsProducts.set(String(shopifyVariantId), { cjSku, cjPid, title, costPrice, sellPrice, imageUrl, addedAt: new Date() });
+  const { shopifyVariantId, cjSku, cjPid, title, costPrice, sellPrice, imageUrl, supplier, supplierProductId, supplierVariantId } = req.body;
+  const sku = cjSku || supplierVariantId;
+  if (!shopifyVariantId || !sku) return res.status(400).json({ error:'Missing fields' });
+  dsProducts.set(String(shopifyVariantId), {
+    cjSku: sku, cjPid, title, costPrice, sellPrice, imageUrl,
+    supplier: supplier || 'cj', supplierProductId: supplierProductId || cjPid || '',
+    supplierVariantId: supplierVariantId || cjSku || sku,
+    addedAt: new Date(),
+  });
   save('dsProducts', Array.from(dsProducts.entries()));
   res.json({ ok: true, total: dsProducts.size });
 });
@@ -4315,6 +4544,8 @@ app.get('/admin/dropship/data', (req, res) => {
       pending:     dsOrders.filter(o => o.status === 'processing').length,
       products:    dsProducts.size,
       cjConnected: !!process.env.CJ_EMAIL && !!process.env.CJ_API_KEY,
+      bgConnected: !!process.env.BRANDSGATEWAY_API_KEY,
+      pfConnected: !!process.env.PRINTFUL_API_KEY,
     },
   });
 });
@@ -5362,28 +5593,34 @@ textarea{resize:vertical;min-height:60px;}
           <div id="ds-orders"></div>
         </div>
       </div>
-      <!-- Right: Product catalogue + CJ search -->
+      <!-- Right: Supplier search + catalogue -->
       <div style="display:flex;flex-direction:column;gap:14px">
         <div class="card">
-          <h3>🔍 Add Product from CJ Dropshipping</h3>
-          <p style="font-size:12.5px;color:#8888aa;margin-bottom:12px">Search the CJ catalogue. Find a product, copy the variant ID, and link it to your Shopify variant.</p>
+          <h3>🔍 Search Supplier Catalogues</h3>
+          <div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap">
+            <button class="btn" id="sup-cj" onclick="setSupplier('cj')" style="font-size:12px;padding:5px 14px">CJ Dropshipping</button>
+            <button class="btn ghost" id="sup-brandsgateway" onclick="setSupplier('brandsgateway')" style="font-size:12px;padding:5px 14px">BrandsGateway</button>
+            <button class="btn ghost" id="sup-printful" onclick="setSupplier('printful')" style="font-size:12px;padding:5px 14px">Printful</button>
+          </div>
+          <div id="sup-status" style="font-size:11.5px;margin-bottom:10px"></div>
           <div style="display:flex;gap:8px;margin-bottom:12px">
-            <input id="cj-search" placeholder="Search CJ: e.g. wireless earbuds" style="flex:1"/>
+            <input id="cj-search" placeholder="Search products..." style="flex:1"/>
             <button class="btn" onclick="cjSearch()">Search</button>
           </div>
           <div id="cj-results" style="max-height:300px;overflow-y:auto"></div>
         </div>
         <div class="card">
-          <h3>🔗 Map Product to CJ</h3>
-          <p style="font-size:12.5px;color:#8888aa;margin-bottom:12px">Link a Shopify product variant to a CJ variant SKU so orders are auto-fulfilled.</p>
+          <h3>🔗 Map Product to Supplier</h3>
+          <p style="font-size:12.5px;color:#8888aa;margin-bottom:12px">Link a Shopify product variant to a supplier variant so orders are auto-fulfilled.</p>
           <div style="display:grid;gap:8px;margin-bottom:12px">
             <div><label style="font-size:11.5px;color:#8888aa;display:block;margin-bottom:3px">Shopify Variant ID</label><input id="ds-shopify-id" placeholder="e.g. 12345678"/></div>
-            <div><label style="font-size:11.5px;color:#8888aa;display:block;margin-bottom:3px">CJ Variant SKU (vid)</label><input id="ds-cj-sku" placeholder="e.g. BAO-001-RED-XL"/></div>
+            <div><label style="font-size:11.5px;color:#8888aa;display:block;margin-bottom:3px">Supplier Variant ID / SKU</label><input id="ds-cj-sku" placeholder="e.g. BAO-001-RED-XL"/></div>
             <div><label style="font-size:11.5px;color:#8888aa;display:block;margin-bottom:3px">Product Name</label><input id="ds-title" placeholder="e.g. Wireless Earbuds Pro"/></div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
               <div><label style="font-size:11.5px;color:#8888aa;display:block;margin-bottom:3px">Your Cost (£)</label><input id="ds-cost" type="number" step="0.01" placeholder="5.99"/></div>
               <div><label style="font-size:11.5px;color:#8888aa;display:block;margin-bottom:3px">Sell Price (£)</label><input id="ds-sell" type="number" step="0.01" placeholder="19.99"/></div>
             </div>
+            <input type="hidden" id="ds-supplier" value="cj"/>
           </div>
           <button class="btn green" onclick="mapProduct()">Add to Catalogue ✓</button>
         </div>
@@ -5394,17 +5631,21 @@ textarea{resize:vertical;min-height:60px;}
         <div class="card">
           <h3>⚙️ Setup Guide</h3>
           <div style="font-size:13px;color:#8888aa;line-height:1.9">
-            <p><strong style="color:#6C63FF">Step 1</strong> — Add to <code>.env</code>:<br>
+            <p><strong style="color:#6C63FF">CJ Dropshipping</strong> — Budget products, fast UK/EU shipping<br>
               <code style="background:#13131f;padding:2px 8px;border-radius:4px;font-size:12px;color:#2ecc71">CJ_EMAIL=your@email.com</code><br>
               <code style="background:#13131f;padding:2px 8px;border-radius:4px;font-size:12px;color:#2ecc71">CJ_API_KEY=your-cj-api-key</code>
             </p>
-            <p><strong style="color:#6C63FF">Step 2</strong> — In Shopify: Settings → Notifications → Webhooks<br>
-              Add webhook: <strong>Order payment</strong> → <code style="background:#13131f;padding:2px 8px;border-radius:4px;font-size:12px;color:#2ecc71">https://your-server.com/api/shopify/webhook</code><br>
-              Copy the webhook secret → add to <code>.env</code>:<br>
+            <p><strong style="color:#e74c3c">BrandsGateway</strong> — Designer brands (Gucci, Versace, Prada, Calvin Klein)<br>
+              <code style="background:#13131f;padding:2px 8px;border-radius:4px;font-size:12px;color:#2ecc71">BRANDSGATEWAY_API_KEY=your-bg-api-key</code>
+            </p>
+            <p><strong style="color:#3498db">Printful</strong> — Print-on-demand (custom t-shirts, hoodies, mugs)<br>
+              <code style="background:#13131f;padding:2px 8px;border-radius:4px;font-size:12px;color:#2ecc71">PRINTFUL_API_KEY=your-printful-token</code>
+            </p>
+            <p style="border-top:1px solid #2a2a44;padding-top:12px;margin-top:8px"><strong style="color:#6C63FF">Shopify Webhook</strong> — Required for auto-fulfilment<br>
+              Settings → Notifications → Webhooks → <strong>Order payment</strong><br>
+              <code style="background:#13131f;padding:2px 8px;border-radius:4px;font-size:12px;color:#2ecc71">https://your-server.com/api/shopify/webhook</code><br>
               <code style="background:#13131f;padding:2px 8px;border-radius:4px;font-size:12px;color:#2ecc71">SHOPIFY_WEBHOOK_SECRET=whsec_xxx</code>
             </p>
-            <p><strong style="color:#6C63FF">Step 3</strong> — Map your products above using CJ search</p>
-            <p><strong style="color:#6C63FF">Step 4</strong> — Test: place a test order in Shopify → it auto-appears here</p>
           </div>
         </div>
       </div>
@@ -5805,58 +6046,87 @@ async function closeHandoff(id){await fetch('/api/handoff/'+id+'/close?pass='+PA
 
 // ─── Dropship admin JS ────────────────────────────────────────────────────────
 let _dsData = null;
+let _activeSupplier = 'cj';
+const supColors = { cj:'#6C63FF', brandsgateway:'#e74c3c', printful:'#3498db' };
+const supNames = { cj:'CJ Dropshipping', brandsgateway:'BrandsGateway', printful:'Printful' };
+
+function setSupplier(s) {
+  _activeSupplier = s;
+  el('ds-supplier').value = s;
+  ['cj','brandsgateway','printful'].forEach(k => {
+    const b = el('sup-'+k);
+    if (k===s) { b.className='btn'; b.style.background=supColors[k]; }
+    else { b.className='btn ghost'; b.style.background=''; }
+  });
+  el('cj-search').placeholder = 'Search ' + supNames[s] + '...';
+  el('cj-results').innerHTML = '';
+  updateSupStatus();
+}
+
+function updateSupStatus() {
+  if (!_dsData) return;
+  const s = _dsData.stats;
+  const status = [];
+  status.push(s.cjConnected ? '<span style="color:#2ecc71">● CJ</span>' : '<span style="color:#e74c3c">○ CJ</span>');
+  status.push(s.bgConnected ? '<span style="color:#2ecc71">● BrandsGateway</span>' : '<span style="color:#e74c3c">○ BrandsGateway</span>');
+  status.push(s.pfConnected ? '<span style="color:#2ecc71">● Printful</span>' : '<span style="color:#e74c3c">○ Printful</span>');
+  el('sup-status').innerHTML = status.join(' &nbsp; ');
+}
+
 async function loadDropship() {
   const r = await fetch('/admin/dropship/data?pass='+PASS);
   _dsData = await r.json();
   renderDropship(_dsData);
+  updateSupStatus();
 }
 
 function renderDropship({ stats, orders, catalogue }) {
-  // Stats
-  const cjStatus = stats.cjConnected
-    ? '<span style="color:#2ecc71">● Connected</span>'
-    : '<span style="color:#e74c3c">● Not connected</span>';
   el('ds-stats').innerHTML = [
     stat(stats.total,'Total Orders'), stat(stats.today,'Today'),
     stat(stats.pending,'Processing'), stat(stats.shipped,'Shipped'),
-    stat(stats.products,'Products'), \`<div class="stat"><div class="n" style="font-size:14px;padding-top:6px">\${cjStatus}</div><div class="l">CJ Status</div></div>\`,
+    stat(stats.products,'Products'), stat((stats.cjConnected?1:0)+(stats.bgConnected?1:0)+(stats.pfConnected?1:0)+'/3','Suppliers'),
   ].join('');
 
   // Orders
   const statusColor = { processing:'#f39c12', shipped:'#2ecc71', error:'#e74c3c' };
   el('ds-orders').innerHTML = orders.length
-    ? orders.slice(0,50).map(o=>\`<div style="padding:10px 0;border-bottom:1px solid #1e1e30">
+    ? orders.slice(0,50).map(o=>{
+        const sup = o.supplier || 'cj';
+        return \`<div style="padding:10px 0;border-bottom:1px solid #1e1e30">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
-          <span style="font-weight:700;color:#fff">Shopify #\${o.shopifyOrderNumber}</span>
+          <span style="font-weight:700;color:#fff">Shopify #\${o.shopifyOrderNumber} <span style="font-size:10px;padding:2px 6px;border-radius:4px;background:\${supColors[sup]||'#666'}20;color:\${supColors[sup]||'#888'};font-weight:600;margin-left:6px">\${supNames[sup]||sup}</span></span>
           <span style="font-size:11.5px;font-weight:700;color:\${statusColor[o.status]||'#888'}">\${o.status}</span>
         </div>
         <div style="font-size:12px;color:#8888aa">\${o.customer?.name||''} · \${o.items?.join(', ').slice(0,60)||''}</div>
-        \${o.cjOrderId?\`<div style="font-size:11.5px;color:#6C63FF;margin-top:3px">CJ: \${o.cjOrderId}</div>\`:''}
+        \${o.cjOrderId?\`<div style="font-size:11.5px;color:#6C63FF;margin-top:3px">Order: \${o.cjOrderId}</div>\`:''}
         \${o.tracking?\`<div style="margin-top:6px"><a href="\${o.tracking.url}" target="_blank" style="font-size:12px;color:#2ecc71;font-weight:600">📮 Track: \${o.tracking.number}</a> (\${o.tracking.carrier})</div>\`:''}
         \${o.unmapped?.length?\`<div style="font-size:11.5px;color:#e74c3c;margin-top:3px">⚠️ Unmapped: \${o.unmapped.join(', ')}</div>\`:''}
         <div style="font-size:11px;color:#666;margin-top:3px">\${new Date(o.createdAt).toLocaleString()}</div>
-      </div>\`).join('')
+      </div>\`;}).join('')
     : '<div style="color:#8888aa;font-size:13px;padding:12px 0">No orders yet. Connect Shopify webhook to start.</div>';
 
-  // Catalogue
+  // Catalogue — grouped by supplier
   el('ds-cat-count').textContent = catalogue.length;
   el('ds-catalogue').innerHTML = catalogue.length
-    ? catalogue.map(p=>\`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #1e1e30;font-size:12.5px">
+    ? catalogue.map(p=>{
+        const sup = p.supplier || 'cj';
+        return \`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #1e1e30;font-size:12.5px">
         <div>
-          <div style="color:#fff;font-weight:600">\${esc(p.title||p.shopifyId)}</div>
-          <div style="color:#8888aa;font-size:11.5px">Shopify: \${p.shopifyId} → CJ: \${p.cjSku}</div>
+          <div style="color:#fff;font-weight:600">\${esc(p.title||p.shopifyId)} <span style="font-size:10px;padding:1px 5px;border-radius:3px;background:\${supColors[sup]||'#666'}20;color:\${supColors[sup]||'#888'}">\${supNames[sup]||sup}</span></div>
+          <div style="color:#8888aa;font-size:11.5px">Shopify: \${p.shopifyId} → \${p.cjSku}</div>
           \${p.costPrice?\`<div style="color:#2ecc71;font-size:11.5px">Cost £\${p.costPrice} → Sell £\${p.sellPrice||'?'}</div>\`:''}
         </div>
         <button class="del-btn" onclick="dsUnmap('\${p.shopifyId}')">Remove</button>
-      </div>\`).join('')
-    : '<div style="color:#8888aa;font-size:13px;padding:8px 0">No products mapped yet. Search CJ above and add them.</div>';
+      </div>\`;}).join('')
+    : '<div style="color:#8888aa;font-size:13px;padding:8px 0">No products mapped yet. Search a supplier above and add them.</div>';
 }
 
 async function cjSearch() {
   const q = el('cj-search').value.trim();
   if (!q) return;
-  el('cj-results').innerHTML = '<div style="color:#8888aa;font-size:13px;padding:8px 0">Searching CJ... ✦</div>';
-  const r = await fetch('/admin/dropship/search?pass='+PASS+'&q='+encodeURIComponent(q));
+  const sup = _activeSupplier;
+  el('cj-results').innerHTML = \`<div style="color:#8888aa;font-size:13px;padding:8px 0">Searching \${supNames[sup]}... ✦</div>\`;
+  const r = await fetch('/admin/dropship/search?pass='+PASS+'&q='+encodeURIComponent(q)+'&supplier='+sup);
   const { products, message } = await r.json();
   if (!products?.length) {
     el('cj-results').innerHTML = \`<div style="color:#8888aa;font-size:13px;padding:8px 0">\${message||'No results found'}</div>\`;
@@ -5866,31 +6136,36 @@ async function cjSearch() {
     <div style="display:flex;gap:10px;padding:10px 0;border-bottom:1px solid #1e1e30;align-items:center">
       \${p.image?\`<img src="\${p.image}" style="width:48px;height:48px;border-radius:6px;object-fit:cover;flex-shrink:0">\`:'<div style="width:48px;height:48px;border-radius:6px;background:#2a2a44;flex-shrink:0"></div>'}
       <div style="flex:1;min-width:0">
-        <div style="font-size:13px;color:#fff;margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">\${esc(p.title)}</div>
-        <div style="font-size:11.5px;color:#8888aa">\${esc(p.category||'')} · \${p.variants} variant(s) · Cost: $\${p.sellPrice||'?'}</div>
-        <div style="font-size:11.5px;color:#6C63FF;font-family:monospace;margin-top:2px">PID: \${p.pid}</div>
+        <div style="font-size:13px;color:#fff;margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">\${esc(p.title)}\${p.brand?\` <span style="color:\${supColors[sup]||'#888'};font-size:10px">\${esc(p.brand)}</span>\`:''}</div>
+        <div style="font-size:11.5px;color:#8888aa">\${esc(p.category||'')} · \${p.variants} variant(s)\${p.sellPrice?' · £'+p.sellPrice:''}</div>
+        <div style="font-size:11.5px;color:\${supColors[sup]||'#6C63FF'};font-family:monospace;margin-top:2px">ID: \${p.pid}</div>
       </div>
-      <button class="btn ghost" style="font-size:11.5px;padding:4px 10px;flex-shrink:0" onclick="prefillCJ('\${p.pid}',\${JSON.stringify(p.title).replace(/'/g,\\"\\\\\\"\\")},''\${p.sellPrice}')">Use this</button>
+      <button class="btn ghost" style="font-size:11.5px;padding:4px 10px;flex-shrink:0" onclick="prefillCJ('\${p.pid}','\${esc(p.title).replace(/'/g,"&#39;")}','\${p.sellPrice||""}')">Use this</button>
     </div>\`).join('');
 }
 
 function prefillCJ(pid, title, price) {
-  el('ds-cj-sku').value = pid; // will need variant SKU from detail view, but pid is a start
+  el('ds-cj-sku').value = pid;
   el('ds-title').value  = title;
   el('ds-cost').value   = price || '';
+  el('ds-supplier').value = _activeSupplier;
   el('ds-cj-sku').focus();
   el('ds-cj-sku').select();
 }
 
 async function mapProduct() {
+  const sup = el('ds-supplier').value || _activeSupplier;
   const data = {
-    shopifyVariantId: el('ds-shopify-id').value.trim(),
-    cjSku:            el('ds-cj-sku').value.trim(),
-    title:            el('ds-title').value.trim(),
-    costPrice:        el('ds-cost').value,
-    sellPrice:        el('ds-sell').value,
+    shopifyVariantId:  el('ds-shopify-id').value.trim(),
+    cjSku:             el('ds-cj-sku').value.trim(),
+    title:             el('ds-title').value.trim(),
+    costPrice:         el('ds-cost').value,
+    sellPrice:         el('ds-sell').value,
+    supplier:          sup,
+    supplierProductId: el('ds-cj-sku').value.trim(),
+    supplierVariantId: el('ds-cj-sku').value.trim(),
   };
-  if (!data.shopifyVariantId || !data.cjSku) { alert('Shopify Variant ID and CJ SKU are required.'); return; }
+  if (!data.shopifyVariantId || !data.cjSku) { alert('Shopify Variant ID and Supplier SKU are required.'); return; }
   const r = await fetch('/admin/dropship/map?pass='+PASS, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) });
   const d = await r.json();
   if (d.ok) {
@@ -5933,7 +6208,7 @@ async function loadDomains() {
   list.innerHTML = data.domains.map(d =>
     '<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:#13131f;border:1px solid #2a2a44;border-radius:10px;margin-bottom:8px;">'
     + '<div style="display:flex;align-items:center;gap:8px;"><span style="color:#2ecc71;font-size:10px;">●</span><span>' + d + '</span></div>'
-    + '<button class="btn red" style="font-size:11px;padding:4px 10px;" onclick="removeDomain(\'' + d + '\')">Remove</button>'
+    + '<button class="btn red" style="font-size:11px;padding:4px 10px;" onclick="removeDomain(\\'' + d + '\\')">Remove</button>'
     + '</div>'
   ).join('');
 }
