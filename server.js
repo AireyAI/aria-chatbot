@@ -7649,8 +7649,8 @@ async function loadChannels() {
             '<div style="font-size:11px;color:#6b6b8a;margin-top:2px;">' + st.replied + ' replies</div></div>' +
           '</div>' +
           '<div style="display:flex;align-items:center;gap:8px;">' +
-            '<label class="toggle" style="width:44px;height:24px;"><input type="checkbox" ' + (ch.enabled ? 'checked' : '') + ' onchange="toggleChannel(\'' + def.key + '\',this.checked)"><span class="slider"></span></label>' +
-            '<button onclick="disconnectChannel(\'' + def.key + '\')" style="background:rgba(255,80,80,0.1);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit;">Disconnect</button>' +
+            '<label class="toggle" style="width:44px;height:24px;"><input type="checkbox" ' + (ch.enabled ? 'checked' : '') + ' onchange="toggleChannel(\\'' + def.key + '\\',this.checked)"><span class="slider"></span></label>' +
+            '<button onclick="disconnectChannel(\\'' + def.key + '\\')" style="background:rgba(255,80,80,0.1);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit;">Disconnect</button>' +
           '</div>' +
         '</div>';
       } else {
