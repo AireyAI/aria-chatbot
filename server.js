@@ -7043,6 +7043,66 @@ app.post('/api/dashboard/channels', (req, res) => {
   res.json({ ok: true });
 });
 
+// GET /api/dashboard/messages — paginated channel message feed
+app.get('/api/dashboard/messages', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const channel = req.query.channel || 'all';
+  const page = parseInt(req.query.page) || 1;
+  const perPage = 10;
+
+  let msgs = channelMessages.get(owner) || [];
+  if (channel !== 'all') msgs = msgs.filter(m => m.channel === channel);
+  msgs = msgs.slice().reverse(); // newest first
+
+  const totalPages = Math.ceil(msgs.length / perPage);
+  const items = msgs.slice((page - 1) * perPage, page * perPage);
+  res.json({ items, page, totalPages, total: msgs.length });
+});
+
+// GET /api/dashboard/channel-stats
+app.get('/api/dashboard/channel-stats', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const stats = channelStats.get(owner) || {
+    whatsapp: { replied: 0, week: 0, lastReply: null },
+    instagram: { replied: 0, week: 0, lastReply: null },
+    facebook: { replied: 0, week: 0, lastReply: null },
+    total: 0,
+  };
+  const channels = channelConfigs.get(owner) || {};
+  res.json({ stats, channels });
+});
+
+// POST /api/dashboard/channel-toggle — enable/disable a channel
+app.post('/api/dashboard/channel-toggle', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { channel, enabled } = req.body;
+  if (!channel || typeof enabled !== 'boolean') return res.status(400).json({ error: 'channel and enabled required' });
+
+  const existing = channelConfigs.get(owner) || {};
+  if (!existing[channel]) return res.status(400).json({ error: 'Channel not connected' });
+  existing[channel].enabled = enabled;
+  channelConfigs.set(owner, existing);
+  persistChannels();
+  res.json({ ok: true });
+});
+
+// POST /api/dashboard/channel-disconnect — remove a channel
+app.post('/api/dashboard/channel-disconnect', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { channel } = req.body;
+  if (!channel) return res.status(400).json({ error: 'channel required' });
+
+  const existing = channelConfigs.get(owner) || {};
+  delete existing[channel];
+  channelConfigs.set(owner, existing);
+  persistChannels();
+  res.json({ ok: true });
+});
+
 // GET /dashboard — Client Dashboard Page
 app.get('/dashboard', (req, res) => {
   const ownerEmail = req.query.owner || '';
@@ -7257,62 +7317,40 @@ tr:last-child td{border-bottom:none;}
 
   <div class="section" id="sec-channels">
     <div class="section-header" onclick="toggleSection('channels')">
-      <h3>&#x1F4E1; Channels</h3>
+      <h3>&#x1F4F1; Channels</h3>
       <span class="arrow">&#x25B6;</span>
     </div>
     <div class="section-body" id="body-channels">
       <div style="padding:16px 20px;">
-        <p style="font-size:13px;color:#9898b8;margin-bottom:16px;">Connect additional channels so Aria can manage them all from one place.</p>
+        <p style="font-size:13px;color:#9898b8;margin-bottom:16px;">Connect your social accounts so Aria can auto-reply to messages.</p>
 
-        <div style="display:flex;flex-direction:column;gap:12px;">
-          <!-- Google (already connected) -->
-          <div style="background:rgba(0,229,160,0.05);border:1px solid rgba(0,229,160,0.2);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;">
-            <div style="display:flex;align-items:center;gap:12px;">
-              <span style="font-size:24px;">&#x1F4E7;</span>
-              <div><div style="font-weight:600;font-size:14px;">Gmail & Calendar</div><div style="font-size:12px;color:#00e5a0;">Connected &#x2713;</div></div>
-            </div>
-          </div>
+        <a href="/auth/meta/start?owner=\${encodeURIComponent(OWNER)}&s=\${encodeURIComponent(TOKEN)}" id="meta-connect-btn" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:13px;background:#1877F2;color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;margin-bottom:20px;">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg>
+          Connect with Facebook
+        </a>
 
-          <!-- WhatsApp -->
-          <div id="wa-channel" style="background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;">
-            <div style="display:flex;align-items:center;gap:12px;">
-              <span style="font-size:24px;">&#x1F4AC;</span>
-              <div><div style="font-weight:600;font-size:14px;">WhatsApp Business</div><div style="font-size:12px;color:#9898b8;" id="wa-status">Not connected</div></div>
-            </div>
-            <button onclick="connectChannel('whatsapp')" id="wa-btn" style="background:rgba(37,211,102,0.15);color:#25D366;border:1px solid rgba(37,211,102,0.3);border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;">Connect</button>
-          </div>
-
-          <!-- Instagram -->
-          <div id="ig-channel" style="background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;">
-            <div style="display:flex;align-items:center;gap:12px;">
-              <span style="font-size:24px;">&#x1F4F7;</span>
-              <div><div style="font-weight:600;font-size:14px;">Instagram DMs</div><div style="font-size:12px;color:#9898b8;" id="ig-status">Not connected</div></div>
-            </div>
-            <button onclick="connectChannel('instagram')" id="ig-btn" style="background:rgba(225,48,108,0.15);color:#E1306C;border:1px solid rgba(225,48,108,0.3);border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;">Connect</button>
-          </div>
-
-          <!-- SMS -->
-          <div id="sms-channel" style="background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;">
-            <div style="display:flex;align-items:center;gap:12px;">
-              <span style="font-size:24px;">&#x1F4F1;</span>
-              <div><div style="font-weight:600;font-size:14px;">SMS</div><div style="font-size:12px;color:#9898b8;" id="sms-status">Not connected</div></div>
-            </div>
-            <button onclick="connectChannel('sms')" id="sms-btn" style="background:rgba(108,99,255,0.15);color:#6C63FF;border:1px solid rgba(108,99,255,0.3);border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;">Connect</button>
-          </div>
-
-          <!-- Facebook Messenger -->
-          <div id="fb-channel" style="background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;">
-            <div style="display:flex;align-items:center;gap:12px;">
-              <span style="font-size:24px;">&#x1F4AC;</span>
-              <div><div style="font-weight:600;font-size:14px;">Facebook Messenger</div><div style="font-size:12px;color:#9898b8;" id="fb-status">Not connected</div></div>
-            </div>
-            <button onclick="connectChannel('facebook')" id="fb-btn" style="background:rgba(24,119,242,0.15);color:#1877F2;border:1px solid rgba(24,119,242,0.3);border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;">Connect</button>
-          </div>
-        </div>
+        <div id="channel-cards" style="display:flex;flex-direction:column;gap:12px;"></div>
       </div>
     </div>
   </div>
 </div>
+
+  <!-- Channel Messages -->
+  <div class="section" id="sec-messages">
+    <div class="section-header" onclick="toggleSection('messages')">
+      <h3>&#x1F4AC; Messages</h3>
+      <span class="arrow">&#x25B6;</span>
+    </div>
+    <div class="section-body" id="body-messages">
+      <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <button onclick="loadMessages(1,'all')" class="msg-filter active" style="background:rgba(0,229,160,0.15);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">All</button>
+        <button onclick="loadMessages(1,'whatsapp')" class="msg-filter" style="background:rgba(255,255,255,0.06);color:#ccc;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">WhatsApp</button>
+        <button onclick="loadMessages(1,'instagram')" class="msg-filter" style="background:rgba(255,255,255,0.06);color:#ccc;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">Instagram</button>
+        <button onclick="loadMessages(1,'facebook')" class="msg-filter" style="background:rgba(255,255,255,0.06);color:#ccc;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">Messenger</button>
+      </div>
+      <div id="messages-list"><div class="empty">Loading...</div></div>
+    </div>
+  </div>
 
 <div class="toast" id="toast"></div>
 
@@ -7357,12 +7395,22 @@ function escH(s) { if (!s) return ''; const d = document.createElement('div'); d
 // Load stats immediately
 async function loadStats() {
   try {
-    const d = await api('/api/dashboard/stats');
+    const [d, ch] = await Promise.all([
+      api('/api/dashboard/stats'),
+      api('/api/dashboard/channel-stats'),
+    ]);
+    const chTotal = ch.stats?.total || 0;
+    const connected = ['whatsapp','instagram','facebook'].filter(c => ch.channels?.[c]?.accessToken).length;
     document.getElementById('stats-row').innerHTML = \`
       <div class="stat-card">
         <div class="value">\${d.emailsReplied.total}</div>
         <div class="label">Emails Replied</div>
         <div class="sub">\${d.emailsReplied.week} this week</div>
+      </div>
+      <div class="stat-card">
+        <div class="value">\${chTotal}</div>
+        <div class="label">Messages Replied</div>
+        <div class="sub">across \${connected} channel\${connected !== 1 ? 's' : ''}</div>
       </div>
       <div class="stat-card">
         <div class="value">\${d.leads.total}</div>
@@ -7434,6 +7482,7 @@ async function loadSection(name) {
   else if (name === 'bookings') await loadBookings();
   else if (name === 'profile') await loadProfile();
   else if (name === 'settings') await loadSettings();
+  else if (name === 'messages') await loadMessages(1, 'all');
 }
 
 let inboxPage = 1;
@@ -7569,51 +7618,124 @@ async function saveSetting(key, value) {
   } catch (e) { toast('Error updating setting'); }
 }
 
-// Channel connection
-async function connectChannel(channel) {
-  const labels = { whatsapp: 'WhatsApp Business', instagram: 'Instagram', sms: 'SMS', facebook: 'Facebook Messenger' };
-  const fields = {
-    whatsapp: { label: 'WhatsApp Business phone number', placeholder: '+447000000000', key: 'phone' },
-    instagram: { label: 'Instagram username', placeholder: '@yourbusiness', key: 'username' },
-    sms: { label: 'Business phone number for SMS', placeholder: '+447000000000', key: 'phone' },
-    facebook: { label: 'Facebook Page ID', placeholder: '123456789', key: 'pageId' },
-  };
-  const field = fields[channel];
-  const value = prompt(field.label + ':');
-  if (!value) return;
-
-  try {
-    const r = await apiPost('/api/dashboard/channels', { owner: OWNER, channel, value: value.trim() });
-    if (r.ok) {
-      document.getElementById(channel.slice(0,2) + '-status').textContent = 'Connected: ' + value.trim();
-      document.getElementById(channel.slice(0,2) + '-btn').textContent = 'Update';
-      document.getElementById(channel.slice(0,2) + '-btn').style.opacity = '0.6';
-      toast(labels[channel] + ' connected!');
-    } else {
-      toast('Failed to connect');
-    }
-  } catch (e) { toast('Error connecting channel'); }
-}
-
-// Load channel statuses
 async function loadChannels() {
   try {
-    const d = await api('/api/dashboard/channels?owner=' + encodeURIComponent(OWNER));
-    if (d.channels) {
-      for (const [ch, val] of Object.entries(d.channels)) {
-        const prefix = ch.slice(0,2);
-        const statusEl = document.getElementById(prefix + '-status');
-        const btnEl = document.getElementById(prefix + '-btn');
-        if (statusEl && val) {
-          statusEl.textContent = 'Connected: ' + val;
-          statusEl.style.color = '#00e5a0';
-          if (btnEl) { btnEl.textContent = 'Update'; btnEl.style.opacity = '0.6'; }
-        }
+    const d = await api('/api/dashboard/channel-stats');
+    const channels = d.channels || {};
+    const stats = d.stats || {};
+    const container = document.getElementById('channel-cards');
+    if (!container) return;
+
+    const channelDefs = [
+      { key: 'whatsapp', name: 'WhatsApp Business', icon: '\u{1F4AC}', color: '#25D366', detail: c => c.displayPhone || 'Connected' },
+      { key: 'instagram', name: 'Instagram DMs', icon: '\u{1F4F7}', color: '#E1306C', detail: c => c.igUsername || 'Connected' },
+      { key: 'facebook', name: 'Facebook Messenger', icon: '\u{1F4AC}', color: '#1877F2', detail: c => c.pageName || 'Connected' },
+    ];
+
+    let html = '';
+    let anyConnected = false;
+    for (const def of channelDefs) {
+      const ch = channels[def.key];
+      const st = stats[def.key] || { replied: 0 };
+      if (ch && ch.accessToken) {
+        anyConnected = true;
+        const statusColor = ch.enabled ? '#00e5a0' : '#ff6b6b';
+        const statusText = ch.enabled ? 'Active' : 'Paused';
+        html += '<div style="background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;">' +
+          '<div style="display:flex;align-items:center;gap:12px;">' +
+            '<span style="font-size:24px;">' + def.icon + '</span>' +
+            '<div><div style="font-weight:600;font-size:14px;">' + def.name + '</div>' +
+            '<div style="font-size:12px;color:' + statusColor + ';">' + statusText + ' \u00B7 ' + escH(def.detail(ch)) + '</div>' +
+            '<div style="font-size:11px;color:#6b6b8a;margin-top:2px;">' + st.replied + ' replies</div></div>' +
+          '</div>' +
+          '<div style="display:flex;align-items:center;gap:8px;">' +
+            '<label class="toggle" style="width:44px;height:24px;"><input type="checkbox" ' + (ch.enabled ? 'checked' : '') + ' onchange="toggleChannel(\'' + def.key + '\',this.checked)"><span class="slider"></span></label>' +
+            '<button onclick="disconnectChannel(\'' + def.key + '\')" style="background:rgba(255,80,80,0.1);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit;">Disconnect</button>' +
+          '</div>' +
+        '</div>';
+      } else {
+        html += '<div style="background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;opacity:0.5;">' +
+          '<div style="display:flex;align-items:center;gap:12px;">' +
+            '<span style="font-size:24px;">' + def.icon + '</span>' +
+            '<div><div style="font-weight:600;font-size:14px;">' + def.name + '</div>' +
+            '<div style="font-size:12px;color:#6b6b8a;">Not connected</div></div>' +
+          '</div>' +
+        '</div>';
       }
     }
-  } catch {}
+    container.innerHTML = html;
+
+    if (anyConnected) {
+      const btn = document.getElementById('meta-connect-btn');
+      if (btn) { btn.textContent = 'Reconnect / Add Channels'; btn.style.background = 'rgba(24,119,242,0.15)'; btn.style.color = '#1877F2'; btn.style.border = '1px solid rgba(24,119,242,0.3)'; }
+    }
+  } catch (e) { console.warn('Failed to load channels:', e); }
 }
+
+async function toggleChannel(channel, enabled) {
+  try {
+    const r = await apiPost('/api/dashboard/channel-toggle', { owner: OWNER, channel, enabled });
+    if (r.ok) toast(channel + (enabled ? ' enabled' : ' paused'));
+    loadChannels();
+  } catch (e) { toast('Error updating channel'); }
+}
+
+async function disconnectChannel(channel) {
+  if (!confirm('Disconnect ' + channel + '? Aria will stop replying on this channel.')) return;
+  try {
+    const r = await apiPost('/api/dashboard/channel-disconnect', { owner: OWNER, channel });
+    if (r.ok) toast(channel + ' disconnected');
+    loadChannels();
+  } catch (e) { toast('Error disconnecting'); }
+}
+
 loadChannels();
+
+let msgChannel = 'all';
+async function loadMessages(page, channel) {
+  if (channel) msgChannel = channel;
+  document.querySelectorAll('.msg-filter').forEach((btn, i) => {
+    const channels = ['all','whatsapp','instagram','facebook'];
+    if (channels[i] === msgChannel) {
+      btn.style.background = 'rgba(0,229,160,0.15)';
+      btn.style.color = '#00e5a0';
+      btn.style.borderColor = 'rgba(0,229,160,0.3)';
+    } else {
+      btn.style.background = 'rgba(255,255,255,0.06)';
+      btn.style.color = '#ccc';
+      btn.style.borderColor = 'rgba(255,255,255,0.1)';
+    }
+  });
+
+  const container = document.getElementById('messages-list');
+  try {
+    const d = await api('/api/dashboard/messages?channel=' + msgChannel + '&page=' + page);
+    if (!d.items || !d.items.length) {
+      container.innerHTML = '<div class="empty">No messages yet.</div>';
+      return;
+    }
+    const icons = { whatsapp: '\u{1F4AC}', instagram: '\u{1F4F7}', facebook: '\u{1F4AC}' };
+    let html = '<table><thead><tr><th></th><th>From</th><th>Message</th><th>Reply</th><th>When</th></tr></thead><tbody>';
+    for (const m of d.items) {
+      html += '<tr>' +
+        '<td>' + (icons[m.channel] || '') + '</td>' +
+        '<td>' + escH(m.senderName || m.senderId) + '</td>' +
+        '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH((m.message || '').substring(0, 80)) + '</td>' +
+        '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH((m.reply || '').substring(0, 80)) + '</td>' +
+        '<td>' + timeAgo(m.timestamp) + '</td>' +
+      '</tr>';
+    }
+    html += '</tbody></table>';
+    if (d.totalPages > 1) {
+      html += '<div class="pagination">';
+      for (let i = 1; i <= d.totalPages; i++) {
+        html += '<button class="' + (i === page ? 'active' : '') + '" onclick="loadMessages(' + i + ')">' + i + '</button>';
+      }
+      html += '</div>';
+    }
+    container.innerHTML = html;
+  } catch (e) { container.innerHTML = '<div class="empty">Failed to load messages.</div>'; }
+}
 </script>
 </body></html>`);
 });
