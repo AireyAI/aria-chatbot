@@ -1885,13 +1885,49 @@ Conversation:\n${convo}`);
 }
 
 // ─── Email templates ──────────────────────────────────────────────────────────
-const wrap = (body, adminUrl, brandColor = '#6C63FF', brandName = 'Aria Chatbot') => `<!DOCTYPE html><html><body style="font-family:-apple-system,sans-serif;background:#f0f0f8;padding:30px;margin:0">
-<div style="max-width:580px;margin:0 auto;background:white;border-radius:16px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.1)">
-<div style="background:${brandColor};padding:22px 28px"><h1 style="color:white;margin:0;font-size:19px">✦ ${brandName}</h1></div>
-<div style="padding:28px">${body}</div>
-<div style="padding:14px 28px;background:#f8f8fc;font-size:12px;color:#999;border-top:1px solid #eee">
-  ${brandName} · ${adminUrl ? `<a href="${adminUrl}" style="color:${brandColor}">Open Admin</a>` : ''}
-</div></div></body></html>`;
+// Branded email wrapper — accepts optional per-client brand config from the booking
+// payload (brandColor, brandName, brandLogoUrl, brandTagline, siteUrl). When those
+// fields are missing it falls back to the original Aria chrome.
+const wrap = (body, adminUrl, brand = {}) => {
+  const brandColor   = brand.brandColor   || '#6C63FF';
+  const brandName    = brand.brandName    || 'Aria Chatbot';
+  const brandLogoUrl = brand.brandLogoUrl || '';
+  const brandTagline = brand.brandTagline || '';
+  const siteUrl      = brand.siteUrl      || '';
+  const footer       = brand.footer       || '';
+
+  const headerInner = brandLogoUrl
+    ? `<table cellpadding="0" cellspacing="0" style="border-collapse:collapse"><tr>
+         <td style="padding-right:14px"><img src="${brandLogoUrl}" alt="${brandName}" width="44" height="44" style="display:block;border-radius:50%;border:1px solid rgba(255,255,255,0.2)" /></td>
+         <td style="vertical-align:middle">
+           <div style="color:#fff;font-size:17px;font-weight:700;letter-spacing:0.02em;line-height:1.1">${brandName}</div>
+           ${brandTagline ? `<div style="color:rgba(255,255,255,0.75);font-size:10px;font-weight:600;letter-spacing:0.25em;text-transform:uppercase;margin-top:4px">${brandTagline}</div>` : ''}
+         </td>
+       </tr></table>`
+    : `<h1 style="color:#fff;margin:0;font-size:18px;font-weight:700;letter-spacing:0.01em">✦ ${brandName}</h1>`;
+
+  return `<!DOCTYPE html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f4f4f7;padding:32px 16px;margin:0;color:#1a1a1a">
+<div style="max-width:600px;margin:0 auto;background:#fff;border-radius:18px;overflow:hidden;box-shadow:0 8px 30px rgba(0,0,0,0.08)">
+  <div style="background:${brandColor};padding:24px 28px">${headerInner}</div>
+  <div style="padding:32px 28px">${body}</div>
+  <div style="padding:18px 28px;background:#fafafc;font-size:11.5px;color:#8a8a96;border-top:1px solid #eef0f4;line-height:1.5">
+    ${footer || `${brandName}${siteUrl ? ` · <a href="${siteUrl}" style="color:${brandColor};text-decoration:none">${siteUrl.replace(/^https?:\/\//,'')}</a>` : ''}`}
+    ${adminUrl ? ` · <a href="${adminUrl}" style="color:${brandColor};text-decoration:none">Admin</a>` : ''}
+  </div>
+</div></body></html>`;
+};
+
+// Helper: extract brand config from a booking / event payload
+function brandFromPayload(p) {
+  return {
+    brandColor:   p.brandColor,
+    brandName:    p.siteName,
+    brandLogoUrl: p.brandLogoUrl,
+    brandTagline: p.brandTagline,
+    siteUrl:      p.siteUrl,
+    footer:       p.emailFooter
+  };
+}
 
 const leadTpl = ({ email, name, page, convo, score, tag, adminUrl, qualification }) => wrap(`
   <h2 style="margin:0 0 16px;color:#1a1a2e">🎯 New Lead${score>=7?' 🔥':''}</h2>
@@ -1911,17 +1947,43 @@ const leadTpl = ({ email, name, page, convo, score, tag, adminUrl, qualification
   <a href="mailto:${email}" style="display:inline-block;padding:11px 22px;background:#6C63FF;color:white;border-radius:10px;text-decoration:none;font-weight:600">Reply now →</a>
 `, adminUrl);
 
-const bookingTpl = ({ name, email, datetime, notes, page, adminUrl }) => wrap(`
-  <h2 style="margin:0 0 16px;color:#1a1a2e">📅 New Booking Request</h2>
-  <table style="width:100%;border-collapse:collapse">
-    <tr><td style="padding:7px 0;color:#999;width:90px">Name</td><td style="font-weight:700">${name}</td></tr>
-    <tr><td style="padding:7px 0;color:#999">Email</td><td><a href="mailto:${email}" style="color:#6C63FF">${email}</a></td></tr>
-    <tr><td style="padding:7px 0;color:#999">Requested</td><td style="font-weight:700;color:#6C63FF">${datetime}</td></tr>
-    ${notes?`<tr><td style="padding:7px 0;color:#999">Notes</td><td>${notes}</td></tr>`:''}
-    <tr><td style="padding:7px 0;color:#999">From</td><td>${page}</td></tr>
-  </table>
-  <a href="mailto:${email}?subject=Booking Confirmation" style="display:inline-block;margin-top:18px;padding:11px 22px;background:#6C63FF;color:white;border-radius:10px;text-decoration:none;font-weight:600">Confirm booking →</a>
-`, adminUrl);
+// Owner alert: new booking received
+const bookingTpl = (p) => {
+  const brand = brandFromPayload(p);
+  const color = brand.brandColor || '#6C63FF';
+  const phone = p.phone || '';
+  const rows = [
+    p.service          && ['Service',  p.service + (p.duration_minutes ? ` · ${p.duration_minutes} min` : '') + (p.price_gbp ? ` · £${p.price_gbp}` : '')],
+    ['When',           `<strong style="color:${color};font-size:16px">${p.datetime}</strong>`],
+    ['Client',          p.name],
+    p.email            && ['Email',    `<a href="mailto:${p.email}" style="color:${color};text-decoration:none;font-weight:600">${p.email}</a>`],
+    phone              && ['Phone',    `<a href="tel:${phone.replace(/\s+/g,'')}" style="color:${color};text-decoration:none;font-weight:600">${phone}</a>`],
+    p.notes            && ['Notes',    `<span style="color:#3a3a3a;line-height:1.5;white-space:pre-line">${p.notes}</span>`],
+    ['Source',          p.page || p.siteName || 'Website']
+  ].filter(Boolean);
+
+  const replyHref = p.email ? `mailto:${p.email}?subject=Re:%20Your%20${encodeURIComponent(p.service || 'booking')}%20on%20${encodeURIComponent(p.datetime || '')}&body=${encodeURIComponent(`Hi ${(p.name||'').split(' ')[0]},\n\nThanks for booking in with me. Just confirming I've got you down for ${p.datetime || 'your session'}.\n\nLooking forward to seeing you.\n\nJord`)}` : '';
+  const callHref  = phone ? `tel:${phone.replace(/\s+/g,'')}` : '';
+
+  return wrap(`
+    <p style="margin:0 0 6px;color:#8a8a96;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.2em">New booking request</p>
+    <h2 style="margin:0 0 24px;color:#1a1a1a;font-size:26px;line-height:1.15;font-weight:700">${p.name} · ${p.datetime}</h2>
+    <div style="background:#fafafc;border:1px solid #eef0f4;border-radius:14px;padding:22px 24px;margin-bottom:24px">
+      <table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;font-size:14px;color:#1a1a1a">
+        ${rows.map(([k,v]) => `
+          <tr>
+            <td style="padding:8px 0;color:#8a8a96;width:90px;vertical-align:top;font-size:12px;text-transform:uppercase;letter-spacing:0.1em;font-weight:600">${k}</td>
+            <td style="padding:8px 0;vertical-align:top">${v}</td>
+          </tr>`).join('')}
+      </table>
+    </div>
+    <div style="display:block">
+      ${replyHref ? `<a href="${replyHref}" style="display:inline-block;margin:0 8px 8px 0;padding:12px 22px;background:${color};color:#fff;border-radius:999px;text-decoration:none;font-weight:600;font-size:13.5px;letter-spacing:0.02em">Reply to client →</a>` : ''}
+      ${callHref  ? `<a href="${callHref}"  style="display:inline-block;margin:0 8px 8px 0;padding:12px 22px;background:#fff;color:${color};border:1.5px solid ${color};border-radius:999px;text-decoration:none;font-weight:600;font-size:13.5px">Call client</a>` : ''}
+    </div>
+    <p style="margin:22px 0 0;color:#8a8a96;font-size:12px;line-height:1.5">📎 A <strong>booking.ics</strong> file is attached — tap it from Outlook / Apple Mail / Gmail to add this session to your calendar in one click.</p>
+  `, p.adminUrl, brand);
+};
 
 const digestTpl = ({ date, stats, topQ, hotLeads, bookingCount, abResults, topObjections, adminUrl }) => wrap(`
   <h2 style="margin:0 0 4px;color:#1a1a2e">📊 ${date} — Daily Digest</h2>
@@ -1953,27 +2015,73 @@ const visitorFollowupTpl = ({ visitorName, botName, siteName, ownerName, summary
 `, adminUrl);
 
 // Booking confirmation sent TO the visitor
-const visitorBookingTpl = ({ name, datetime, siteName, botName, ownerName, ownerEmail, calendarLink, adminUrl }) => wrap(`
-  <h2 style="margin:0 0 16px;color:#1a1a2e">📅 Booking Received!</h2>
-  <p style="font-size:14px;color:#444;line-height:1.6;margin-bottom:20px">
-    Hi ${name || 'there'}! Your booking with <strong>${siteName}</strong> has been received.
-  </p>
-  <div style="background:#f8f8fc;border-radius:10px;padding:16px;margin-bottom:20px">
-    <p style="font-size:12px;font-weight:700;color:#999;margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px">Your booking details</p>
-    <p style="font-size:15px;color:#1a1a2e;font-weight:700">📅 ${datetime}</p>
-    ${ownerName ? `<p style="font-size:13px;color:#666;margin-top:6px">With: ${ownerName}</p>` : ''}
-  </div>
-  ${calendarLink ? `
-  <div style="background:#e8f5e920;border:1.5px solid #2ecc7140;border-radius:10px;padding:14px;margin-bottom:20px;text-align:center">
-    <p style="font-size:13px;color:#1a8a4a;margin-bottom:10px">✓ This has been added to your calendar</p>
-    <a href="${calendarLink}" style="display:inline-block;padding:9px 20px;background:#2ecc71;color:white;border-radius:8px;text-decoration:none;font-size:13px;font-weight:600">View in Google Calendar →</a>
-  </div>` : ''}
-  <p style="font-size:13.5px;color:#444;line-height:1.6">
-    ${ownerName || 'The team'} will be in touch to confirm shortly.
-    ${ownerEmail ? `You can reach them at <a href="mailto:${ownerEmail}" style="color:#6C63FF">${ownerEmail}</a>.` : ''}
-  </p>
-  <p style="font-size:13px;color:#888;margin-top:18px">Need to reschedule? Just reply to this email.</p>
-`, adminUrl);
+const visitorBookingTpl = (p) => {
+  const brand = brandFromPayload(p);
+  const color = brand.brandColor || '#6C63FF';
+  const firstName = (p.name || '').split(' ')[0] || 'there';
+  const location = p.location || p.address || '';
+  const mapUrl = p.mapUrl || (location ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(location)}` : '');
+
+  const detailRows = [
+    p.service          && ['Treatment', p.service + (p.duration_minutes ? ` · ${p.duration_minutes} min` : '') + (p.price_gbp ? ` · £${p.price_gbp}` : '')],
+    ['When',            `<strong style="color:${color};font-size:15px">${p.datetime}</strong>`],
+    p.ownerName        && ['Therapist', p.ownerName],
+    location           && ['Where',     `<a href="${mapUrl}" style="color:${color};text-decoration:none;font-weight:600">${location}</a>`]
+  ].filter(Boolean);
+
+  const hasPreparation = p.service && /massage|assessment|treatment|rehab/i.test(p.service);
+
+  return wrap(`
+    <p style="margin:0 0 6px;color:#8a8a96;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.2em">Booking received</p>
+    <h2 style="margin:0 0 16px;color:#1a1a1a;font-size:26px;line-height:1.2;font-weight:700">See you soon, ${firstName}.</h2>
+    <p style="margin:0 0 24px;color:#3a3a3a;font-size:15px;line-height:1.6">
+      ${p.ownerName || 'Your therapist'} has received your booking and will confirm shortly. Here's everything you need to know.
+    </p>
+
+    <div style="background:#fafafc;border:1px solid #eef0f4;border-radius:14px;padding:22px 24px;margin-bottom:20px">
+      <table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;font-size:14px;color:#1a1a1a">
+        ${detailRows.map(([k,v]) => `
+          <tr>
+            <td style="padding:8px 0;color:#8a8a96;width:100px;vertical-align:top;font-size:12px;text-transform:uppercase;letter-spacing:0.1em;font-weight:600">${k}</td>
+            <td style="padding:8px 0;vertical-align:top">${v}</td>
+          </tr>`).join('')}
+      </table>
+    </div>
+
+    ${p.calendarLink ? `
+    <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:12px;padding:14px 18px;margin-bottom:20px;text-align:center">
+      <p style="margin:0 0 10px;font-size:13px;color:#166534;font-weight:600">✓ Added to your calendar</p>
+      <a href="${p.calendarLink}" style="display:inline-block;padding:9px 20px;background:#16a34a;color:#fff;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">Open in Google Calendar →</a>
+    </div>` : `
+    <p style="margin:0 0 20px;color:#8a8a96;font-size:12.5px;line-height:1.5;padding:10px 14px;background:#fffaea;border-radius:10px;border:1px solid #fde68a">
+      📎 A <strong>booking.ics</strong> file is attached — tap it to add this session to your own calendar.
+    </p>`}
+
+    ${hasPreparation ? `
+    <div style="margin-bottom:22px">
+      <p style="margin:0 0 10px;color:#8a8a96;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.2em">Before you come</p>
+      <ul style="margin:0;padding:0 0 0 18px;color:#3a3a3a;font-size:13.5px;line-height:1.7">
+        <li>Wear gym kit — shorts and a t-shirt, or whatever you train in.</li>
+        <li>Come clean and showered if you can.</li>
+        <li>Bring a note of anything that's been bothering you — tight spots, injuries, any goals.</li>
+      </ul>
+    </div>` : ''}
+
+    <div style="margin-bottom:20px">
+      <p style="margin:0 0 10px;color:#8a8a96;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.2em">Need to reschedule?</p>
+      <p style="margin:0;color:#3a3a3a;font-size:13.5px;line-height:1.6">
+        Free to move any session up to 24 hours before. Just reply to this email${p.ownerEmail ? ` or call ${p.ownerName || 'us'}` : ''}.
+      </p>
+    </div>
+
+    ${p.ownerEmail ? `
+    <div style="border-top:1px solid #eef0f4;padding-top:18px">
+      <p style="margin:0;color:#8a8a96;font-size:12.5px;line-height:1.7">
+        Questions? Drop a line to <a href="mailto:${p.ownerEmail}" style="color:${color};text-decoration:none;font-weight:600">${p.ownerEmail}</a>.
+      </p>
+    </div>` : ''}
+  `, p.adminUrl, brand);
+};
 
 const weeklyTpl = ({ period, stats, trend, topQuestions, hotLeads, npsAvg, adminUrl }) => wrap(`
   <h2 style="margin:0 0 4px;color:#1a1a2e">📈 Weekly Report — ${period}</h2>
@@ -3563,7 +3671,7 @@ app.post('/api/booking', async (req, res) => {
     ownerEmail: alertTo,
     to:         alertTo,
     replyTo:    b.email,
-    subject:    `📅 Booking: ${b.name} — ${b.datetime}${b.siteName ? ' (' + b.siteName + ')' : ''}`,
+    subject:    `New booking — ${b.name} · ${b.datetime}`,
     html:       bookingTpl({ ...b, adminUrl }),
     attachments: icsOwner ? [icsOwner] : undefined,
   });
@@ -3578,8 +3686,8 @@ app.post('/api/booking', async (req, res) => {
       ownerEmail: alertTo,
       to:         b.email,
       replyTo:    alertTo,
-      subject:    `📅 Booking received — ${b.siteName || b.page}`,
-      html:       visitorBookingTpl({ name:b.name, datetime:b.datetime, siteName:b.siteName||b.page, botName:b.botName||'us', ownerName:b.ownerName, ownerEmail:alertTo, calendarLink:b.calendarLink, adminUrl:null }),
+      subject:    `Booking received — ${b.siteName || 'your session'}`,
+      html:       visitorBookingTpl({ ...b, ownerEmail: alertTo, calendarLink: b.calendarLink, adminUrl: null }),
       attachments: icsVisitor ? [icsVisitor] : undefined,
     });
   }
