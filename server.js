@@ -65,7 +65,7 @@ app.use('/chatbot.js', (req, res, next) => {
 // Domain whitelist middleware — protects chatbot widget endpoints from unauthorized domains
 app.use((req, res, next) => {
   // Only check widget-facing endpoints (chat, leads, bookings, handoffs, sessions, nps, gaps, faqs)
-  const widgetPaths = ['/api/chat', '/api/lead', '/api/booking', '/api/session', '/api/handoff', '/api/nps', '/api/gap', '/api/faqs', '/api/ab'];
+  const widgetPaths = ['/api/chat', '/api/lead', '/api/booking', '/api/session', '/api/handoff', '/api/nps', '/api/gap', '/api/faqs', '/api/ab', '/api/reviews'];
   const isWidgetReq = widgetPaths.some(p => req.path.startsWith(p));
   if (isWidgetReq && !isDomainAllowed(req)) {
     return res.status(403).json({ error: 'Unauthorized domain. Contact AireyAi to enable this site.' });
@@ -1612,6 +1612,7 @@ const sessions     = new Map();
 const faqs         = new Map();
 const handoffs     = new Map();
 const bookings     = [];
+const reviews      = new Map();  // slug → [{id, name, email, rating, text, service, date, submittedAt, source, approved, rejected}]
 const npsScores    = [];
 const abResults    = { A:{ opens:0, leads:0 }, B:{ opens:0, leads:0 } };
 const gaps         = [];        // knowledge gaps: questions bot couldn't answer
@@ -1746,6 +1747,10 @@ function save(name, data, delay = 500) {
   // Bookings
   const savedBookings = loadFile('bookings', []);
   bookings.push(...savedBookings);
+
+  // Reviews (per-client slug)
+  const savedReviews = loadFile('reviews', {});
+  for (const [slug, list] of Object.entries(savedReviews)) reviews.set(slug, list);
 
   // Lead statuses (pipeline)
   const savedStatuses = loadFile('leadStatuses', []);
@@ -3811,6 +3816,139 @@ app.post('/api/booking/reschedule', async (req, res) => {
     console.warn('Reschedule failed:', e.message);
     res.status(500).json({ error: 'Could not reschedule' });
   }
+});
+
+// ─── Reviews (multi-tenant moderation) ───────────────────────────────────────
+//
+// Fully multi-tenant: every client site gets its own reviews list via a slug in
+// the URL (e.g. /api/reviews/repwithrobson, /api/reviews/ejroofing). One server,
+// one DB file, full isolation between clients.
+//
+// Admin password resolution (most specific wins):
+//   1. env REVIEWS_ADMIN_PASS_<slug>   — per-client (e.g. REVIEWS_ADMIN_PASS_repwithrobson)
+//   2. env REVIEWS_ADMIN_PASS          — global master (you only)
+//   3. "aria-admin"                    — default, CHANGE ON RAILWAY
+const REVIEWS_MASTER_PASS = process.env.REVIEWS_ADMIN_PASS || 'aria-admin';
+
+function adminPassForSlug(slug) {
+  const perClient = process.env['REVIEWS_ADMIN_PASS_' + slug];
+  return perClient || REVIEWS_MASTER_PASS;
+}
+
+function persistReviews() {
+  const obj = {};
+  for (const [slug, list] of reviews.entries()) obj[slug] = list;
+  save('reviews', obj);
+}
+
+function sanitiseText(s, max = 2000) {
+  if (typeof s !== 'string') return '';
+  // Strip control chars + angle brackets (XSS) + cap length
+  return s.replace(/[\x00-\x1f<>]/g, '').trim().slice(0, max);
+}
+
+function isAdminReq(req, slug) {
+  const expected = adminPassForSlug(slug);
+  const header = req.get('X-Admin-Password');
+  const query  = req.query.adminPass;
+  // Accept per-client password OR the global master (so Kyle has a backdoor)
+  const accept = v => v && (v === expected || v === REVIEWS_MASTER_PASS);
+  return accept(header) || accept(query);
+}
+
+// GET — list reviews for a client. ?all=1 (+ admin header) returns pending/rejected too.
+app.get('/api/reviews/:slug', (req, res) => {
+  const slug = req.params.slug;
+  const list = reviews.get(slug) || [];
+  const wantAll = req.query.all === '1';
+  if (wantAll && !isAdminReq(req, slug)) return res.status(401).json({ error: 'Admin auth required for ?all=1' });
+  const filtered = wantAll ? list : list.filter(r => r.approved && !r.rejected);
+  // Redact private fields for public responses
+  const visible = wantAll ? filtered : filtered.map(({ email, ip, ...rest }) => rest);
+  res.json({ reviews: visible, total: visible.length });
+});
+
+// POST — submit a new review (pending approval).
+app.post('/api/reviews/:slug', async (req, res) => {
+  const slug = req.params.slug;
+  const body = req.body || {};
+  const name   = sanitiseText(body.name, 80);
+  const email  = sanitiseText(body.email, 120);
+  const text   = sanitiseText(body.text || body.review, 2000);
+  const rating = Math.max(1, Math.min(5, parseInt(body.rating, 10) || 5));
+  const service = sanitiseText(body.service, 80);
+
+  if (!name || !email || text.length < 20) {
+    return res.status(400).json({ error: 'name, email and review (min 20 chars) are required' });
+  }
+
+  const review = {
+    id: 'rv_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+    name, email, rating, text, service,
+    date: 'Just now',
+    source: 'Website',
+    submittedAt: new Date().toISOString(),
+    approved: false,
+    rejected: false,
+    ip: req.headers['x-forwarded-for'] || req.ip || ''
+  };
+
+  const list = reviews.get(slug) || [];
+  list.unshift(review);
+  reviews.set(slug, list);
+  persistReviews();
+
+  // Alert owner (uses the slug to derive owner email from client profile, falls back to body.ownerEmail)
+  let ownerEmail = body.ownerEmail || null;
+  if (!ownerEmail) {
+    for (const [, v] of clientProfiles) {
+      if (v.profile?.slug === slug || v.profile?.code === slug) { ownerEmail = v.profile.email; break; }
+    }
+  }
+  const alertTo = ownerTo(ownerEmail);
+  if (alertTo) {
+    const safeText = text.replace(/</g, '&lt;');
+    const adminUrl = `${req.protocol}://${req.get('host')}/admin/reviews.html`;
+    await smartSend({
+      ownerEmail: alertTo,
+      to: alertTo,
+      replyTo: email,
+      subject: `⭐ New review from ${name} (${rating}★) — ${slug}`,
+      html: `<div style="font-family:-apple-system,sans-serif;max-width:520px;margin:0 auto;padding:24px;">
+        <h2 style="margin:0 0 16px;color:#0A0A0A">⭐ New review awaiting approval</h2>
+        <p style="font-size:14px;color:#666;"><strong>${name}</strong> (${email}) left a ${rating}-star review on your ${slug} site.</p>
+        ${service ? `<p style="font-size:13px;color:#888;">Treatment: ${service}</p>` : ''}
+        <blockquote style="border-left:3px solid #EC0A7E;padding:12px 16px;background:#FAFAFA;font-size:14px;margin:16px 0;">${safeText}</blockquote>
+        <a href="${adminUrl}" style="display:inline-block;padding:12px 22px;background:#EC0A7E;color:#fff;border-radius:999px;text-decoration:none;font-weight:600">Approve or reject →</a>
+      </div>`,
+    });
+  }
+
+  await slack([
+    { type: 'header', text: { type: 'plain_text', text: `⭐ New review — ${slug}` } },
+    { type: 'section', text: { type: 'mrkdwn', text: `*${name}* (${email}) — ${rating}★\n${text.slice(0, 280)}${text.length > 280 ? '…' : ''}` } },
+  ], `New review for ${slug}`);
+
+  res.json({ ok: true, id: review.id });
+});
+
+// PATCH — moderate a review (approve / reject / delete). Admin only.
+app.patch('/api/reviews/:slug/:id', (req, res) => {
+  const { slug, id } = req.params;
+  if (!isAdminReq(req, slug)) return res.status(401).json({ error: 'Admin auth required' });
+  const action = (req.body?.action || '').toLowerCase();
+  const list = reviews.get(slug) || [];
+  const idx = list.findIndex(r => r.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Review not found' });
+
+  if (action === 'approve') { list[idx].approved = true;  list[idx].rejected = false; }
+  else if (action === 'reject')  { list[idx].approved = false; list[idx].rejected = true; }
+  else if (action === 'delete')  { list.splice(idx, 1); }
+  else return res.status(400).json({ error: 'action must be approve | reject | delete' });
+
+  reviews.set(slug, list);
+  persistReviews();
+  res.json({ ok: true });
 });
 
 // ─── Abandoned Chat Recovery ─────────────────────────────────────────────────
