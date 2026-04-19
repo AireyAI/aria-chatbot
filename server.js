@@ -82,10 +82,11 @@ if (process.env.SMTP_HOST && process.env.SMTP_USER) {
   mailer = nodemailer.createTransport({ host: process.env.SMTP_HOST, port: +( process.env.SMTP_PORT||587), secure: false, auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } });
   mailer.verify().then(() => console.log('✉️  Email ready')).catch(e => console.warn('Email:', e.message));
 }
-const sendEmail = async ({ to, subject, html, replyTo }) => {
+const sendEmail = async ({ to, subject, html, replyTo, attachments }) => {
   if (!mailer || !to) return;
   const opts = { from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, html };
   if (replyTo) opts.replyTo = replyTo;
+  if (attachments && attachments.length) opts.attachments = attachments;
   try { await mailer.sendMail(opts); }
   catch (e) { console.warn('Email fail:', e.message); }
 };
@@ -199,25 +200,53 @@ async function saveGmailTokens(ownerEmail, tokens) {
 }
 
 // Send an email using the owner's connected Gmail account
-async function sendViaGmail(ownerEmail, { to, subject, html, replyTo }) {
+async function sendViaGmail(ownerEmail, { to, subject, html, replyTo, attachments }) {
   const entry = gmailTokens.get(ownerEmail);
   if (!entry) return false;
   try {
-    // Refresh token if needed
     const { auth } = entry;
     const gmail = google.gmail({ version: 'v1', auth });
 
-    // Build RFC 2822 message
-    const headerLines = [
+    // Multipart/mixed so we can attach files (e.g. .ics calendar invites)
+    const hasAtt = attachments && attachments.length > 0;
+    const boundary = 'rwr-' + Math.random().toString(36).slice(2);
+    const head = [
       `From: ${ownerEmail}`,
       `To: ${to}`,
       replyTo ? `Reply-To: ${replyTo}` : '',
       `Subject: ${subject}`,
       'MIME-Version: 1.0',
-      'Content-Type: text/html; charset=utf-8',
+      hasAtt ? `Content-Type: multipart/mixed; boundary="${boundary}"` : 'Content-Type: text/html; charset=utf-8',
     ].filter(Boolean).join('\r\n');
 
-    const encoded = Buffer.from(headerLines + '\r\n\r\n' + html).toString('base64url');
+    let body;
+    if (hasAtt) {
+      const parts = [
+        `--${boundary}`,
+        'Content-Type: text/html; charset=utf-8',
+        'Content-Transfer-Encoding: 7bit',
+        '',
+        html,
+      ];
+      for (const a of attachments) {
+        const ctype = a.contentType || 'application/octet-stream';
+        const buf = Buffer.isBuffer(a.content) ? a.content : Buffer.from(a.content || '', 'utf8');
+        parts.push(
+          `--${boundary}`,
+          `Content-Type: ${ctype}; name="${a.filename}"`,
+          `Content-Disposition: attachment; filename="${a.filename}"`,
+          'Content-Transfer-Encoding: base64',
+          '',
+          buf.toString('base64').replace(/(.{76})/g, '$1\r\n'),
+        );
+      }
+      parts.push(`--${boundary}--`);
+      body = parts.join('\r\n');
+    } else {
+      body = html;
+    }
+
+    const encoded = Buffer.from(head + '\r\n\r\n' + body).toString('base64url');
     await gmail.users.messages.send({ userId: 'me', requestBody: { raw: encoded } });
     return true;
   } catch (e) {
@@ -227,13 +256,13 @@ async function sendViaGmail(ownerEmail, { to, subject, html, replyTo }) {
 }
 
 // Smart send: use owner's Gmail if connected, otherwise fall back to server SMTP
-async function smartSend({ ownerEmail, to, subject, html, replyTo }) {
+async function smartSend({ ownerEmail, to, subject, html, replyTo, attachments }) {
   if (ownerEmail && gmailTokens.has(ownerEmail)) {
-    const sent = await sendViaGmail(ownerEmail, { to, subject, html, replyTo });
+    const sent = await sendViaGmail(ownerEmail, { to, subject, html, replyTo, attachments });
     if (sent) return;
   }
   // Fallback to server SMTP
-  await sendEmail({ to, subject, html, replyTo });
+  await sendEmail({ to, subject, html, replyTo, attachments });
 }
 
 // ─── Multi-Channel Send ─────────────────────────────────────────────────────
@@ -1977,6 +2006,94 @@ function slackLeadBlocks({ email, score, tag, page, adminUrl }) {
 // ─── Google Calendar ──────────────────────────────────────────────────────────
 
 // Parse natural language datetime into ISO — uses Claude so "next Tuesday 2pm" just works
+/**
+ * Build a calendar invite (.ics) attachment for a booking email.
+ * Returns a { filename, content, contentType } object, or null if the datetime
+ * can't be parsed (in which case we just skip the attachment — email still goes).
+ *
+ * `method` is 'REQUEST' for the owner (they can accept it like an invite) and
+ * 'PUBLISH' for the visitor (it shows as an info event, no RSVP prompt).
+ */
+function pad2(n) { return String(n).padStart(2, '0'); }
+function icsDate(d) {
+  return d.getUTCFullYear() + pad2(d.getUTCMonth() + 1) + pad2(d.getUTCDate()) +
+         'T' + pad2(d.getUTCHours()) + pad2(d.getUTCMinutes()) + pad2(d.getUTCSeconds()) + 'Z';
+}
+function icsEscape(s) {
+  return String(s || '').replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/,/g, '\\,').replace(/;/g, '\\;');
+}
+async function buildBookingIcs(booking, { method = 'REQUEST' } = {}) {
+  // Prefer explicit structured date+time from the form; fallback to AI-parsed datetime string.
+  let start, end;
+  if (booking.date && booking.time) {
+    // Interpret as Europe/London. Build as local, convert to UTC via tz offset best-effort (UTC+0 for simplicity — iCal clients handle well with Z).
+    const [hh, mm] = booking.time.split(':').map(Number);
+    const [yy, m, d] = booking.date.split('-').map(Number);
+    start = new Date(Date.UTC(yy, m - 1, d, hh, mm));
+    const dur = parseInt(booking.duration_minutes, 10) || 60;
+    end = new Date(start.getTime() + dur * 60 * 1000);
+  } else {
+    const parsed = await parseBookingDatetime(booking.datetime);
+    if (!parsed) return null;
+    start = new Date(parsed.start);
+    end = new Date(parsed.end);
+  }
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) return null;
+
+  const uid = (booking.ts ? new Date(booking.ts).getTime() : Date.now()) + '-' + Math.random().toString(36).slice(2) + '@repwithrobson';
+  const now = new Date();
+  const owner = booking.ownerEmail || '';
+  const ownerName = booking.ownerName || 'Therapist';
+  const visitor = booking.email || '';
+  const visitorName = booking.name || 'Client';
+  const siteName = booking.siteName || 'REP with Robson';
+
+  const summary = `${booking.service || 'Session'} — ${visitorName}`;
+  const descLines = [
+    `Service: ${booking.service || 'Session'}${booking.duration_minutes ? ` (${booking.duration_minutes} min)` : ''}`,
+    booking.price_gbp ? `Price: £${booking.price_gbp}` : '',
+    `Client: ${visitorName}`,
+    booking.phone ? `Phone: ${booking.phone}` : '',
+    `Email: ${visitor}`,
+    booking.notes ? `\nNotes:\n${booking.notes}` : '',
+    `\nBooked via ${siteName}`
+  ].filter(Boolean).join('\n');
+  const location = booking.location || booking.address || '1 Lonsdale Street, Carlisle CA1 1BJ';
+
+  const ics = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    `PRODID:-//${siteName}//Booking//EN`,
+    'CALSCALE:GREGORIAN',
+    `METHOD:${method}`,
+    'BEGIN:VEVENT',
+    `UID:${uid}`,
+    `DTSTAMP:${icsDate(now)}`,
+    `DTSTART:${icsDate(start)}`,
+    `DTEND:${icsDate(end)}`,
+    `SUMMARY:${icsEscape(summary)}`,
+    `DESCRIPTION:${icsEscape(descLines)}`,
+    `LOCATION:${icsEscape(location)}`,
+    owner ? `ORGANIZER;CN=${icsEscape(ownerName)}:mailto:${owner}` : '',
+    visitor ? `ATTENDEE;CN=${icsEscape(visitorName)};RSVP=TRUE;PARTSTAT=NEEDS-ACTION:mailto:${visitor}` : '',
+    'STATUS:CONFIRMED',
+    'SEQUENCE:0',
+    'BEGIN:VALARM',
+    'TRIGGER:-PT1H',
+    'ACTION:DISPLAY',
+    `DESCRIPTION:Upcoming session — ${icsEscape(summary)}`,
+    'END:VALARM',
+    'END:VEVENT',
+    'END:VCALENDAR'
+  ].filter(Boolean).join('\r\n');
+
+  return {
+    filename: 'booking.ics',
+    content: ics,
+    contentType: `text/calendar; method=${method}; charset=UTF-8`
+  };
+}
+
 async function parseBookingDatetime(text) {
   const today = new Date().toISOString().slice(0, 10);
   const r = await aiJSON(`Convert this booking request into a start/end datetime.
@@ -3436,16 +3553,22 @@ app.post('/api/booking', async (req, res) => {
   // 1. Create Google Calendar event (non-blocking — runs in parallel with emails)
   const calendarPromise = alertTo ? createCalendarEvent(alertTo, b) : Promise.resolve(null);
 
-  // 2. Alert the site owner — use their Gmail if connected
+  // 2. Generate .ics calendar invite attachment (works with any mail client — Outlook, Apple Mail, Gmail)
+  //    Skipped silently if we can't determine the date (e.g. free-text bookings)
+  const icsOwner = await buildBookingIcs({ ...b, ownerEmail: alertTo }, { method: 'REQUEST' }).catch(() => null);
+  const icsVisitor = await buildBookingIcs({ ...b, ownerEmail: alertTo }, { method: 'PUBLISH' }).catch(() => null);
+
+  // 3. Alert the site owner — use their Gmail if connected; attach the .ics so Outlook users can one-tap-add
   await smartSend({
     ownerEmail: alertTo,
     to:         alertTo,
     replyTo:    b.email,
     subject:    `📅 Booking: ${b.name} — ${b.datetime}${b.siteName ? ' (' + b.siteName + ')' : ''}`,
     html:       bookingTpl({ ...b, adminUrl }),
+    attachments: icsOwner ? [icsOwner] : undefined,
   });
 
-  // 3. Wait for calendar, then send visitor confirmation with calendar link if available
+  // 4. Wait for calendar, then send visitor confirmation with calendar link if available
   const calEvent = await calendarPromise;
   b.calendarLink = calEvent?.htmlLink || null;
   b.calendarAdded = !!calEvent;
@@ -3457,6 +3580,7 @@ app.post('/api/booking', async (req, res) => {
       replyTo:    alertTo,
       subject:    `📅 Booking received — ${b.siteName || b.page}`,
       html:       visitorBookingTpl({ name:b.name, datetime:b.datetime, siteName:b.siteName||b.page, botName:b.botName||'us', ownerName:b.ownerName, ownerEmail:alertTo, calendarLink:b.calendarLink, adminUrl:null }),
+      attachments: icsVisitor ? [icsVisitor] : undefined,
     });
   }
 
