@@ -3,7 +3,7 @@
  *  UNIVERSAL AI CHATBOT WIDGET v4 — Fun Edition
  *  One hosted file. Auto-updates on all sites.
  *
- *  Fun features: Confetti · Floating emoji · Bot moods
+ *  Fun features: Floating emoji · Bot moods
  *  Name capture · Streaks · Easter eggs · Rotating thinking
  *  messages · Celebration moments · Rich interactions
  *
@@ -126,7 +126,6 @@
     captureNames:       true,
     streakEnabled:      true,
     easterEggsEnabled:  true,
-    confettiEnabled:    true,
     floatingEmoji:      true,
 
     // ── Owner features ─────────────────────────────────────────────
@@ -241,60 +240,9 @@
     celebrate:() => CONFIG.soundEnabled && (_tone(523, null, 0.07, 0.08), setTimeout(() => _tone(659, null, 0.07, 0.08), 90), setTimeout(() => _tone(784, null, 0.07, 0.08), 180), setTimeout(() => _tone(1047, null, 0.07, 0.2), 270)),
   };
 
-  // =====================================================
-  //  CONFETTI ENGINE (pure canvas — no dependencies)
-  // =====================================================
-  function confetti(opts = {}) {
-    if (!CONFIG.confettiEnabled || reducedMotion) return;
-    const { count = 90, x = 0.5, y = 0.6, spread = 'full' } = opts;
-    const A = CONFIG.accentColor;
-    const colors = [A, '#FF6B6B', '#FFD93D', '#6BCB77', '#4D96FF', '#FF922B', '#F78CA2', '#a18cd1'];
-    const cvs = document.createElement('canvas');
-    cvs.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483647';
-    document.body.appendChild(cvs);
-    cvs.width  = window.innerWidth;
-    cvs.height = window.innerHeight;
-    const ctx = cvs.getContext('2d');
-
-    const particles = Array.from({ length: count }, () => {
-      const angle = spread === 'full'
-        ? Math.random() * Math.PI * 2
-        : (-Math.PI / 2) + (Math.random() - 0.5) * Math.PI * 0.8;
-      const speed = Math.random() * 10 + 5;
-      return {
-        x: cvs.width  * x,
-        y: cvs.height * y,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed,
-        color: colors[Math.floor(Math.random() * colors.length)],
-        w: Math.random() * 10 + 6,
-        h: Math.random() * 6  + 4,
-        rot: Math.random() * 360,
-        rv: (Math.random() - 0.5) * 12,
-        life: 1,
-      };
-    });
-
-    let raf;
-    (function draw() {
-      ctx.clearRect(0, 0, cvs.width, cvs.height);
-      let alive = false;
-      particles.forEach(p => {
-        p.x  += p.vx; p.y  += p.vy;
-        p.vy += 0.35; p.vx *= 0.99;
-        p.rot += p.rv; p.life -= 0.013;
-        if (p.life <= 0) return; alive = true;
-        ctx.save();
-        ctx.globalAlpha = Math.min(p.life * 2, 1);
-        ctx.translate(p.x, p.y); ctx.rotate(p.rot * Math.PI / 180);
-        ctx.fillStyle = p.color;
-        ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
-        ctx.restore();
-      });
-      if (alive) raf = requestAnimationFrame(draw);
-      else cvs.remove();
-    })();
-  }
+  // Confetti removed — Kyle's rule: no cheesy particle effects on client sites.
+  // Keeping a no-op stub so existing call sites don't throw.
+  function confetti() { /* intentionally empty */ }
 
   // =====================================================
   //  FLOATING EMOJI
