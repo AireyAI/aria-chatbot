@@ -49,7 +49,10 @@ const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const ADMIN  = process.env.ADMIN_PASS || 'aria-admin';
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
-const corsOpts = { origin: '*', methods: ['GET','POST','DELETE','PUT','OPTIONS','PATCH'] };
+// origin: true reflects the request's Origin header back, which is required
+// when the client uses credentialed requests (navigator.sendBeacon always does).
+// Wildcard '*' is rejected by browsers in that case.
+const corsOpts = { origin: true, credentials: true, methods: ['GET','POST','DELETE','PUT','OPTIONS','PATCH'] };
 app.use(cors(corsOpts));
 app.options('*', cors(corsOpts));
 // Raw body capture for Shopify webhook HMAC verification — must run before express.json()
