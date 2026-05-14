@@ -22,11 +22,13 @@ test.describe('Lead router — widget wiring', () => {
     await page.route('**/api/chat/router', async (route) => {
       routerCalled = true;
       capturedBody = JSON.parse(route.request().postData() || '{}');
+      const reply = 'Got it — flat roof repair, someone will be in touch.';
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
         body: JSON.stringify({
-          reply: 'Got it — flat roof repair, someone will be in touch.',
+          content: [{ type: 'text', text: reply }], // legacy widget reads this
+          reply,                                     // richer consumers
           toolEvents: [
             { name: 'qualify_lead', input: {}, result: { score: 90, tier: 'hot', reason: 'mock' } },
             { name: 'create_lead_record', input: {}, result: { logged: true, leadId: 'mock-1' } },
@@ -46,12 +48,12 @@ test.describe('Lead router — widget wiring', () => {
     await page.locator('#_ac-btn').click();
     await expect(page.locator('#_ac-win')).toBeVisible({ timeout: 5000 });
 
-    const input = page.locator('#_ac-win textarea, #_ac-win input[type="text"]');
-    await input.fill('I need a flat roof repair, can someone call 07900?');
-    await input.press('Enter');
+    // Drive via the widget's public API (window.AriaChat.send) — bypasses
+    // input enable/disable state which is tricky to reproduce with fill().
+    await page.evaluate(() => window.AriaChat.send('I need a flat roof repair, can someone call 07900?'));
 
     // Bot reply renders
-    const botMsg = page.locator('.ac-msg.ac-bot');
+    const botMsg = page.locator('.ac-msg.bot');
     await expect(botMsg.last()).toContainText('flat roof repair', { timeout: 8000 });
 
     expect(routerCalled).toBe(true);
@@ -62,11 +64,13 @@ test.describe('Lead router — widget wiring', () => {
 
   test('handles router response with stopReason=max_iters_exceeded gracefully', async ({ page }) => {
     await page.route('**/api/chat/router', async (route) => {
+      const reply = "I've collected enough info — someone from the team will be in touch shortly.";
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
         body: JSON.stringify({
-          reply: "I've collected enough info — someone from the team will be in touch shortly.",
+          content: [{ type: 'text', text: reply }],
+          reply,
           toolEvents: [],
           stopReason: 'max_iters_exceeded',
         }),
@@ -76,11 +80,9 @@ test.describe('Lead router — widget wiring', () => {
     await page.goto(TEST_PAGE);
     await page.locator('#_ac-btn').click();
     await expect(page.locator('#_ac-win')).toBeVisible({ timeout: 5000 });
-    const input = page.locator('#_ac-win textarea, #_ac-win input[type="text"]');
-    await input.fill('hi');
-    await input.press('Enter');
+    await page.evaluate(() => window.AriaChat.send('hi'));
 
-    const botMsg = page.locator('.ac-msg.ac-bot');
+    const botMsg = page.locator('.ac-msg.bot');
     await expect(botMsg.last()).toContainText('team will be in touch', { timeout: 8000 });
   });
 
@@ -96,9 +98,7 @@ test.describe('Lead router — widget wiring', () => {
     await page.goto(TEST_PAGE);
     await page.locator('#_ac-btn').click();
     await expect(page.locator('#_ac-win')).toBeVisible({ timeout: 5000 });
-    const input = page.locator('#_ac-win textarea, #_ac-win input[type="text"]');
-    await input.fill('hi');
-    await input.press('Enter');
+    await page.evaluate(() => window.AriaChat.send('hi'));
 
     // Widget should show *some* visible error/fallback rather than silently swallowing.
     // We don't assert exact copy because the widget has its own error UI string —

@@ -8,3 +8,4 @@ data/
 
 # Superpowers scratch (per-machine, not portable)
 .superpowers/
+test-results/

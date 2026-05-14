@@ -3522,7 +3522,16 @@ app.post('/api/chat/router', async (req, res) => {
     const qualifyEvent = toolEvents.find(e => e.name === 'qualify_lead');
     const newScore = qualifyEvent?.result?.score ?? lastScore;
 
-    res.json({ reply, toolEvents, score: newScore, stopReason, action });
+    // Dual-shape response: widget reads `data.content[0].text` (Anthropic shape)
+    // unchanged; richer consumers can read `reply`, `toolEvents`, `score`, `action`.
+    res.json({
+      content: [{ type: 'text', text: reply }],
+      reply,
+      toolEvents,
+      score: newScore,
+      stopReason,
+      action,
+    });
   } catch (e) {
     console.error('[aria/router] error:', e.message);
     res.status(500).json({ error: 'AI error' });
