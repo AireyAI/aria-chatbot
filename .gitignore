@@ -2,3 +2,9 @@ node_modules/
 .env
 .DS_Store
 data/
+
+# Loose archives that drift into repo root
+*.zip
+
+# Superpowers scratch (per-machine, not portable)
+.superpowers/
