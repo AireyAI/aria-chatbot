@@ -43,10 +43,20 @@ import cors       from 'cors';
 import nodemailer from 'nodemailer';
 import { google } from 'googleapis';
 import crypto     from 'crypto';
+import { promises as fsp } from 'node:fs';
+import { routeChat }                    from './lib/lead_router.js';
+import { decideLeadAction, policyAddendum } from './lib/lead_policy.js';
 
 const app    = express();
 const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const ADMIN  = process.env.ADMIN_PASS || 'aria-admin';
+// ADMIN_PASS is required. The historical fallback 'aria-admin' was retired
+// 2026-05-14 — having a guessable default meant any reader of this OSS repo
+// could wipe the live domain allowlist. Refuse to start without it.
+if (!process.env.ADMIN_PASS) {
+  console.error('FATAL: ADMIN_PASS env var is required. Set it on Railway → aria-chatbot service → Variables.');
+  process.exit(1);
+}
+const ADMIN  = process.env.ADMIN_PASS;
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 // origin: true reflects the request's Origin header back, which is required
@@ -3461,6 +3471,119 @@ app.post('/api/chat', async (req, res) => {
   } catch(e) {
     console.error('Chat error:', e.message);
     res.status(500).json({ error: e.message?.includes('API key') ? 'Invalid API key' : 'AI error' });
+  }
+});
+
+// ─── Lead-Router Chat (tool-use) ─────────────────────────────────────────────
+// Same guard rails as /api/chat (rate limit, cost cap, session save) but
+// routes through lib/lead_router.js so Claude can invoke tools to qualify
+// leads, log them, stage WhatsApp pings, and stage calendar bookings.
+// Two-stage approval (CLAUDE.md Rule #12): irreversible tools STAGE to
+// data/pending_actions.jsonl and email the owner a one-click confirm link.
+app.post('/api/chat/router', async (req, res) => {
+  if (!checkRate(req.ip)) return res.status(429).json({ error: 'Rate limited' });
+  if (isOverCap())        return res.status(429).json({ error: 'Monthly message limit reached — please try again next month.' });
+  if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'API key not configured' });
+
+  const { system, messages, model, max_tokens, sessionId, clientConfig = {} } = req.body;
+  if (!messages?.length) return res.status(400).json({ error: 'Invalid messages' });
+
+  try {
+    const lastScore = clientConfig.lastScore ?? 0;
+    const tier = lastScore >= 70 ? 'hot' : lastScore >= 40 ? 'warm' : 'cold';
+    const action = decideLeadAction({
+      score: lastScore,
+      tier,
+      businessType: clientConfig.type,
+      hasContact:   Boolean(clientConfig.capturedEmail || clientConfig.capturedPhone),
+      isOutOfHours: clientConfig.isOutOfHours ?? false,
+    });
+
+    const fullPrompt = (system || 'You are a helpful assistant.')
+      + buildBusinessContext()
+      + '\n\n' + policyAddendum(action);
+
+    const { reply, toolEvents, warning, stopReason } = await routeChat({
+      claude,
+      messages: messages.slice(-24),
+      systemPrompt: fullPrompt,
+      clientConfig: { ...clientConfig, serverBaseUrl: `${req.protocol}://${req.get('host')}` },
+      sessionId,
+      serverFns: { smartSend, sendWhatsAppMessage },
+      model: model || 'claude-sonnet-4-6',
+      maxTokens: max_tokens || 800,
+    });
+
+    if (warning) console.warn('[aria/router]', warning); // Rule #10 — fail loud
+    if (sessionId) saveSession(sessionId, { messages: messages.slice(-24) });
+
+    // Track the qualify_lead score back to clientConfig so the next turn can
+    // re-evaluate policy with up-to-date info. Widget should persist this.
+    const qualifyEvent = toolEvents.find(e => e.name === 'qualify_lead');
+    const newScore = qualifyEvent?.result?.score ?? lastScore;
+
+    res.json({ reply, toolEvents, score: newScore, stopReason, action });
+  } catch (e) {
+    console.error('[aria/router] error:', e.message);
+    res.status(500).json({ error: 'AI error' });
+  }
+});
+
+// ─── Pending action confirmation (two-stage approval for irreversible ops) ──
+// Owner gets emailed a link like /api/pending/confirm?id=<id>&token=<t>
+// which executes the staged WhatsApp send or calendar booking.
+app.get('/api/pending/confirm', async (req, res) => {
+  const { id, token } = req.query;
+  if (!id || !token) return res.status(400).send('Missing id or token');
+
+  let rows;
+  try {
+    const raw = await fsp.readFile(resolve('data', 'pending_actions.jsonl'), 'utf8');
+    rows = raw.trim().split('\n').filter(Boolean).map(JSON.parse);
+  } catch {
+    return res.status(404).send('No pending actions');
+  }
+
+  // Append-only log: an entry is "live" if its id has no later row with executed_at set.
+  const matches = rows.filter(r => r.id === id);
+  if (!matches.length) return res.status(403).send('Invalid or expired link');
+  const row = matches[0];
+  if (row.token !== token) return res.status(403).send('Invalid token');
+  if (matches.some(r => r.executed_at)) return res.send('Already actioned.');
+
+  try {
+    if (row.kind === 'send_whatsapp_to_owner') {
+      const wa = row.payload;
+      const ownerWa = row.owner?.handoffWa;
+      if (!ownerWa) {
+        console.error('[aria/pending] cannot send — no handoffWa on staged row', row.id);
+        return res.status(500).send('No WhatsApp number configured for this client');
+      }
+      await sendWhatsAppMessage({}, ownerWa,
+        `New lead from your site (Aria):\n\n${wa.summary}\n\nCallback: ${wa.callback_number}\nUrgency: ${wa.urgency}`);
+    } else if (row.kind === 'book_calendar_slot') {
+      // Each client's calendar auth is per-account — full calendar.events.insert
+      // wiring is a follow-up. For now: email the owner with the booking details
+      // so they confirm by hand. Visitor was told "we'll confirm within 1 hour".
+      const b = row.payload;
+      const ownerEmail = row.owner?.handoffEmail || process.env.NOTIFY_EMAIL;
+      if (ownerEmail) {
+        await smartSend({
+          ownerEmail, to: ownerEmail,
+          subject: `Aria booking request — ${b.visitor_name}`,
+          html: `<p>Tentative booking:</p><pre>${JSON.stringify(b, null, 2)}</pre>`
+        });
+      }
+    } else {
+      return res.status(400).send(`Unknown pending kind: ${row.kind}`);
+    }
+
+    await fsp.appendFile(resolve('data', 'pending_actions.jsonl'),
+      JSON.stringify({ ...row, executed_at: new Date().toISOString() }) + '\n');
+    res.send('Done — Aria has sent it.');
+  } catch (e) {
+    console.error('[aria/pending] execute failed:', e.message);
+    res.status(500).send('Execute failed: ' + e.message);
   }
 });
 

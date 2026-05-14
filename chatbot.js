@@ -186,6 +186,11 @@
     contactEmail:    _a('contactEmail', ''),       // contact email (defaults to ownerEmail)
     whatsapp:        _a('whatsapp',     ''),       // WhatsApp number for contact card
     upsells:         _j('upsells',      []),       // [{trigger:"Haircut",offer:"Beard Trim",price:"£5",desc:"Quick 5-min add-on"}]
+
+    // Opt-in tool-use lead router. Default keeps every existing site on the
+    // proven /api/chat path. Set data-endpoint="/api/chat/router" per-client
+    // to flip that client onto the qualifier + handler pipeline.
+    endpoint:        _a('endpoint',     '/api/chat'),
   };
 
   // Apply business type preset (any explicit data-* overrides the preset)
@@ -193,7 +198,7 @@
   if (!_s?.dataset?.quickReplies) CONFIG.quickReplies = _preset.quickReplies;
 
   const BASE        = CONFIG.serverUrl || window.location.origin;
-  const PROXY_URL   = BASE + '/api/chat';
+  const PROXY_URL   = BASE + CONFIG.endpoint;
   const STREAM_URL  = BASE + '/api/chat/stream';
   const SESSION_URL = BASE + '/api/session';
   const LEAD_URL    = BASE + '/api/lead';
