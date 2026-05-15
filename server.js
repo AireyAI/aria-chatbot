@@ -4105,7 +4105,7 @@ app.post('/api/chat/router', async (req, res) => {
       + pageContext
       + '\n\n' + policyAddendum(action);
 
-    const { reply, toolEvents, warning, stopReason } = await routeChat({
+    const { reply, toolEvents, warning, stopReason, usage } = await routeChat({
       claude,
       messages: messages.slice(-24),
       systemPrompt: fullPrompt,
@@ -4116,6 +4116,10 @@ app.post('/api/chat/router', async (req, res) => {
       maxTokens: max_tokens || 800,
     });
 
+    // Track usage AFTER the call so monthly caps + cost alerts actually
+    // include router traffic. Without this, /api/chat tracked but the new
+    // tool-use router silently bypassed the cap (Codex B2).
+    if (usage) trackUsage(usage.inputTokens, usage.outputTokens);
     if (warning) console.warn('[aria/router]', warning); // Rule #10 — fail loud
     if (sessionId) saveSession(sessionId, { messages: messages.slice(-24) });
 
@@ -4193,7 +4197,7 @@ app.post('/api/chat/router/stream', async (req, res) => {
       + '\n\n' + policyAddendum(action);
 
     const { streamRouteChat } = await import('./lib/lead_router_stream.js');
-    const { stopReason, toolEvents, score, warning } = await streamRouteChat({
+    const { stopReason, toolEvents, score, warning, usage } = await streamRouteChat({
       claude,
       messages: messages.slice(-24),
       systemPrompt: fullPrompt,
@@ -4209,6 +4213,8 @@ app.post('/api/chat/router/stream', async (req, res) => {
       maxTokens: max_tokens || 800,
     });
 
+    // Track usage even on aborted streams — tokens already crossed the wire.
+    if (usage) trackUsage(usage.inputTokens, usage.outputTokens);
     if (warning) console.warn('[aria/router-stream]', warning);
     if (sessionId) saveSession(sessionId, { messages: messages.slice(-24) });
 
@@ -4226,26 +4232,56 @@ app.post('/api/chat/router/stream', async (req, res) => {
 // ─── Pending action confirmation (two-stage approval for irreversible ops) ──
 // Owner gets emailed a link like /api/pending/confirm?id=<id>&token=<t>
 // which executes the staged WhatsApp send or calendar booking.
+//
+// In-process lock prevents the read→check→execute→append race (Codex B5).
+// Two simultaneous clicks would otherwise both pass the "already actioned"
+// check, both fire sendWhatsAppMessage, and the prospect gets the same WA
+// twice. Single-instance Railway deploy makes a Map-based lock sufficient;
+// a multi-node setup would need a real lease (Redis SETNX or similar).
+const _pendingConfirmInFlight = new Set();
+
+function _resolveWhatsAppCreds(ownerHandoffEmail) {
+  // Sender = agency (Kyle), not the site owner. Try env first (most common),
+  // then per-owner channelConfigs (rare — only set if a client has their own
+  // WABA + Kyle is operating it for them).
+  if (process.env.WA_PHONE_NUMBER_ID && process.env.WA_ACCESS_TOKEN) {
+    return { phoneNumberId: process.env.WA_PHONE_NUMBER_ID, accessToken: process.env.WA_ACCESS_TOKEN };
+  }
+  if (ownerHandoffEmail && typeof channelConfigs !== 'undefined') {
+    const cfg = channelConfigs.get(ownerHandoffEmail);
+    if (cfg?.whatsapp?.phoneNumberId && cfg?.whatsapp?.accessToken) return cfg.whatsapp;
+  }
+  return null;
+}
+
 app.get('/api/pending/confirm', async (req, res) => {
   const { id, token } = req.query;
   if (!id || !token) return res.status(400).send('Missing id or token');
 
+  // Block concurrent confirmations for the same id. The reservation is freed
+  // in finally{} regardless of execute success/failure so a retried link still
+  // works after a transient error (e.g. SMTP timeout).
+  if (_pendingConfirmInFlight.has(id)) {
+    return res.status(409).send('Confirmation already in progress — refresh in a moment.');
+  }
+  _pendingConfirmInFlight.add(id);
+
   let rows;
   try {
-    const raw = await fsp.readFile(resolve('data', 'pending_actions.jsonl'), 'utf8');
-    rows = raw.trim().split('\n').filter(Boolean).map(JSON.parse);
-  } catch {
-    return res.status(404).send('No pending actions');
-  }
+    try {
+      const raw = await fsp.readFile(resolve('data', 'pending_actions.jsonl'), 'utf8');
+      rows = raw.trim().split('\n').filter(Boolean).map(JSON.parse);
+    } catch {
+      return res.status(404).send('No pending actions');
+    }
 
-  // Append-only log: an entry is "live" if its id has no later row with executed_at set.
-  const matches = rows.filter(r => r.id === id);
-  if (!matches.length) return res.status(403).send('Invalid or expired link');
-  const row = matches[0];
-  if (row.token !== token) return res.status(403).send('Invalid token');
-  if (matches.some(r => r.executed_at)) return res.send('Already actioned.');
+    // Append-only log: an entry is "live" if its id has no later row with executed_at set.
+    const matches = rows.filter(r => r.id === id);
+    if (!matches.length) return res.status(403).send('Invalid or expired link');
+    const row = matches[0];
+    if (!_constantTimeEq(row.token, String(token))) return res.status(403).send('Invalid token');
+    if (matches.some(r => r.executed_at)) return res.send('Already actioned.');
 
-  try {
     if (row.kind === 'send_whatsapp_to_owner') {
       const wa = row.payload;
       const ownerWa = row.owner?.handoffWa;
@@ -4253,8 +4289,19 @@ app.get('/api/pending/confirm', async (req, res) => {
         console.error('[aria/pending] cannot send — no handoffWa on staged row', row.id);
         return res.status(500).send('No WhatsApp number configured for this client');
       }
-      await sendWhatsAppMessage({}, ownerWa,
+      const creds = _resolveWhatsAppCreds(row.owner?.handoffEmail);
+      if (!creds) {
+        // Fail loud (Rule #10) — silently swallowing this used to mean the
+        // owner thought their lead was forwarded when nothing actually sent.
+        console.error('[aria/pending] no WhatsApp creds resolved (env or channelConfigs) — id=' + row.id);
+        return res.status(500).send('WhatsApp not configured on this server. Lead saved to dashboard.');
+      }
+      const ok = await sendWhatsAppMessage(creds, ownerWa,
         `New lead from your site (Aria):\n\n${wa.summary}\n\nCallback: ${wa.callback_number}\nUrgency: ${wa.urgency}`);
+      if (!ok) {
+        console.error('[aria/pending] WhatsApp send returned false — id=' + row.id);
+        return res.status(502).send('WhatsApp send failed. Check server logs.');
+      }
     } else if (row.kind === 'book_calendar_slot') {
       // Each client's calendar auth is per-account — full calendar.events.insert
       // wiring is a follow-up. For now: email the owner with the booking details
@@ -4278,6 +4325,8 @@ app.get('/api/pending/confirm', async (req, res) => {
   } catch (e) {
     console.error('[aria/pending] execute failed:', e.message);
     res.status(500).send('Execute failed: ' + e.message);
+  } finally {
+    _pendingConfirmInFlight.delete(id);
   }
 });
 
