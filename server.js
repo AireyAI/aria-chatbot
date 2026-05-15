@@ -3700,8 +3700,11 @@ app.post('/api/chat/router/stream', async (req, res) => {
   const { system, messages, model, max_tokens, sessionId, clientConfig = {} } = req.body;
   if (!messages?.length) { sse({ error: 'Invalid messages' }); return res.end(); }
 
+  // res.on('close') — fires on actual client disconnect. NOT req.on('close')
+  // which in Node 24+ fires the moment express.json() finishes consuming the
+  // body, killing every SSE write before the model even responds.
   let aborted = false;
-  req.on('close', () => { aborted = true; });
+  res.on('close', () => { aborted = true; });
 
   try {
     const lastScore = clientConfig.lastScore ?? 0;
@@ -3824,8 +3827,11 @@ app.post('/api/chat/stream', async (req, res) => {
   if (!process.env.ANTHROPIC_API_KEY) { sse({ error:'API key not configured — add ANTHROPIC_API_KEY to your .env file' }); return res.end(); }
   const { system, messages, model, max_tokens, sessionId } = req.body;
   if (!messages?.length) { sse({ error:'Invalid' }); return res.end(); }
+  // res.on('close') — Node 24+ emits req 'close' when the body stream is
+  // consumed (right after express.json()), which would falsely flag aborted=true
+  // before any text deltas fire. res 'close' fires only on actual disconnect.
   let aborted = false;
-  req.on('close', () => { aborted = true; });
+  res.on('close', () => { aborted = true; });
   try {
     const stream = claude.messages.stream({
       model:      model || 'claude-haiku-4-5-20251001',
@@ -3833,7 +3839,7 @@ app.post('/api/chat/stream', async (req, res) => {
       system:     (system || 'You are a helpful assistant.') + buildBusinessContext(),
       messages:   messages.slice(-24),
     });
-    req.on('close', () => { try { stream.abort(); } catch {} });
+    res.on('close', () => { try { stream.abort(); } catch {} });
     stream.on('text', t => { if (!aborted) sse({ text: t }); });
     stream.on('finalMessage', msg => {
       trackUsage(msg.usage?.input_tokens || 0, msg.usage?.output_tokens || 0);
