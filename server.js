@@ -47,6 +47,7 @@ import { promises as fsp } from 'node:fs';
 import { routeChat }                    from './lib/lead_router.js';
 import { decideLeadAction, policyAddendum } from './lib/lead_policy.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
+import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue } from './lib/analytics.js';
 
 const app    = express();
 // Railway terminates TLS at its edge proxy and forwards X-Forwarded-Proto.
@@ -3836,6 +3837,11 @@ app.get('/preview/:token', async (req, res) => {
 
   const { profile, prompt } = session;
   const serverBaseUrl = `${req.protocol}://${req.get('host')}`;
+
+  // Funnel: track that this prospect actually opened the preview. Critical
+  // signal for cold-outreach conversion rates (sent vs viewed vs replied).
+  const _slug = (profile.businessName || 'unknown').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 50);
+  recordEvent({ slug: _slug, event: 'preview_viewed', sessionId: req.params.token, data: { hostname: profile.hostname || null } });
   const safePrompt = prompt.replace(/"/g, '&quot;').replace(/\n/g, ' ');
   // Fake mini-site styled in the visitor's detected brand colour so they
   // immediately recognise "this is what Aria looks like on MY site".
@@ -4128,6 +4134,34 @@ app.post('/api/chat/router', async (req, res) => {
     const qualifyEvent = toolEvents.find(e => e.name === 'qualify_lead');
     const newScore = qualifyEvent?.result?.score ?? lastScore;
 
+    // Funnel analytics — one event per chat round-trip, plus higher-signal
+    // events for lead capture + hot-lead promotion + after-hours engagement.
+    const _slug = clientConfig.slug || 'unknown';
+    const _owner = clientConfig.handoffEmail || null;
+    recordEvent({ slug: _slug, event: 'chat_message', sessionId, ownerEmail: _owner });
+    if (clientConfig.isOutOfHours) {
+      recordEvent({ slug: _slug, event: 'after_hours', sessionId, ownerEmail: _owner });
+    }
+    if (newScore >= 40 && newScore > lastScore) {
+      recordEvent({
+        slug: _slug, event: 'lead_captured', sessionId, ownerEmail: _owner,
+        data: { score: newScore, summary: qualifyEvent?.input?.summary || null },
+      });
+      if (newScore >= 70) {
+        recordEvent({
+          slug: _slug, event: 'lead_hot', sessionId, ownerEmail: _owner,
+          data: { score: newScore, summary: qualifyEvent?.input?.summary || null },
+        });
+      }
+    }
+    for (const e of toolEvents) {
+      if (e.name === 'send_whatsapp_to_owner' && e.result?.ok) {
+        recordEvent({ slug: _slug, event: 'owner_notified', sessionId, ownerEmail: _owner, data: { channel: 'whatsapp' } });
+      } else if (e.name === 'book_calendar_slot' && e.result?.ok) {
+        recordEvent({ slug: _slug, event: 'booking_created', sessionId, ownerEmail: _owner });
+      }
+    }
+
     // Dual-shape response: widget reads `data.content[0].text` (Anthropic shape)
     // unchanged; richer consumers can read `reply`, `toolEvents`, `score`, `action`.
     res.json({
@@ -4217,6 +4251,37 @@ app.post('/api/chat/router/stream', async (req, res) => {
     if (usage) trackUsage(usage.inputTokens, usage.outputTokens);
     if (warning) console.warn('[aria/router-stream]', warning);
     if (sessionId) saveSession(sessionId, { messages: messages.slice(-24) });
+
+    // Funnel analytics — same shape as non-streaming router. We don't record
+    // aborts as `chat_message` because no full exchange occurred.
+    if (stopReason !== 'client_aborted') {
+      const _slug = clientConfig.slug || 'unknown';
+      const _owner = clientConfig.handoffEmail || null;
+      recordEvent({ slug: _slug, event: 'chat_message', sessionId, ownerEmail: _owner });
+      if (clientConfig.isOutOfHours) {
+        recordEvent({ slug: _slug, event: 'after_hours', sessionId, ownerEmail: _owner });
+      }
+      const qualifyEvent = toolEvents.find(e => e.name === 'qualify_lead');
+      if (qualifyEvent && score >= 40 && score > (clientConfig.lastScore ?? 0)) {
+        recordEvent({
+          slug: _slug, event: 'lead_captured', sessionId, ownerEmail: _owner,
+          data: { score, summary: qualifyEvent.input?.summary || null },
+        });
+        if (score >= 70) {
+          recordEvent({
+            slug: _slug, event: 'lead_hot', sessionId, ownerEmail: _owner,
+            data: { score, summary: qualifyEvent.input?.summary || null },
+          });
+        }
+      }
+      for (const e of toolEvents) {
+        if (e.name === 'send_whatsapp_to_owner' && e.result?.ok) {
+          recordEvent({ slug: _slug, event: 'owner_notified', sessionId, ownerEmail: _owner, data: { channel: 'whatsapp' } });
+        } else if (e.name === 'book_calendar_slot' && e.result?.ok) {
+          recordEvent({ slug: _slug, event: 'booking_created', sessionId, ownerEmail: _owner });
+        }
+      }
+    }
 
     if (!aborted) {
       sse({ done: true, score, toolEvents, stopReason, action });
@@ -5994,11 +6059,124 @@ app.patch('/admin/lead/:email/status', (req, res) => {
   res.json({ ok:true });
 });
 
+// ─── Funnel Analytics — per-client conversion rollup ────────────────────────
+// Reads data/aria_events.jsonl, projects events into a 7/30-day funnel per
+// client. JSON for tooling; HTML view at /admin/analytics.
+app.get('/admin/analytics', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  _hardenAdminResponse(res);
+  const week = rollupForWindow({ windowMs: 7 * 24 * 60 * 60 * 1000 });
+  const month = rollupForWindow({ windowMs: 30 * 24 * 60 * 60 * 1000 });
+  res.json({
+    window7d: week,
+    window30d: month,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+app.get('/admin/analytics/:slug', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  _hardenAdminResponse(res);
+  const week = rollupForWindow({ windowMs: 7 * 24 * 60 * 60 * 1000 });
+  const row = week.slugs?.[req.params.slug];
+  if (!row) return res.status(404).json({ error: 'No events for slug in last 7d' });
+  res.json(row);
+});
+
+// Trigger weekly digest manually (for testing — cron handles the schedule).
+// Body: { dryRun?: bool, ownerEmail?: string }
+app.post('/admin/analytics/send-digest', async (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  _hardenAdminResponse(res);
+  const { dryRun, ownerEmail } = req.body || {};
+  const result = await sendWeeklyDigests({ dryRun: !!dryRun, ownerEmailFilter: ownerEmail });
+  res.json(result);
+});
+
+// Worker — emails each owner their per-client weekly digest. Idempotent
+// within a 24h window via the data/weekly_digest_log.jsonl file.
+async function sendWeeklyDigests({ dryRun = false, ownerEmailFilter = null } = {}) {
+  const week = rollupForWindow({ windowMs: 7 * 24 * 60 * 60 * 1000 });
+  const sent = [];
+  const skipped = [];
+  const failed = [];
+
+  // De-dupe — read digest log, skip slugs already mailed in last 24h.
+  const digestLogPath = resolve('data', 'weekly_digest_log.jsonl');
+  const recentlyMailed = new Set();
+  try {
+    const raw = readFileSync(digestLogPath, 'utf8');
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const line of raw.split('\n')) {
+      if (!line) continue;
+      try {
+        const ev = JSON.parse(line);
+        if (new Date(ev.ts).getTime() > cutoff) recentlyMailed.add(ev.slug);
+      } catch {}
+    }
+  } catch {}
+
+  for (const slug of Object.keys(week.slugs || {})) {
+    const row = week.slugs[slug];
+    const owner = row.ownerEmail;
+    if (!owner) { skipped.push({ slug, reason: 'no ownerEmail recorded' }); continue; }
+    if (ownerEmailFilter && owner !== ownerEmailFilter) { skipped.push({ slug, reason: 'filter mismatch' }); continue; }
+    if (recentlyMailed.has(slug)) { skipped.push({ slug, reason: 'already sent <24h ago' }); continue; }
+
+    // Skip if there's no real signal — sending "0 chats this week" emails to
+    // owners is the fastest way to get them to unsubscribe.
+    const totalEvents = Object.values(row.counts || {}).reduce((a, b) => a + b, 0);
+    if (totalEvents < 3) { skipped.push({ slug, reason: 'low signal' }); continue; }
+
+    const businessType = row.businessType || 'generic';
+    const weekStart = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const weekEnd = new Date().toISOString().slice(0, 10);
+    const html = renderWeeklyDigestHtml({ slug, businessType, weekStart, weekEnd, row });
+    const hot = row.counts?.lead_hot || 0;
+    const subject = hot > 0
+      ? `Aria found ${hot} hot lead${hot === 1 ? '' : 's'} for you this week`
+      : `Your weekly Aria summary`;
+
+    if (dryRun) {
+      sent.push({ slug, ownerEmail: owner, subject, htmlLength: html.length, dryRun: true });
+      continue;
+    }
+    try {
+      await smartSend({ ownerEmail: owner, to: owner, subject, html, replyTo: process.env.NOTIFY_EMAIL });
+      await fsp.appendFile(digestLogPath, JSON.stringify({ ts: new Date().toISOString(), slug, ownerEmail: owner }) + '\n');
+      sent.push({ slug, ownerEmail: owner });
+    } catch (e) {
+      failed.push({ slug, error: e.message });
+    }
+  }
+  return { sent: sent.length, skipped: skipped.length, failed: failed.length, details: { sent, skipped, failed } };
+}
+
+// Cron: every Monday 08:00 UTC. Single-instance Railway deploy makes a
+// process-local setInterval sufficient. We compute the day-of-week + hour
+// every minute and only fire on the right combo, so a restart doesn't
+// re-fire (the digest log dedupes anyway).
+let _lastDigestRunIso = null;
+setInterval(async () => {
+  const now = new Date();
+  const isMon = now.getUTCDay() === 1;
+  const isHour = now.getUTCHours() === 8;
+  const ymd = now.toISOString().slice(0, 10);
+  if (!isMon || !isHour || _lastDigestRunIso === ymd) return;
+  _lastDigestRunIso = ymd;
+  try {
+    const r = await sendWeeklyDigests({});
+    console.log(`📊 Weekly digest run: ${r.sent} sent, ${r.skipped} skipped, ${r.failed} failed`);
+  } catch (e) {
+    console.error('[analytics] weekly digest failed:', e.message);
+  }
+}, 60 * 1000).unref();
+
 // ─── Usage & Settings ─────────────────────────────────────────────────────────
 // ─── Agency Dashboard — per-client lead stats (internal tool for Kyle) ───────
 // Reads data/leads.jsonl, groups by `client` field, returns per-client roll-up
 // of leads_total / leads_7d / leads_30d / hot_rate / last_lead. Powers the
-// HTML view at /admin/clients.html. Gated by ?pass=<ADMIN_PASS>.
+// HTML view at /admin/clients.html.
 app.get('/admin/clients', async (req, res) => {
   if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   try {
