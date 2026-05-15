@@ -43,16 +43,121 @@ import cors       from 'cors';
 import nodemailer from 'nodemailer';
 import { google } from 'googleapis';
 import crypto     from 'crypto';
+import { promises as fsp } from 'node:fs';
+import { routeChat }                    from './lib/lead_router.js';
+import { decideLeadAction, policyAddendum } from './lib/lead_policy.js';
 
 const app    = express();
 const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const ADMIN  = process.env.ADMIN_PASS || 'aria-admin';
+// ADMIN_PASS is required. The historical fallback 'aria-admin' was retired
+// 2026-05-14 — having a guessable default meant any reader of this OSS repo
+// could wipe the live domain allowlist. Refuse to start without it.
+if (!process.env.ADMIN_PASS) {
+  console.error('FATAL: ADMIN_PASS env var is required. Set it on Railway → aria-chatbot service → Variables.');
+  process.exit(1);
+}
+const ADMIN  = process.env.ADMIN_PASS;
+
+// ─── Per-Client Owner Allowlist (for OAuth-gated admin pages) ─────────────────
+// Maps slug → Set of authorized owner emails. Loaded from data/owners.json at
+// startup. Used to gate /auth/admin/start (who can sign in for which client)
+// and isAdminReq (whether a presented signed token's email is authorized).
+import { readFileSync as _ownersRF, existsSync as _ownersEX, writeFileSync as _ownersWF } from 'fs';
+const OWNERS_FILE = (await import('path')).resolve('data/owners.json');
+const owners = new Map();
+function loadOwners() {
+  owners.clear();
+  // 1. Seed from OWNERS_JSON env var (survives Railway container rebuilds even
+  //    if the data/ volume is ephemeral). Optional.
+  if (process.env.OWNERS_JSON) {
+    try {
+      const raw = JSON.parse(process.env.OWNERS_JSON);
+      for (const [slug, emails] of Object.entries(raw)) {
+        if (Array.isArray(emails)) owners.set(slug.toLowerCase(), new Set(emails.map(e => String(e).toLowerCase())));
+      }
+    } catch (e) { console.error('Failed to parse OWNERS_JSON env:', e.message); }
+  }
+  // 2. data/owners.json (committed to repo, ships with deploy). Overrides env
+  //    on a per-slug basis so post-deploy edits via /admin/owners stick.
+  try {
+    if (_ownersEX(OWNERS_FILE)) {
+      const raw = JSON.parse(_ownersRF(OWNERS_FILE, 'utf8'));
+      for (const [slug, emails] of Object.entries(raw)) {
+        if (Array.isArray(emails)) owners.set(slug.toLowerCase(), new Set(emails.map(e => String(e).toLowerCase())));
+      }
+    }
+  } catch (e) { console.error('Failed to load owners.json:', e.message); }
+  console.log(`👥 Loaded owners for ${owners.size} client(s): ${[...owners.keys()].join(', ') || '(none)'}`);
+}
+loadOwners();
+function isOwner(slug, email) {
+  if (!slug || !email) return false;
+  const set = owners.get(String(slug).toLowerCase());
+  return !!(set && set.has(String(email).toLowerCase()));
+}
+
+// Signed-token helpers. Token format: `${email}~${expiry}~${slug}~${sig}` where
+// sig = HMAC-SHA256(ADMIN_PASS, `${email}~${expiry}~${slug}`).
+//   `~` is the separator (URL-safe, never appears in emails / slugs / digits /
+//   base64url, so split('~') always yields exactly 4 parts even when the email
+//   contains dots like `liam@howhighscaffolding.com`).
+// Issued after Google OAuth confirms the user owns the email; verified on every
+// review-admin API call. Stateless — no session storage required.
+function signAdminToken(email, slug, expiry) {
+  const payload = `${email}~${expiry}~${slug}`;
+  const sig = crypto.createHmac('sha256', ADMIN).update(payload).digest('base64url');
+  return `${payload}~${sig}`;
+}
+function verifyAdminToken(token, slugExpected) {
+  if (typeof token !== 'string' || token.length < 20) return null;
+  const parts = token.split('~');
+  if (parts.length !== 4) return null;
+  const [email, expiryStr, slug, sig] = parts;
+  if (slugExpected && slug.toLowerCase() !== slugExpected.toLowerCase()) return null;
+  const expiry = parseInt(expiryStr, 10);
+  if (!expiry || expiry < Date.now()) return null;
+  const expected = crypto.createHmac('sha256', ADMIN)
+    .update(`${email}~${expiry}~${slug}`).digest('base64url');
+  // Constant-time compare to defeat timing attacks
+  const a = Buffer.from(sig); const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  if (!isOwner(slug, email)) return null;
+  return { email, slug, expiry };
+}
+
+// OAuth state token store. Maps short random token → { slug, returnTo, created }.
+// State is round-tripped through Google's `state` param so callbacks can resume
+// the original "where to send the user back" intent. 10 min TTL.
+const adminAuthStates = new Map();
+function makeAdminAuthState(slug, returnTo) {
+  const token = crypto.randomBytes(24).toString('base64url');
+  adminAuthStates.set(token, { slug, returnTo, created: Date.now() });
+  return token;
+}
+function consumeAdminAuthState(token) {
+  const st = adminAuthStates.get(token);
+  if (!st) return null;
+  adminAuthStates.delete(token);
+  if (Date.now() - st.created > 10 * 60 * 1000) return null;
+  return st;
+}
+setInterval(() => {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [t, s] of adminAuthStates) if (s.created < cutoff) adminAuthStates.delete(t);
+}, 5 * 60 * 1000).unref();
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 // origin: true reflects the request's Origin header back, which is required
 // when the client uses credentialed requests (navigator.sendBeacon always does).
 // Wildcard '*' is rejected by browsers in that case.
-const corsOpts = { origin: true, credentials: true, methods: ['GET','POST','DELETE','PUT','OPTIONS','PATCH'] };
+const corsOpts = {
+  origin: true,
+  credentials: true,
+  methods: ['GET','POST','DELETE','PUT','OPTIONS','PATCH'],
+  // Explicit allow-list — required for cross-origin admin auth from client domains
+  // (howhighscaffolding.co.uk → aria-chatbot...railway.app) to send X-Aria-Token.
+  allowedHeaders: ['content-type', 'x-aria-token', 'x-admin-password', 'authorization'],
+};
 app.use(cors(corsOpts));
 app.options('*', cors(corsOpts));
 // Raw body capture for Shopify webhook HMAC verification — must run before express.json()
@@ -3314,6 +3419,39 @@ Example: You are Aria, the assistant for Smith Plumbing — a family plumbing bu
 app.get('/auth/gmail/callback', async (req, res) => {
   const { code, state: rawState, error } = req.query;
 
+  // ── Admin-auth dispatch ────────────────────────────────────────────────────
+  // If state is `{adminAuth: true, t: <state_token>}`, this is a cross-origin
+  // login for a client review page (not a Gmail-token-saving flow). Handle it
+  // here BEFORE the Gmail flow tries to persist tokens for the user.
+  try {
+    const parsed = JSON.parse(rawState);
+    if (parsed && parsed.adminAuth && parsed.t) {
+      if (error) return res.status(400).send(`<h1>Sign-in cancelled</h1><p>${error}</p>`);
+      if (!code) return res.status(400).send('No code received');
+      const st = consumeAdminAuthState(parsed.t);
+      if (!st) return res.status(400).send('<h1>Link expired</h1><p>Sign-in link expired or already used. Go back to the admin page and click "Sign in with Google" again.</p>');
+      const oauthClient = makeOAuthClient();
+      const { tokens } = await oauthClient.getToken(code);
+      oauthClient.setCredentials(tokens);
+      const userInfo = await google.oauth2({ version: 'v2', auth: oauthClient }).userinfo.get();
+      const verifiedEmail = String(userInfo.data.email || '').toLowerCase();
+      if (!verifiedEmail) return res.status(400).send('<h1>Sign-in failed</h1><p>Google did not return your email address.</p>');
+      if (!isOwner(st.slug, verifiedEmail)) {
+        return res.status(403).send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Not authorized</title>
+        <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;color:#eee;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:24px}.box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:40px;max-width:480px;text-align:center}h1{color:#ef4444;margin-top:0}a{color:#60a5fa}</style>
+        </head><body><div class="box"><h1>Not authorized</h1><p><strong>${verifiedEmail}</strong> is not on the owner list for <strong>${st.slug}</strong>.</p><p>If this is your first time, ask the AireyAI team to add your email. Otherwise, sign out of Google and try again with the right account.</p><p><a href="${st.returnTo}">← Back to admin page</a></p></div></body></html>`);
+      }
+      // Issue a 24h signed token and bounce the user back to the original page
+      // with the token in the URL fragment (never sent in HTTP requests, so it
+      // doesn't leak through server logs or the Referer header).
+      const expiry = Date.now() + 24 * 60 * 60 * 1000;
+      const token = signAdminToken(verifiedEmail, st.slug, expiry);
+      const returnUrl = st.returnTo + (st.returnTo.includes('#') ? '&' : '#') + 'aria_token=' + encodeURIComponent(token);
+      console.log(`🔑 Admin sign-in: ${verifiedEmail} for slug=${st.slug}`);
+      return res.redirect(returnUrl);
+    }
+  } catch (_) { /* not admin auth — fall through to Gmail flow */ }
+
   // Parse state — could be JSON { owner, onboard, quickSetup, setupToken } or plain email string
   let ownerEmail = rawState || '';
   let onboardToken = null;
@@ -3464,6 +3602,219 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+// ─── Lead-Router Chat (tool-use) ─────────────────────────────────────────────
+// Same guard rails as /api/chat (rate limit, cost cap, session save) but
+// routes through lib/lead_router.js so Claude can invoke tools to qualify
+// leads, log them, stage WhatsApp pings, and stage calendar bookings.
+// Two-stage approval (CLAUDE.md Rule #12): irreversible tools STAGE to
+// data/pending_actions.jsonl and email the owner a one-click confirm link.
+app.post('/api/chat/router', async (req, res) => {
+  if (!checkRate(req.ip)) return res.status(429).json({ error: 'Rate limited' });
+  if (isOverCap())        return res.status(429).json({ error: 'Monthly message limit reached — please try again next month.' });
+  if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'API key not configured' });
+
+  const { system, messages, model, max_tokens, sessionId, clientConfig = {} } = req.body;
+  if (!messages?.length) return res.status(400).json({ error: 'Invalid messages' });
+
+  try {
+    const lastScore = clientConfig.lastScore ?? 0;
+    const tier = lastScore >= 70 ? 'hot' : lastScore >= 40 ? 'warm' : 'cold';
+    const action = decideLeadAction({
+      score: lastScore,
+      tier,
+      businessType: clientConfig.type,
+      hasContact:   Boolean(clientConfig.capturedEmail || clientConfig.capturedPhone),
+      isOutOfHours: clientConfig.isOutOfHours ?? false,
+    });
+
+    // Per-page enrichment — visitor on /pricing is way more buying-ready
+    // than one on /about. Thread page context into the prompt so Aria knows
+    // where in the funnel this person is.
+    const pageContext = (clientConfig.pageUrl || clientConfig.pageTitle || clientConfig.isOutOfHours)
+      ? '\n\nVISITOR CONTEXT:\n'
+        + (clientConfig.pageTitle ? `- Currently viewing: "${clientConfig.pageTitle}"\n` : '')
+        + (clientConfig.pagePath  ? `- Page path: ${clientConfig.pagePath}\n` : '')
+        + (clientConfig.isOutOfHours ? '- It is currently outside business hours — set expectations about response time.\n' : '')
+      : '';
+
+    const fullPrompt = (system || 'You are a helpful assistant.')
+      + buildBusinessContext()
+      + pageContext
+      + '\n\n' + policyAddendum(action);
+
+    const { reply, toolEvents, warning, stopReason } = await routeChat({
+      claude,
+      messages: messages.slice(-24),
+      systemPrompt: fullPrompt,
+      clientConfig: { ...clientConfig, serverBaseUrl: `${req.protocol}://${req.get('host')}` },
+      sessionId,
+      serverFns: { smartSend, sendWhatsAppMessage },
+      model: model || 'claude-sonnet-4-6',
+      maxTokens: max_tokens || 800,
+    });
+
+    if (warning) console.warn('[aria/router]', warning); // Rule #10 — fail loud
+    if (sessionId) saveSession(sessionId, { messages: messages.slice(-24) });
+
+    // Track the qualify_lead score back to clientConfig so the next turn can
+    // re-evaluate policy with up-to-date info. Widget should persist this.
+    const qualifyEvent = toolEvents.find(e => e.name === 'qualify_lead');
+    const newScore = qualifyEvent?.result?.score ?? lastScore;
+
+    // Dual-shape response: widget reads `data.content[0].text` (Anthropic shape)
+    // unchanged; richer consumers can read `reply`, `toolEvents`, `score`, `action`.
+    res.json({
+      content: [{ type: 'text', text: reply }],
+      reply,
+      toolEvents,
+      score: newScore,
+      stopReason,
+      action,
+    });
+  } catch (e) {
+    console.error('[aria/router] error:', e.message);
+    res.status(500).json({ error: 'AI error' });
+  }
+});
+
+// ─── Streaming variant of /api/chat/router (SSE) ─────────────────────────────
+// Same policy and tool-use loop as /api/chat/router but emits text deltas as
+// they arrive from Anthropic. Tool dispatches happen invisibly between turns
+// — visitor sees continuous text output instead of a long pause.
+//
+// SSE event format matches /api/chat/stream so the widget's streamResponse
+// handler can consume it unchanged: {text: t} deltas, optional {tool: name},
+// final {done, score, toolEvents, stopReason}, then literal "[DONE]".
+app.post('/api/chat/router/stream', async (req, res) => {
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection',    'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  const sse = d => { res.write(`data: ${typeof d === 'string' ? d : JSON.stringify(d)}\n\n`); if (typeof res.flush === 'function') res.flush(); };
+
+  if (!checkRate(req.ip)) { sse({ error: 'Rate limited' }); return res.end(); }
+  if (isOverCap())        { sse({ error: 'Monthly message limit reached — please try again next month.' }); return res.end(); }
+  if (!process.env.ANTHROPIC_API_KEY) { sse({ error: 'API key not configured' }); return res.end(); }
+
+  const { system, messages, model, max_tokens, sessionId, clientConfig = {} } = req.body;
+  if (!messages?.length) { sse({ error: 'Invalid messages' }); return res.end(); }
+
+  // res.on('close') — fires on actual client disconnect. NOT req.on('close')
+  // which in Node 24+ fires the moment express.json() finishes consuming the
+  // body, killing every SSE write before the model even responds.
+  let aborted = false;
+  res.on('close', () => { aborted = true; });
+
+  try {
+    const lastScore = clientConfig.lastScore ?? 0;
+    const tier = lastScore >= 70 ? 'hot' : lastScore >= 40 ? 'warm' : 'cold';
+    const action = decideLeadAction({
+      score: lastScore,
+      tier,
+      businessType: clientConfig.type,
+      hasContact:   Boolean(clientConfig.capturedEmail || clientConfig.capturedPhone),
+      isOutOfHours: clientConfig.isOutOfHours ?? false,
+    });
+
+    const pageContext = (clientConfig.pageUrl || clientConfig.pageTitle || clientConfig.isOutOfHours)
+      ? '\n\nVISITOR CONTEXT:\n'
+        + (clientConfig.pageTitle ? `- Currently viewing: "${clientConfig.pageTitle}"\n` : '')
+        + (clientConfig.pagePath  ? `- Page path: ${clientConfig.pagePath}\n` : '')
+        + (clientConfig.isOutOfHours ? '- It is currently outside business hours — set expectations about response time.\n' : '')
+      : '';
+
+    const fullPrompt = (system || 'You are a helpful assistant.')
+      + buildBusinessContext()
+      + pageContext
+      + '\n\n' + policyAddendum(action);
+
+    const { streamRouteChat } = await import('./lib/lead_router_stream.js');
+    const { stopReason, toolEvents, score, warning } = await streamRouteChat({
+      claude,
+      messages: messages.slice(-24),
+      systemPrompt: fullPrompt,
+      clientConfig: { ...clientConfig, serverBaseUrl: `${req.protocol}://${req.get('host')}` },
+      sessionId,
+      serverFns: { smartSend, sendWhatsAppMessage },
+      onTextDelta: t => { if (!aborted) sse({ text: t }); },
+      onToolEvent: e => { if (!aborted) sse({ tool: e.name, result: e.result }); },
+      model: model || 'claude-sonnet-4-6',
+      maxTokens: max_tokens || 800,
+    });
+
+    if (warning) console.warn('[aria/router-stream]', warning);
+    if (sessionId) saveSession(sessionId, { messages: messages.slice(-24) });
+
+    if (!aborted) {
+      sse({ done: true, score, toolEvents, stopReason, action });
+      sse('[DONE]');
+      res.end();
+    }
+  } catch (e) {
+    console.error('[aria/router-stream] error:', e.message);
+    if (!aborted) { sse({ error: 'AI error' }); res.end(); }
+  }
+});
+
+// ─── Pending action confirmation (two-stage approval for irreversible ops) ──
+// Owner gets emailed a link like /api/pending/confirm?id=<id>&token=<t>
+// which executes the staged WhatsApp send or calendar booking.
+app.get('/api/pending/confirm', async (req, res) => {
+  const { id, token } = req.query;
+  if (!id || !token) return res.status(400).send('Missing id or token');
+
+  let rows;
+  try {
+    const raw = await fsp.readFile(resolve('data', 'pending_actions.jsonl'), 'utf8');
+    rows = raw.trim().split('\n').filter(Boolean).map(JSON.parse);
+  } catch {
+    return res.status(404).send('No pending actions');
+  }
+
+  // Append-only log: an entry is "live" if its id has no later row with executed_at set.
+  const matches = rows.filter(r => r.id === id);
+  if (!matches.length) return res.status(403).send('Invalid or expired link');
+  const row = matches[0];
+  if (row.token !== token) return res.status(403).send('Invalid token');
+  if (matches.some(r => r.executed_at)) return res.send('Already actioned.');
+
+  try {
+    if (row.kind === 'send_whatsapp_to_owner') {
+      const wa = row.payload;
+      const ownerWa = row.owner?.handoffWa;
+      if (!ownerWa) {
+        console.error('[aria/pending] cannot send — no handoffWa on staged row', row.id);
+        return res.status(500).send('No WhatsApp number configured for this client');
+      }
+      await sendWhatsAppMessage({}, ownerWa,
+        `New lead from your site (Aria):\n\n${wa.summary}\n\nCallback: ${wa.callback_number}\nUrgency: ${wa.urgency}`);
+    } else if (row.kind === 'book_calendar_slot') {
+      // Each client's calendar auth is per-account — full calendar.events.insert
+      // wiring is a follow-up. For now: email the owner with the booking details
+      // so they confirm by hand. Visitor was told "we'll confirm within 1 hour".
+      const b = row.payload;
+      const ownerEmail = row.owner?.handoffEmail || process.env.NOTIFY_EMAIL;
+      if (ownerEmail) {
+        await smartSend({
+          ownerEmail, to: ownerEmail,
+          subject: `Aria booking request — ${b.visitor_name}`,
+          html: `<p>Tentative booking:</p><pre>${JSON.stringify(b, null, 2)}</pre>`
+        });
+      }
+    } else {
+      return res.status(400).send(`Unknown pending kind: ${row.kind}`);
+    }
+
+    await fsp.appendFile(resolve('data', 'pending_actions.jsonl'),
+      JSON.stringify({ ...row, executed_at: new Date().toISOString() }) + '\n');
+    res.send('Done — Aria has sent it.');
+  } catch (e) {
+    console.error('[aria/pending] execute failed:', e.message);
+    res.status(500).send('Execute failed: ' + e.message);
+  }
+});
+
 app.post('/api/chat/stream', async (req, res) => {
   res.setHeader('Content-Type',  'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -3476,8 +3827,11 @@ app.post('/api/chat/stream', async (req, res) => {
   if (!process.env.ANTHROPIC_API_KEY) { sse({ error:'API key not configured — add ANTHROPIC_API_KEY to your .env file' }); return res.end(); }
   const { system, messages, model, max_tokens, sessionId } = req.body;
   if (!messages?.length) { sse({ error:'Invalid' }); return res.end(); }
+  // res.on('close') — Node 24+ emits req 'close' when the body stream is
+  // consumed (right after express.json()), which would falsely flag aborted=true
+  // before any text deltas fire. res 'close' fires only on actual disconnect.
   let aborted = false;
-  req.on('close', () => { aborted = true; });
+  res.on('close', () => { aborted = true; });
   try {
     const stream = claude.messages.stream({
       model:      model || 'claude-haiku-4-5-20251001',
@@ -3485,7 +3839,7 @@ app.post('/api/chat/stream', async (req, res) => {
       system:     (system || 'You are a helpful assistant.') + buildBusinessContext(),
       messages:   messages.slice(-24),
     });
-    req.on('close', () => { try { stream.abort(); } catch {} });
+    res.on('close', () => { try { stream.abort(); } catch {} });
     stream.on('text', t => { if (!aborted) sse({ text: t }); });
     stream.on('finalMessage', msg => {
       trackUsage(msg.usage?.input_tokens || 0, msg.usage?.output_tokens || 0);
@@ -4083,12 +4437,24 @@ function sanitiseText(s, max = 2000) {
 }
 
 function isAdminReq(req, slug) {
+  // 1. New: HMAC-signed token from Google-OAuth admin sign-in (preferred path).
+  //    No shared secret on the client; email is verified against owners.json.
+  const ariaToken = req.get('X-Aria-Token') || req.query.aria_token;
+  if (ariaToken && verifyAdminToken(String(ariaToken), slug)) return true;
+
+  // 2. Legacy: shared `X-Admin-Password` header / `?adminPass=` query.
+  //    Kept working during OAuth rollout so non-migrated clients aren't broken.
+  //    A console warning fires so we can see in logs which slugs still depend
+  //    on the password path and need migrating.
   const expected = adminPassForSlug(slug);
   const header = req.get('X-Admin-Password');
   const query  = req.query.adminPass;
-  // Accept per-client password OR the global master (so Kyle has a backdoor)
   const accept = v => v && (v === expected || v === REVIEWS_MASTER_PASS);
-  return accept(header) || accept(query);
+  if (accept(header) || accept(query)) {
+    console.warn(`⚠️  Legacy X-Admin-Password used for slug=${slug} — migrate to OAuth (data/owners.json)`);
+    return true;
+  }
+  return false;
 }
 
 // GET — list reviews for a client. ?all=1 (+ admin header) returns pending/rejected too.
@@ -5239,6 +5605,74 @@ app.get('/admin/data', (req, res) => {
   const topGaps = Object.entries(gapFreq).sort((a,b)=>b[1]-a[1]).slice(0,30).map(([q,count])=>({ question:q, count, ts: gaps.find(g=>g.question.toLowerCase().slice(0,80)===q)?.ts }));
   res.json({ sessions:all, faqs:Array.from(faqs.values()), bookings, handoffs:activeHandoffs, npsScores, abResults, topWords, allLeads:allLeadsWithStatus, hotLeads:hotLeadsWithStatus, topObjections:topObj, gaps:topGaps,
     stats:{ total:all.length, today:todayS.length, leads:allLeads.length, leadsToday:todayLeads.length, avgRating, npsAvg, bookings:bookings.length, hotLeads:hotLeads.length, activeHandoffs:activeHandoffs.length, gaps:gaps.length } });
+});
+
+// ─── Admin OAuth (cross-origin, cookie-less) ─────────────────────────────────
+// Browser flow:
+//   1. Client admin page hits /auth/admin/start?slug=X&return_to=Y
+//   2. Server stashes {slug, returnTo} keyed by random state token, redirects
+//      to Google OAuth with minimum scope (just userinfo.email).
+//   3. Google bounces back to /auth/gmail/callback (existing endpoint), which
+//      detects the admin-auth state, verifies email is in owners.json[slug],
+//      issues a 24h HMAC-signed token, redirects user to
+//      `${return_to}#aria_token=<token>`.
+//   4. Admin page reads the token from location.hash, stores in sessionStorage,
+//      sends as `X-Aria-Token` header on every API call.
+app.get('/auth/admin/start', (req, res) => {
+  const { slug, return_to } = req.query;
+  if (!slug) return res.status(400).send('slug query param required');
+  if (!owners.has(String(slug).toLowerCase())) {
+    return res.status(404).send(`<h1>Unknown client</h1><p>No owners registered for slug "<code>${slug}</code>". Add them to <code>data/owners.json</code> on the Aria server.</p>`);
+  }
+  const returnTo = String(return_to || '/');
+  // Reject open redirects — return_to must be http(s) and not protocol-relative.
+  if (!/^https?:\/\//i.test(returnTo)) return res.status(400).send('return_to must be an absolute http(s) URL');
+  const stateToken = makeAdminAuthState(slug, returnTo);
+  const oauthClient = makeOAuthClient();
+  const url = oauthClient.generateAuthUrl({
+    access_type: 'online',          // login only — no refresh token needed
+    prompt: 'select_account',       // always show account chooser (avoids silent wrong-account auth)
+    scope: [
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile',
+    ],
+    state: JSON.stringify({ adminAuth: true, t: stateToken }),
+  });
+  res.redirect(url);
+});
+
+// Verifies the X-Aria-Token header and returns the signed-in email + slug.
+// Admin pages call this on load to decide whether to show the UI or the
+// "Sign in with Google" button.
+app.get('/auth/admin/whoami', (req, res) => {
+  const { slug } = req.query;
+  const token = req.get('X-Aria-Token') || '';
+  if (!slug) return res.status(400).json({ error: 'slug query param required' });
+  const verified = verifyAdminToken(token, String(slug));
+  if (!verified) return res.status(401).json({ error: 'not authenticated' });
+  res.json({ email: verified.email, slug: verified.slug, expiresAt: verified.expiry });
+});
+
+// Owner management (for adding new clients/owners post-install).
+app.get('/admin/owners', (req, res) => {
+  if (req.query.pass !== ADMIN) return res.status(403).json({ error: 'Unauthorised' });
+  const out = {};
+  for (const [slug, set] of owners) out[slug] = [...set];
+  res.json({ owners: out });
+});
+app.post('/admin/owners', (req, res) => {
+  if (req.query.pass !== ADMIN) return res.status(403).json({ error: 'Unauthorised' });
+  const { slug, emails } = req.body || {};
+  if (!slug || !Array.isArray(emails)) return res.status(400).json({ error: 'slug and emails[] required' });
+  const cleanSlug = String(slug).toLowerCase().trim();
+  const cleanEmails = emails.map(e => String(e).toLowerCase().trim()).filter(Boolean);
+  owners.set(cleanSlug, new Set(cleanEmails));
+  // Persist
+  const obj = {};
+  for (const [s, set] of owners) obj[s] = [...set];
+  _ownersWF(OWNERS_FILE, JSON.stringify(obj, null, 2));
+  console.log(`👥 Owners updated for slug=${cleanSlug}: ${cleanEmails.join(', ')}`);
+  res.json({ ok: true, slug: cleanSlug, emails: cleanEmails });
 });
 
 // ─── Invite system ───────────────────────────────────────────────────────────

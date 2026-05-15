@@ -186,6 +186,11 @@
     contactEmail:    _a('contactEmail', ''),       // contact email (defaults to ownerEmail)
     whatsapp:        _a('whatsapp',     ''),       // WhatsApp number for contact card
     upsells:         _j('upsells',      []),       // [{trigger:"Haircut",offer:"Beard Trim",price:"£5",desc:"Quick 5-min add-on"}]
+
+    // Opt-in tool-use lead router. Default keeps every existing site on the
+    // proven /api/chat path. Set data-endpoint="/api/chat/router" per-client
+    // to flip that client onto the qualifier + handler pipeline.
+    endpoint:        _a('endpoint',     '/api/chat'),
   };
 
   // Apply business type preset (any explicit data-* overrides the preset)
@@ -193,8 +198,10 @@
   if (!_s?.dataset?.quickReplies) CONFIG.quickReplies = _preset.quickReplies;
 
   const BASE        = CONFIG.serverUrl || window.location.origin;
-  const PROXY_URL   = BASE + '/api/chat';
-  const STREAM_URL  = BASE + '/api/chat/stream';
+  const PROXY_URL   = BASE + CONFIG.endpoint;
+  // STREAM_URL derives from endpoint — /api/chat → /api/chat/stream,
+  // /api/chat/router → /api/chat/router/stream. Both server-side routes exist.
+  const STREAM_URL  = BASE + CONFIG.endpoint + '/stream';
   const SESSION_URL = BASE + '/api/session';
   const LEAD_URL    = BASE + '/api/lead';
   const BOOK_URL    = BASE + '/api/booking';
@@ -215,6 +222,55 @@
     if (!id) { id = Date.now().toString(36) + Math.random().toString(36).slice(2); sessionStorage.setItem(k, id); }
     return id;
   })();
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // clientConfig payload — sent on every /api/chat/router request so the
+  // server can run policy decisions (lead_policy.js) with up-to-date context.
+  // Only included when the router endpoint is in use; legacy /api/chat
+  // ignores unknown body fields so we send it unconditionally.
+  // ───────────────────────────────────────────────────────────────────────────
+  const SCORE_KEY = '_ac_lastScore';
+  function buildClientConfig() {
+    // Compute isOutOfHours from CONFIG.businessHours (optional data-businessHours
+    // JSON e.g. {"open":"09:00","close":"18:00","timezone":"Europe/London"}).
+    let isOutOfHours = false;
+    try {
+      const bh = CONFIG.businessHours;
+      if (bh && bh.open && bh.close) {
+        const now = new Date();
+        const hhmm = now.toTimeString().slice(0, 5);
+        isOutOfHours = hhmm < bh.open || hhmm >= bh.close;
+      }
+    } catch {}
+
+    const lastScore = parseInt(sessionStorage.getItem(SCORE_KEY) || '0', 10) || 0;
+
+    return {
+      slug:           CONFIG.siteName || (location.hostname || '').replace(/\./g, '-'),
+      type:           CONFIG.businessType,
+      handoffEmail:   CONFIG.ownerEmail,
+      handoffWa:      CONFIG.whatsapp,
+      handoffUrl:     CONFIG.bookingUrl,
+      canned:         CONFIG.cannedAnswers || {},
+      calendarConnected: !!CONFIG.calendarConnected,
+      lastScore,
+      isOutOfHours,
+      // Per-page context — server appends these to the system prompt so Aria
+      // knows which page the visitor is on (pricing page = high-intent signal).
+      pageUrl:        location.href,
+      pageTitle:      document.title,
+      pagePath:       location.pathname,
+    };
+  }
+
+  // Called on every router response to persist the qualify_lead score so the
+  // NEXT turn's policy decision uses an up-to-date score instead of resetting
+  // to 0 each turn.
+  function persistRouterScore(responseData) {
+    if (responseData && typeof responseData.score === 'number') {
+      try { sessionStorage.setItem(SCORE_KEY, String(responseData.score)); } catch {}
+    }
+  }
 
   // =====================================================
   //  SOUND ENGINE
@@ -2332,7 +2388,12 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     try {
       const res = await fetch(STREAM_URL, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ system: buildSystemPrompt(), messages, model, max_tokens: maxTokens, sessionId: SESSION_ID }),
+        body: JSON.stringify({
+          system: buildSystemPrompt(),
+          messages, model, max_tokens: maxTokens,
+          sessionId: SESSION_ID,
+          clientConfig: buildClientConfig(),
+        }),
       });
       if (!res.ok) throw new Error();
       const reader = res.body.getReader(), decoder = new TextDecoder();
@@ -2347,6 +2408,9 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
           try {
             const c = JSON.parse(raw); if (c.error) throw new Error(c.error);
             if (c.text) { fullText += c.text; bubble.textContent = fullText.replace(/\nFOLLOWUPS:.*$/m,''); scrollBottom(); }
+            // Router stream emits a final {done, score, ...} frame — persist the
+            // score so next turn's policy decision uses an up-to-date value.
+            if (c.done) persistRouterScore(c);
           } catch (e) { if (e.message && !e.message.includes('JSON')) throw e; }
         }
       }
@@ -2358,10 +2422,17 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
   async function standardResponse(messages, model, maxTokens = 500) {
     const res = await fetch(PROXY_URL, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ system: buildSystemPrompt(), messages, model, max_tokens: maxTokens, sessionId: SESSION_ID }),
+      body: JSON.stringify({
+        system: buildSystemPrompt(),
+        messages, model, max_tokens: maxTokens,
+        sessionId: SESSION_ID,
+        clientConfig: buildClientConfig(),
+      }),
     });
     if (!res.ok) throw new Error();
-    const data = await res.json(); return data.content[0].text;
+    const data = await res.json();
+    persistRouterScore(data); // no-op on legacy /api/chat (no score field)
+    return data.content[0].text;
   }
 
   // =====================================================
