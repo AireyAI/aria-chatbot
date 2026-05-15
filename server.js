@@ -3618,7 +3618,12 @@ app.post('/api/onboard/scan', async (req, res) => {
 
   try {
     const { fetchSiteContent, extractBusinessProfile, generateSystemPrompt,
-            createPreviewSession, generateEmbedSnippet } = await import('./lib/onboarding.js');
+            createPreviewSession, generateEmbedSnippet, validateScanUrl } = await import('./lib/onboarding.js');
+
+    // Validate URL up-front so SSRF + format errors return 400 with the
+    // actual reason instead of being masked as a generic 500.
+    const urlErr = validateScanUrl(url);
+    if (urlErr) return res.status(400).json({ error: urlErr });
 
     const content = await fetchSiteContent(url);
     const profile = await extractBusinessProfile(claude, content);
@@ -3639,6 +3644,49 @@ app.post('/api/onboard/scan', async (req, res) => {
   } catch (e) {
     console.error('[onboard/scan]', e.message);
     res.status(500).json({ error: e.message?.startsWith('Site') ? e.message : 'Scan failed — check the URL is reachable.' });
+  }
+});
+
+// POST /api/onboard/install { previewToken, email, siteUrl } →
+// finalises onboarding: allowlists the visitor's domain on Aria's server,
+// emails them the install snippet. This is the "go live" step after preview.
+//
+// Phase 2 will add a Stripe Checkout gate before this route. For now it's
+// open (free tier) so we can prove the funnel converts.
+app.post('/api/onboard/install', async (req, res) => {
+  if (!checkRate(req.ip)) return res.status(429).json({ error: 'Rate limited' });
+  const { previewToken, email, siteUrl } = req.body || {};
+  if (!previewToken || !email || !siteUrl) return res.status(400).json({ error: 'previewToken, email, and siteUrl required' });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Invalid email address' });
+
+  try {
+    const { getPreviewSession, autoAllowlistDomain, emailInstallSnippet, generateEmbedSnippet } = await import('./lib/onboarding.js');
+    const session = await getPreviewSession(previewToken);
+    if (!session) return res.status(404).json({ error: 'Preview expired — generate a new one at /start' });
+
+    const u = new URL(siteUrl);
+    const serverBaseUrl = `${req.protocol}://${req.get('host')}`;
+    const snippet = generateEmbedSnippet({ profile: session.profile, prompt: session.prompt, serverBaseUrl });
+
+    // Step 1: allowlist their domain (so widget requests stop being 403'd)
+    const allowlist = await autoAllowlistDomain(u.hostname, serverBaseUrl);
+    // Step 2: email them the snippet (fire-and-forget — email latency must not block UX)
+    emailInstallSnippet({
+      smartSend, toEmail: email,
+      businessName: session.profile.businessName,
+      snippet,
+      previewUrl: `${serverBaseUrl}/preview/${previewToken}`,
+    }).catch(e => console.error('[onboard/install] email failed:', e?.message));
+
+    res.json({
+      ok: true,
+      message: 'Domain allowlisted. Check your email for the install snippet.',
+      domainAllowlisted: allowlist.ok,
+      snippet, // also return inline so the page can show it immediately
+    });
+  } catch (e) {
+    console.error('[onboard/install]', e.message);
+    res.status(500).json({ error: 'Install failed — try again or contact support.' });
   }
 });
 
@@ -3691,11 +3739,50 @@ app.get('/preview/:token', async (req, res) => {
 });
 
 // GET /start → the onboarding landing page where visitors paste their URL.
-app.get('/start', (req, res) => {
+// Niche-tuned headlines that swap onto the generic /start page based on
+// /start/:niche path. Same flow, but the hero + feature copy speaks
+// directly to the niche so SEO + paid landing pages convert better.
+const NICHE_COPY = {
+  trades:     { hero: 'Install Aria on your trades website in <span class="accent">60 seconds</span>',
+                sub: 'Stop losing leads to voicemail. Aria qualifies every visitor, captures their name + number, and WhatsApps you the hot ones.',
+                niche: 'Trades' },
+  roofers:    { hero: '<span class="accent">Never miss</span> a roofing quote again',
+                sub: 'Aria handles your inbox 24/7. Captures the visitor\'s name, address, and what work they need — texts you the qualified leads in real time.',
+                niche: 'Roofers' },
+  salons:     { hero: 'Aria takes salon bookings while you do <span class="accent">lashes</span>',
+                sub: 'Visitors book themselves while you\'re mid-treatment. Aria knows your services, captures contact details, and emails you a daily roundup.',
+                niche: 'Salons' },
+  restaurants:{ hero: 'Aria takes <span class="accent">reservations</span> on your website',
+                sub: 'Two-stage approval — Aria captures the booking, you confirm. Never an embarrassing double-book or 9pm "are you open?" question missed.',
+                niche: 'Restaurants' },
+  gyms:       { hero: 'Aria sells <span class="accent">memberships</span> while the gym is closed',
+                sub: 'After-hours visitors get tour bookings and price quotes without you lifting a finger.',
+                niche: 'Gyms' },
+  clinics:    { hero: 'Aria triages enquiries <span class="accent">24/7</span>',
+                sub: 'Booking requests, prescription questions, hours — captured and queued for your team. HIPAA-safe handoff.',
+                niche: 'Clinics' },
+};
+
+app.get(['/start', '/start/:niche'], (req, res) => {
+  const copy = NICHE_COPY[req.params?.niche] || {
+    hero: 'Install Aria on your site in <span class="accent">60 seconds</span>',
+    sub: 'Paste your website URL. Aria will read it, learn your business, and show you a working AI chatbot configured for you — before you sign up.',
+    niche: null,
+  };
+  // Inject into the render below — see the next edit which swaps the static H1.
+  res.locals = { ...res.locals, copy };
+  return renderStartPage(res, copy);
+});
+
+function renderStartPage(res, copy) {
   res.send(`<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Aria — install on your site in 60 seconds</title>
+<title>${copy.niche ? `Aria — AI chatbot for ${copy.niche}` : 'Aria — install on your site in 60 seconds'}</title>
+<meta name="description" content="Aria is a 60-second-install AI chatbot${copy.niche ? ` built for ${copy.niche.toLowerCase()}` : ''}. Auto-qualifies leads, captures contact details, hands off to WhatsApp. No card required to try.">
+<meta property="og:title" content="Aria — ${copy.niche ? `AI chatbot for ${copy.niche}` : 'install on your site in 60 seconds'}">
+<meta property="og:description" content="Paste your URL → see Aria configured for your business → install in 60 seconds. No card.">
+<meta property="og:type" content="website">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, system-ui, sans-serif; background: #fff; color: #1a202c; }
@@ -3728,8 +3815,8 @@ app.get('/start', (req, res) => {
 </style></head>
 <body>
 <div class="wrap">
-  <h1>Install Aria on your site in <span class="accent">60 seconds</span></h1>
-  <p class="sub">Paste your website URL. Aria will read it, learn your business, and show you a working AI chatbot configured for you — before you sign up.</p>
+  <h1>${copy.hero}</h1>
+  <p class="sub">${copy.sub}</p>
 
   <div class="form">
     <input id="url" type="url" placeholder="https://your-website.com" autocomplete="off" autofocus>
@@ -3745,10 +3832,21 @@ app.get('/start', (req, res) => {
   </div>
 
   <div class="result" id="result">
-    <p class="step">Step 1 of 2 — live preview</p>
+    <p class="step">Step 1 of 3 — live preview</p>
     <h2 style="font-size:24px;margin-bottom:16px">Here's Aria on your site:</h2>
     <iframe id="preview"></iframe>
-    <p class="step" style="margin-top:32px">Step 2 of 2 — install</p>
+
+    <p class="step" style="margin-top:48px">Step 2 of 3 — allowlist your domain</p>
+    <h2 style="font-size:24px;margin-bottom:8px">Tell us where to send the install code:</h2>
+    <p style="color:#4a5568;margin-bottom:16px">We'll allowlist your domain on our server and email you the snippet. Free to install — no card required.</p>
+    <div class="form" style="margin-bottom:0">
+      <input id="email" type="email" placeholder="you@your-business.com" autocomplete="email">
+      <button id="install" onclick="install()">Email me the snippet →</button>
+    </div>
+    <p class="error" id="installErr"></p>
+    <p class="hint" id="installOk" style="display:none;color:#16a34a;font-weight:600"></p>
+
+    <p class="step" style="margin-top:48px">Step 3 of 3 — paste &amp; ship</p>
     <h2 style="font-size:24px;margin-bottom:16px">Paste this before <code style="background:#f7fafc;padding:2px 6px;border-radius:4px">&lt;/body&gt;</code> on every page:</h2>
     <pre class="snippet" id="snippet"></pre>
     <button class="copy" onclick="copySnippet()">Copy to clipboard</button>
@@ -3772,6 +3870,8 @@ async function scan() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Scan failed');
 
+    _currentPreviewToken = data.previewToken;
+    _currentSiteUrl = url;
     document.getElementById('preview').src = data.previewUrl;
     document.getElementById('snippet').textContent = data.snippet;
     document.getElementById('result').classList.add('show');
@@ -3787,12 +3887,46 @@ function copySnippet() {
   event.target.textContent = '✓ Copied';
   setTimeout(() => event.target.textContent = 'Copy to clipboard', 1500);
 }
+let _currentPreviewToken = null, _currentSiteUrl = null;
+async function install() {
+  const email = document.getElementById('email').value.trim();
+  const btn = document.getElementById('install');
+  const err = document.getElementById('installErr');
+  const okMsg = document.getElementById('installOk');
+  err.textContent = ''; okMsg.style.display = 'none';
+  if (!email) { err.textContent = 'Add your email so we can send the snippet.'; return; }
+  btn.disabled = true; btn.textContent = 'Allowlisting your domain…';
+  try {
+    const res = await fetch('/api/onboard/install', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ previewToken: _currentPreviewToken, email, siteUrl: _currentSiteUrl }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Install failed');
+    okMsg.textContent = '✓ ' + data.message;
+    okMsg.style.display = 'block';
+  } catch (e) {
+    err.textContent = e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Email me the snippet →';
+  }
+}
 document.getElementById('url').addEventListener('keydown', e => {
   if (e.key === 'Enter') scan();
 });
+document.getElementById('email').addEventListener('keydown', e => {
+  if (e.key === 'Enter') install();
+});
+// Auto-fill URL from ?url= query param (for SEO landing pages / referrals)
+const urlParam = new URLSearchParams(location.search).get('url');
+if (urlParam) {
+  document.getElementById('url').value = urlParam;
+  // Auto-scan after a short delay so the page renders first
+  setTimeout(scan, 400);
+}
 </script>
 </body></html>`);
-});
+}
 
 // ─── Lead-Router Chat (tool-use) ─────────────────────────────────────────────
 // Same guard rails as /api/chat (rate limit, cost cap, session save) but
