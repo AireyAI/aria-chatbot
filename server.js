@@ -5799,6 +5799,117 @@ app.patch('/admin/lead/:email/status', (req, res) => {
 });
 
 // ─── Usage & Settings ─────────────────────────────────────────────────────────
+// ─── Agency Dashboard — per-client lead stats (internal tool for Kyle) ───────
+// Reads data/leads.jsonl, groups by `client` field, returns per-client roll-up
+// of leads_total / leads_7d / leads_30d / hot_rate / last_lead. Powers the
+// HTML view at /admin/clients.html. Gated by ?pass=<ADMIN_PASS>.
+app.get('/admin/clients', async (req, res) => {
+  if (req.query.pass !== ADMIN) return res.status(403).json({ error: 'Unauthorised' });
+  try {
+    let leads = [];
+    try {
+      const raw = await fsp.readFile(resolve('data', 'leads.jsonl'), 'utf8');
+      leads = raw.trim().split('\n').filter(Boolean).map(JSON.parse);
+    } catch { /* no leads yet */ }
+
+    const now = Date.now();
+    const D7 = 7 * 86400_000, D30 = 30 * 86400_000;
+    const byClient = new Map();
+    for (const lead of leads) {
+      const slug = lead.client || 'unknown';
+      const t = new Date(lead.ts).getTime();
+      if (!byClient.has(slug)) byClient.set(slug, { client: slug, total: 0, last7: 0, last30: 0, hot: 0, last_ts: null });
+      const row = byClient.get(slug);
+      row.total += 1;
+      if (now - t <= D7)  row.last7 += 1;
+      if (now - t <= D30) row.last30 += 1;
+      if ((lead.qualification_score ?? 0) >= 70) row.hot += 1;
+      if (!row.last_ts || t > row.last_ts) row.last_ts = t;
+    }
+    const clients = [...byClient.values()]
+      .map(r => ({ ...r, hot_rate: r.total ? +(r.hot / r.total).toFixed(2) : 0, last_lead: r.last_ts ? new Date(r.last_ts).toISOString() : null }))
+      .sort((a, b) => (b.last_ts || 0) - (a.last_ts || 0));
+
+    res.json({ leads_total: leads.length, clients_count: clients.length, clients });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// HTML view of the same — easier for Kyle to glance at on his phone.
+app.get('/admin/clients.html', async (req, res) => {
+  if (req.query.pass !== ADMIN) return res.status(403).send('<h1>Unauthorised</h1>');
+  try {
+    let leads = [];
+    try {
+      const raw = await fsp.readFile(resolve('data', 'leads.jsonl'), 'utf8');
+      leads = raw.trim().split('\n').filter(Boolean).map(JSON.parse);
+    } catch {}
+    const now = Date.now();
+    const D7 = 7 * 86400_000, D30 = 30 * 86400_000;
+    const byClient = new Map();
+    for (const lead of leads) {
+      const slug = lead.client || 'unknown';
+      const t = new Date(lead.ts).getTime();
+      if (!byClient.has(slug)) byClient.set(slug, { client: slug, total: 0, last7: 0, last30: 0, hot: 0, last_ts: null });
+      const r = byClient.get(slug);
+      r.total += 1;
+      if (now - t <= D7)  r.last7 += 1;
+      if (now - t <= D30) r.last30 += 1;
+      if ((lead.qualification_score ?? 0) >= 70) r.hot += 1;
+      if (!r.last_ts || t > r.last_ts) r.last_ts = t;
+    }
+    const rows = [...byClient.values()].sort((a, b) => (b.last_ts || 0) - (a.last_ts || 0));
+    const totalRevenue = rows.length * 29; // illustrative — if every client paid £29/mo
+    res.send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aria — Agency Dashboard</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; background: #f7fafc; color: #1a202c; margin: 0; padding: 24px; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 28px; margin: 0 0 4px; }
+  .sub { color: #4a5568; margin-bottom: 24px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .stat { background: white; padding: 16px 20px; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  .stat .v { font-size: 28px; font-weight: 700; }
+  .stat .l { font-size: 12px; color: #718096; text-transform: uppercase; letter-spacing: 0.5px; }
+  table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  th { background: #edf2f7; text-align: left; padding: 12px 16px; font-size: 12px; color: #4a5568; text-transform: uppercase; letter-spacing: 0.5px; }
+  td { padding: 12px 16px; border-top: 1px solid #f1f5f9; font-size: 14px; }
+  tr:hover td { background: #fafafa; }
+  .hot { background: #fee2e2; color: #991b1b; padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 600; }
+  .empty { padding: 60px; text-align: center; color: #718096; }
+  .empty a { color: #6366f1; }
+</style></head>
+<body><div class="wrap">
+  <h1>Agency Dashboard</h1>
+  <p class="sub">Lead capture across all Aria-bundled client sites. Refresh to update.</p>
+  <div class="stats">
+    <div class="stat"><div class="v">${rows.length}</div><div class="l">Active clients</div></div>
+    <div class="stat"><div class="v">${leads.length}</div><div class="l">Total leads captured</div></div>
+    <div class="stat"><div class="v">${rows.reduce((s,r)=>s+r.last7,0)}</div><div class="l">Leads (last 7d)</div></div>
+    <div class="stat"><div class="v">£${totalRevenue}</div><div class="l">MRR at £29/client</div></div>
+  </div>
+  ${rows.length === 0 ? '<div class="empty">No leads captured yet. Bundle Aria on a client site and wait for the first chat. <br><br><a href="/start">/start</a> to try it yourself.</div>' : `
+  <table>
+    <thead><tr><th>Client</th><th>Total</th><th>30d</th><th>7d</th><th>Hot rate</th><th>Last lead</th></tr></thead>
+    <tbody>
+      ${rows.map(r => `<tr>
+        <td><strong>${r.client}</strong></td>
+        <td>${r.total}</td>
+        <td>${r.last30}</td>
+        <td>${r.last7}</td>
+        <td>${r.hot > 0 ? `<span class="hot">${Math.round(r.hot/r.total*100)}% hot</span>` : '—'}</td>
+        <td style="color:#718096">${r.last_ts ? new Date(r.last_ts).toLocaleString('en-GB') : '—'}</td>
+      </tr>`).join('')}
+    </tbody>
+  </table>`}
+</div></body></html>`);
+  } catch (e) {
+    res.status(500).send('<h1>Error</h1><pre>' + e.message + '</pre>');
+  }
+});
+
 // ─── Admin Domain Whitelist Endpoints ─────────────────────────────────────────
 app.get('/admin/domains', (req, res) => {
   if (req.query.pass !== ADMIN) return res.status(403).json({ error: 'Unauthorised' });
