@@ -48,6 +48,11 @@ import { routeChat }                    from './lib/lead_router.js';
 import { decideLeadAction, policyAddendum } from './lib/lead_policy.js';
 
 const app    = express();
+// Railway terminates TLS at its edge proxy and forwards X-Forwarded-Proto.
+// Without trust proxy, req.protocol reports the inner http:// and any URLs
+// we generate (preview links, embed snippets) come back as http://. Trust
+// the proxy so generated URLs use the real public https:// scheme.
+app.set('trust proxy', true);
 const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 // ADMIN_PASS is required. The historical fallback 'aria-admin' was retired
 // 2026-05-14 — having a guessable default meant any reader of this OSS repo
