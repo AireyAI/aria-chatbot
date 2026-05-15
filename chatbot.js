@@ -248,10 +248,12 @@
     return {
       slug:           CONFIG.siteName || (location.hostname || '').replace(/\./g, '-'),
       type:           CONFIG.businessType,
-      handoffEmail:   CONFIG.ownerEmail,
-      handoffWa:      CONFIG.whatsapp,
-      handoffUrl:     CONFIG.bookingUrl,
-      canned:         CONFIG.cannedAnswers || {},
+      // Prefer the explicit handoff target; fall back to ownerEmail / whatsapp
+      // so the owner still gets notified if a client only set one of the two.
+      handoffEmail:   CONFIG.handoffEmail || CONFIG.ownerEmail,
+      handoffWa:      CONFIG.handoffWa    || CONFIG.whatsapp,
+      handoffUrl:     CONFIG.handoffUrl,
+      canned:         CONFIG.canned || {},
       calendarConnected: !!CONFIG.calendarConnected,
       lastScore,
       isOutOfHours,

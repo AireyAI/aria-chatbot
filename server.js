@@ -4070,6 +4070,9 @@ app.post('/api/chat/router/stream', async (req, res) => {
       serverFns: { smartSend, sendWhatsAppMessage },
       onTextDelta: t => { if (!aborted) sse({ text: t }); },
       onToolEvent: e => { if (!aborted) sse({ tool: e.name, result: e.result }); },
+      // Lets the router actually abort the upstream Anthropic stream + skip
+      // irreversible tool dispatch when the visitor closes the tab.
+      isAborted: () => aborted,
       model: model || 'claude-sonnet-4-6',
       maxTokens: max_tokens || 800,
     });
