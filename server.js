@@ -3602,6 +3602,198 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+// ─── Self-Serve Onboarding ───────────────────────────────────────────────────
+// Phase 1 spike: visitor pastes their URL → server scans it → Claude extracts
+// business profile → generate Aria prompt → create preview session → visitor
+// sees Aria embedded with their config + copy-paste embed snippet.
+//
+// Phase 2 (later) adds Stripe auth + per-account domain allowlisting between
+// the preview and the embed snippet.
+
+// POST /api/onboard/scan { url } → { profile, prompt, snippet, previewToken }
+app.post('/api/onboard/scan', async (req, res) => {
+  if (!checkRate(req.ip)) return res.status(429).json({ error: 'Rate limited' });
+  const { url } = req.body || {};
+  if (!url || typeof url !== 'string') return res.status(400).json({ error: 'Provide a website URL' });
+
+  try {
+    const { fetchSiteContent, extractBusinessProfile, generateSystemPrompt,
+            createPreviewSession, generateEmbedSnippet } = await import('./lib/onboarding.js');
+
+    const content = await fetchSiteContent(url);
+    const profile = await extractBusinessProfile(claude, content);
+    if (!profile) return res.status(422).json({ error: 'Could not extract business info — site may be JS-heavy or behind auth.' });
+
+    const prompt = generateSystemPrompt(profile);
+    const session = await createPreviewSession({ profile, prompt });
+    const serverBaseUrl = `${req.protocol}://${req.get('host')}`;
+    const snippet = generateEmbedSnippet({ profile, prompt, serverBaseUrl });
+
+    res.json({
+      profile,
+      prompt,
+      snippet,
+      previewToken: session.token,
+      previewUrl: `${serverBaseUrl}/preview/${session.token}`,
+    });
+  } catch (e) {
+    console.error('[onboard/scan]', e.message);
+    res.status(500).json({ error: e.message?.startsWith('Site') ? e.message : 'Scan failed — check the URL is reachable.' });
+  }
+});
+
+// GET /preview/:token → HTML page with Aria embedded using the preview's config.
+// This is the "live preview" iframe the /start page shows after the scan.
+app.get('/preview/:token', async (req, res) => {
+  const { getPreviewSession } = await import('./lib/onboarding.js');
+  const session = await getPreviewSession(req.params.token);
+  if (!session) return res.status(404).send('<h1>Preview expired</h1><p>Previews live for 1 hour. <a href="/start">Generate a new one</a>.</p>');
+
+  const { profile, prompt } = session;
+  const serverBaseUrl = `${req.protocol}://${req.get('host')}`;
+  const safePrompt = prompt.replace(/"/g, '&quot;').replace(/\n/g, ' ');
+  // Fake mini-site styled in the visitor's detected brand colour so they
+  // immediately recognise "this is what Aria looks like on MY site".
+  res.send(`<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aria preview — ${profile.businessName}</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; min-height: 100vh;
+         background: linear-gradient(135deg, ${profile.primaryColor || '#4a5568'}15, #fff);
+         display: flex; align-items: center; justify-content: center; padding: 40px 20px; }
+  .preview { max-width: 600px; text-align: center; }
+  h1 { font-size: 32px; margin: 0 0 12px; color: #1a202c; }
+  .business { color: ${profile.primaryColor || '#4a5568'}; }
+  p { color: #4a5568; line-height: 1.6; }
+  .pill { display: inline-block; background: ${profile.primaryColor || '#4a5568'}; color: white;
+          padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600;
+          letter-spacing: 1px; text-transform: uppercase; margin-bottom: 20px; }
+</style></head>
+<body>
+  <div class="preview">
+    <div class="pill">Aria preview</div>
+    <h1>Welcome to <span class="business">${profile.businessName}</span></h1>
+    <p>${profile.description || ''}</p>
+    <p style="margin-top: 30px; font-size: 14px; color: #718096;">Try the chatbot in the bottom-right corner →</p>
+  </div>
+  <script src="${serverBaseUrl}/chatbot.js"
+    data-name="Aria"
+    data-color="${profile.primaryColor || '#4a5568'}"
+    data-server="${serverBaseUrl}"
+    data-endpoint="/api/chat/router"
+    data-streaming="true"
+    data-type="${profile.businessType || 'generic'}"
+    ${profile.contact?.email ? `data-handoff-email="${profile.contact.email}"` : ''}
+    data-prompt="${safePrompt}"
+  ></script>
+</body></html>`);
+});
+
+// GET /start → the onboarding landing page where visitors paste their URL.
+app.get('/start', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aria — install on your site in 60 seconds</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, system-ui, sans-serif; background: #fff; color: #1a202c; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 80px 24px; }
+  h1 { font-size: 44px; line-height: 1.1; font-weight: 800; letter-spacing: -0.03em; margin-bottom: 16px; }
+  h1 .accent { background: linear-gradient(135deg, #6366f1, #ec4899); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+  .sub { color: #4a5568; font-size: 19px; line-height: 1.6; margin-bottom: 40px; max-width: 560px; }
+  .form { display: flex; gap: 12px; margin-bottom: 16px; }
+  input { flex: 1; font-size: 17px; padding: 16px 20px; border: 2px solid #e2e8f0; border-radius: 12px;
+          font-family: inherit; outline: none; transition: border-color 0.15s; }
+  input:focus-visible { border-color: #6366f1; }
+  button { background: #1a202c; color: white; font-size: 17px; font-weight: 600; padding: 16px 28px;
+           border: 0; border-radius: 12px; cursor: pointer; font-family: inherit; transition: transform 0.15s; }
+  button:hover { transform: translateY(-1px); }
+  button:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+  .hint { color: #718096; font-size: 14px; }
+  .result { margin-top: 48px; display: none; }
+  .result.show { display: block; }
+  iframe { width: 100%; height: 480px; border: 2px solid #e2e8f0; border-radius: 16px; background: #fff; }
+  .snippet { background: #1a202c; color: #cbd5e0; padding: 20px; border-radius: 12px; margin-top: 24px;
+             font-family: 'SF Mono', Monaco, monospace; font-size: 13px; line-height: 1.6;
+             overflow-x: auto; white-space: pre; }
+  .copy { background: #6366f1; margin-top: 12px; }
+  .step { color: #6366f1; font-weight: 600; font-size: 13px; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 8px; }
+  .error { color: #e53e3e; margin-top: 12px; font-size: 14px; }
+  .features { margin: 60px 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 24px; }
+  .feature { padding: 24px; background: #f7fafc; border-radius: 12px; }
+  .feature h3 { font-size: 16px; margin-bottom: 8px; }
+  .feature p { font-size: 14px; color: #4a5568; line-height: 1.5; }
+</style></head>
+<body>
+<div class="wrap">
+  <h1>Install Aria on your site in <span class="accent">60 seconds</span></h1>
+  <p class="sub">Paste your website URL. Aria will read it, learn your business, and show you a working AI chatbot configured for you — before you sign up.</p>
+
+  <div class="form">
+    <input id="url" type="url" placeholder="https://your-website.com" autocomplete="off" autofocus>
+    <button id="scan" onclick="scan()">Scan my site →</button>
+  </div>
+  <p class="hint">No signup. No card. Works on any website.</p>
+  <p class="error" id="err"></p>
+
+  <div class="features">
+    <div class="feature"><h3>Captures leads automatically</h3><p>Aria qualifies every visitor and texts you the hot ones.</p></div>
+    <div class="feature"><h3>Books appointments</h3><p>Two-stage approval — you confirm before bookings land.</p></div>
+    <div class="feature"><h3>White-label by default</h3><p>Looks like your brand. No "Powered by" footer.</p></div>
+  </div>
+
+  <div class="result" id="result">
+    <p class="step">Step 1 of 2 — live preview</p>
+    <h2 style="font-size:24px;margin-bottom:16px">Here's Aria on your site:</h2>
+    <iframe id="preview"></iframe>
+    <p class="step" style="margin-top:32px">Step 2 of 2 — install</p>
+    <h2 style="font-size:24px;margin-bottom:16px">Paste this before <code style="background:#f7fafc;padding:2px 6px;border-radius:4px">&lt;/body&gt;</code> on every page:</h2>
+    <pre class="snippet" id="snippet"></pre>
+    <button class="copy" onclick="copySnippet()">Copy to clipboard</button>
+  </div>
+</div>
+
+<script>
+async function scan() {
+  const url = document.getElementById('url').value.trim();
+  const btn = document.getElementById('scan');
+  const err = document.getElementById('err');
+  err.textContent = '';
+  if (!url) { err.textContent = 'Paste your website URL first.'; return; }
+
+  btn.disabled = true; btn.textContent = 'Scanning your site…';
+  try {
+    const res = await fetch('/api/onboard/scan', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Scan failed');
+
+    document.getElementById('preview').src = data.previewUrl;
+    document.getElementById('snippet').textContent = data.snippet;
+    document.getElementById('result').classList.add('show');
+    document.getElementById('result').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (e) {
+    err.textContent = e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Scan my site →';
+  }
+}
+function copySnippet() {
+  navigator.clipboard.writeText(document.getElementById('snippet').textContent);
+  event.target.textContent = '✓ Copied';
+  setTimeout(() => event.target.textContent = 'Copy to clipboard', 1500);
+}
+document.getElementById('url').addEventListener('keydown', e => {
+  if (e.key === 'Enter') scan();
+});
+</script>
+</body></html>`);
+});
+
 // ─── Lead-Router Chat (tool-use) ─────────────────────────────────────────────
 // Same guard rails as /api/chat (rate limit, cost cap, session save) but
 // routes through lib/lead_router.js so Claude can invoke tools to qualify
