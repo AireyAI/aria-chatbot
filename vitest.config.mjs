@@ -13,5 +13,9 @@ export default defineConfig({
       'tests/widget.test.js',
       'tests/router-e2e.test.js',
     ],
+    // Test files share data/ for the append-only JSONL fixtures (leads.jsonl,
+    // pending_actions.jsonl). Parallel file execution races their beforeEach
+    // file-deletion — force serial so writes don't get nuked mid-test.
+    fileParallelism: false,
   },
 });
