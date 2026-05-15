@@ -46,6 +46,8 @@ import crypto     from 'crypto';
 import { promises as fsp } from 'node:fs';
 import { routeChat }                    from './lib/lead_router.js';
 import { decideLeadAction, policyAddendum } from './lib/lead_policy.js';
+import { safeFetch as _safeFetch }     from './lib/onboarding.js';
+import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue } from './lib/analytics.js';
 
 const app    = express();
 // Railway terminates TLS at its edge proxy and forwards X-Forwarded-Proto.
@@ -62,6 +64,82 @@ if (!process.env.ADMIN_PASS) {
   process.exit(1);
 }
 const ADMIN  = process.env.ADMIN_PASS;
+
+// ─── Admin auth — magic-link + cookie session (Codex C5 fix) ─────────────────
+// We used to ship `${ADMIN}` inside every owner-notification URL. That meant
+// every site owner had the master password in their inbox (a single forwarded
+// alert email = full takeover). Replaced with:
+//   1. mintAdminMagicLink() — one-shot 30-min token, exchanged for a session
+//   2. adminSessions Map     — 24h httpOnly cookies, crypto-random ids
+//   3. adminAuth(req)        — accepts cookie OR header; legacy ?pass still
+//      works as a fallback to avoid breaking old inbox links during rollout
+const adminMagicLinks = new Map();   // token → { expiresAt }
+const adminSessions   = new Map();   // sessionId → { expiresAt, createdAt, ip }
+const ADMIN_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const ADMIN_MAGIC_TTL_MS   = 30 * 60 * 1000;
+
+function _sweepAdminMaps() {
+  const now = Date.now();
+  for (const [t, v] of adminMagicLinks) if (v.expiresAt < now) adminMagicLinks.delete(t);
+  for (const [s, v] of adminSessions)   if (v.expiresAt < now) adminSessions.delete(s);
+}
+setInterval(_sweepAdminMaps, 5 * 60 * 1000).unref();
+
+function parseCookies(req) {
+  const raw = req.headers.cookie || '';
+  const out = {};
+  for (const part of raw.split(/;\s*/)) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+
+function mintAdminMagicLink(req) {
+  const token = crypto.randomBytes(24).toString('hex');
+  adminMagicLinks.set(token, { expiresAt: Date.now() + ADMIN_MAGIC_TTL_MS });
+  // req may be null in cron/startup contexts — fall back to public env URL.
+  let base;
+  if (req) {
+    base = `${req.protocol}://${req.get('host')}`;
+  } else if (process.env.RAILWAY_PUBLIC_DOMAIN) {
+    base = `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
+  } else if (process.env.BASE_URL) {
+    base = process.env.BASE_URL.replace(/\/+$/, '');
+  } else {
+    base = `http://localhost:${process.env.PORT || 3000}`;
+  }
+  return `${base}/admin/auth?t=${token}`;
+}
+
+function mintAdminSession(ip) {
+  const sessionId = crypto.randomBytes(32).toString('hex');
+  adminSessions.set(sessionId, {
+    expiresAt: Date.now() + ADMIN_SESSION_TTL_MS,
+    createdAt: Date.now(),
+    ip,
+  });
+  return sessionId;
+}
+
+// Single source of truth for admin authentication. Used by adminAuth(),
+// isAdmin(), and the 27 inline checks in handler bodies. Constant-time
+// comparison on shared-secret paths to dodge timing oracles.
+function _hasValidAdminCookie(req) {
+  const cookies = parseCookies(req);
+  const sid = cookies.aria_admin_session;
+  if (!sid) return false;
+  const sess = adminSessions.get(sid);
+  if (!sess || sess.expiresAt < Date.now()) return false;
+  return true;
+}
+
+function _constantTimeEq(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const ab = Buffer.from(a), bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
 
 // ─── Per-Client Owner Allowlist (for OAuth-gated admin pages) ─────────────────
 // Maps slug → Set of authorized owner emails. Loaded from data/owners.json at
@@ -594,8 +672,14 @@ function persistSessions() {
   } catch (e) { console.warn('Failed to persist sessions:', e.message); }
 }
 
-// Simple hash — not crypto-grade but fine for dashboard PINs
+// Password hashing — scrypt with random salt. Old format was a 32-bit
+// non-crypto hash trivially reversible by a Python one-liner. New format is
+// `s2$<saltHex>$<hashHex>`. Old `h_*` hashes still verify so existing users
+// don't get locked out; first successful login re-hashes them to scrypt.
 function simpleHash(str) {
+  // BACKCOMPAT shim — only called by reads of the password file. Returns the
+  // legacy format so old stored hashes still compare equal during migration.
+  // New writes go through scryptHash(); migrated reads update in place.
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
     const char = str.charCodeAt(i);
@@ -605,8 +689,39 @@ function simpleHash(str) {
   return 'h_' + Math.abs(hash).toString(36);
 }
 
+function scryptHash(password) {
+  const salt = crypto.randomBytes(16);
+  // N=2^15 is a reasonable web-app default — ~50ms on modern CPU, makes a
+  // GPU-cracking spree expensive without making login feel slow.
+  // N=16384 = OWASP minimum, ~25ms per hash, fits in Node's default 32MB scrypt maxmem.
+  const hash = crypto.scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+  return `s2$${salt.toString('hex')}$${hash.toString('hex')}`;
+}
+
+function verifyPassword(password, stored) {
+  if (!stored || typeof stored !== 'string') return { ok: false, needsRehash: false };
+  if (stored.startsWith('s2$')) {
+    const parts = stored.split('$');
+    if (parts.length !== 3) return { ok: false, needsRehash: false };
+    const salt = Buffer.from(parts[1], 'hex');
+    const expected = Buffer.from(parts[2], 'hex');
+    let actual;
+    try { actual = crypto.scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }); }
+    catch { return { ok: false, needsRehash: false }; }
+    if (actual.length !== expected.length) return { ok: false, needsRehash: false };
+    return { ok: crypto.timingSafeEqual(actual, expected), needsRehash: false };
+  }
+  // Legacy h_* format — verify, then signal caller to re-hash with scrypt.
+  if (stored.startsWith('h_')) {
+    return { ok: simpleHash(password) === stored, needsRehash: true };
+  }
+  return { ok: false, needsRehash: false };
+}
+
 function generateSessionToken() {
-  return Array.from({ length: 32 }, () => Math.random().toString(36)[2]).join('');
+  // 32 bytes = 256 bits of entropy via CSPRNG. Previous Math.random()-based
+  // version had ~165 bits and was predictable from a V8 internal state leak.
+  return crypto.randomBytes(32).toString('hex');
 }
 
 function createSession(ownerEmail) {
@@ -1332,6 +1447,7 @@ setInterval(async () => {
 
 // Enable auto-reply for an owner (with extended config)
 app.post('/api/email-autoreply/enable', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   const { owner, systemPrompt, config: cfg } = req.body;
   if (!owner) return res.status(400).json({ error: 'owner required' });
   if (!gmailTokens.has(owner)) return res.status(400).json({ error: 'Gmail not connected for this owner' });
@@ -1341,21 +1457,25 @@ app.post('/api/email-autoreply/enable', (req, res) => {
 
 // Disable auto-reply
 app.post('/api/email-autoreply/disable', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   const { owner } = req.body;
   disableEmailAutoReply(owner);
   res.json({ ok: true, owner, enabled: false });
 });
 
-// Check status
+// Check status — exposes config + reply stats, admin only
 app.get('/api/email-autoreply/status', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   const { owner } = req.query;
   const config = EMAIL_AUTO_REPLY_ENABLED.get(owner);
   const stats = EMAIL_REPLY_STATS.get(owner) || { replied: 0, bookings: 0, followUps: 0, urgent: 0, lastReply: null, leads: { hot: 0, warm: 0, cold: 0 }, categories: { quote: 0, booking: 0, complaint: 0, feedback: 0, general: 0 } };
   res.json({ owner, enabled: !!config?.enabled, config: config?.config || {}, stats });
 });
 
-// Debug — show what's in the inbox and why each email would be skipped
+// Debug — show what's in the inbox and why each email would be skipped.
+// Returns raw inbox previews and sender addresses — strict admin only.
 app.post('/api/email-autoreply/debug', async (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   const { owner } = req.body;
   if (!owner) return res.status(400).json({ error: 'owner required' });
   const entry = gmailTokens.get(owner);
@@ -1408,15 +1528,17 @@ app.post('/api/email-autoreply/debug', async (req, res) => {
   }
 });
 
-// Clear replied set — for retesting
+// Clear replied set — for retesting. Resets idempotency state, admin only.
 app.post('/api/email-autoreply/clear-replied', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   repliedEmails.clear();
   persistRepliedEmails();
   res.json({ ok: true, cleared: true });
 });
 
-// Manual trigger — check inbox now without waiting for the poll
+// Manual trigger — check inbox now without waiting for the poll. Admin only.
 app.post('/api/email-autoreply/check-now', async (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   const { owner } = req.body;
   if (!owner) return res.status(400).json({ error: 'owner required' });
   if (!gmailTokens.has(owner)) return res.status(400).json({ error: 'Gmail not connected' });
@@ -1484,8 +1606,9 @@ app.get('/api/email-autoreply/reject', (req, res) => {
   res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><div style="font-size:48px;margin-bottom:16px">🗑️</div><h2>Reply Discarded</h2><p style="color:#9898b8;">The draft reply to ' + approval.senderEmail + ' has been discarded.</p></body></html>');
 });
 
-// Get reply log for a specific owner
+// Get reply log for a specific owner — exposes outbound message history.
 app.get('/api/email-autoreply/reply-log', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   const { owner } = req.query;
   if (!owner) return res.status(400).json({ error: 'owner required' });
   const ownerLog = replyLog.filter(r => r.ownerEmail === owner).reverse().slice(0, 50);
@@ -1614,10 +1737,12 @@ async function scanWebsite(url) {
   if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
   const baseUrl = new URL(url);
 
-  // Fetch homepage
-  const homepageRes = await fetch(url, {
+  // safeFetch validates URL + DNS + every redirect target. Without this, the
+  // legacy scanner was a wide-open SSRF primitive — anyone could ask the
+  // server to fetch any internal address.
+  const homepageRes = await _safeFetch(url, {
     headers: { 'User-Agent': 'AriaBot/1.0 (website scanner)' },
-    signal: AbortSignal.timeout(15000)
+    timeoutMs: 15000,
   });
   if (!homepageRes.ok) throw new Error(`Failed to fetch ${url}: ${homepageRes.status}`);
   const homepageHtml = await homepageRes.text();
@@ -1666,9 +1791,11 @@ async function scanWebsite(url) {
 
   for (const pageUrl of pagesToFetch) {
     try {
-      const res = await fetch(pageUrl, {
+      // Same-origin filter above doesn't help if the origin itself resolves to
+      // an internal IP, so re-validate each subpage through safeFetch too.
+      const res = await _safeFetch(pageUrl, {
         headers: { 'User-Agent': 'AriaBot/1.0 (website scanner)' },
-        signal: AbortSignal.timeout(10000)
+        timeoutMs: 10000,
       });
       if (res.ok) {
         const html = await res.text();
@@ -2491,8 +2618,8 @@ app.post('/api/dashboard/complete-reset', (req, res) => {
   if (!reset || reset.expiresAt < Date.now() || reset.ownerEmail !== owner) {
     return res.status(400).json({ error: 'Invalid or expired reset link' });
   }
-  if (!password || password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
-  dashboardPasswords.set(owner, simpleHash(password));
+  if (!password || password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  dashboardPasswords.set(owner, scryptHash(password));
   persistPasswords();
   passwordResetTokens.delete(token);
   const sessionToken = createSession(owner);
@@ -2503,9 +2630,9 @@ app.post('/api/dashboard/complete-reset', (req, res) => {
 app.post('/api/dashboard/set-password', (req, res) => {
   const { owner, password } = req.body;
   if (!owner || !password) return res.status(400).json({ error: 'owner and password required' });
-  if (password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   if (dashboardPasswords.has(owner)) return res.status(400).json({ error: 'Password already set. Use reset if needed.' });
-  dashboardPasswords.set(owner, simpleHash(password));
+  dashboardPasswords.set(owner, scryptHash(password));
   persistPasswords();
   const token = createSession(owner);
   res.json({ ok: true, token });
@@ -2517,7 +2644,13 @@ app.post('/api/dashboard/login', (req, res) => {
   if (!owner || !password) return res.status(400).json({ error: 'owner and password required' });
   const stored = dashboardPasswords.get(owner);
   if (!stored) return res.status(400).json({ error: 'No password set' });
-  if (simpleHash(password) !== stored) return res.status(401).json({ error: 'Wrong password' });
+  const verify = verifyPassword(password, stored);
+  if (!verify.ok) return res.status(401).json({ error: 'Wrong password' });
+  // Migrate legacy h_* hashes to scrypt on first successful login.
+  if (verify.needsRehash) {
+    dashboardPasswords.set(owner, scryptHash(password));
+    persistPasswords();
+  }
   const token = createSession(owner);
   res.json({ ok: true, token });
 });
@@ -2527,9 +2660,9 @@ app.post('/api/dashboard/reset-password', (req, res) => {
   const { owner, currentPassword, newPassword } = req.body;
   if (!owner || !currentPassword || !newPassword) return res.status(400).json({ error: 'All fields required' });
   const stored = dashboardPasswords.get(owner);
-  if (!stored || simpleHash(currentPassword) !== stored) return res.status(401).json({ error: 'Wrong current password' });
-  if (newPassword.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
-  dashboardPasswords.set(owner, simpleHash(newPassword));
+  if (!stored || !verifyPassword(currentPassword, stored).ok) return res.status(401).json({ error: 'Wrong current password' });
+  if (newPassword.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  dashboardPasswords.set(owner, scryptHash(newPassword));
   persistPasswords();
   res.json({ ok: true });
 });
@@ -3704,6 +3837,11 @@ app.get('/preview/:token', async (req, res) => {
 
   const { profile, prompt } = session;
   const serverBaseUrl = `${req.protocol}://${req.get('host')}`;
+
+  // Funnel: track that this prospect actually opened the preview. Critical
+  // signal for cold-outreach conversion rates (sent vs viewed vs replied).
+  const _slug = (profile.businessName || 'unknown').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 50);
+  recordEvent({ slug: _slug, event: 'preview_viewed', sessionId: req.params.token, data: { hostname: profile.hostname || null } });
   const safePrompt = prompt.replace(/"/g, '&quot;').replace(/\n/g, ' ');
   // Fake mini-site styled in the visitor's detected brand colour so they
   // immediately recognise "this is what Aria looks like on MY site".
@@ -3973,7 +4111,7 @@ app.post('/api/chat/router', async (req, res) => {
       + pageContext
       + '\n\n' + policyAddendum(action);
 
-    const { reply, toolEvents, warning, stopReason } = await routeChat({
+    const { reply, toolEvents, warning, stopReason, usage } = await routeChat({
       claude,
       messages: messages.slice(-24),
       systemPrompt: fullPrompt,
@@ -3984,6 +4122,10 @@ app.post('/api/chat/router', async (req, res) => {
       maxTokens: max_tokens || 800,
     });
 
+    // Track usage AFTER the call so monthly caps + cost alerts actually
+    // include router traffic. Without this, /api/chat tracked but the new
+    // tool-use router silently bypassed the cap (Codex B2).
+    if (usage) trackUsage(usage.inputTokens, usage.outputTokens);
     if (warning) console.warn('[aria/router]', warning); // Rule #10 — fail loud
     if (sessionId) saveSession(sessionId, { messages: messages.slice(-24) });
 
@@ -3991,6 +4133,34 @@ app.post('/api/chat/router', async (req, res) => {
     // re-evaluate policy with up-to-date info. Widget should persist this.
     const qualifyEvent = toolEvents.find(e => e.name === 'qualify_lead');
     const newScore = qualifyEvent?.result?.score ?? lastScore;
+
+    // Funnel analytics — one event per chat round-trip, plus higher-signal
+    // events for lead capture + hot-lead promotion + after-hours engagement.
+    const _slug = clientConfig.slug || 'unknown';
+    const _owner = clientConfig.handoffEmail || null;
+    recordEvent({ slug: _slug, event: 'chat_message', sessionId, ownerEmail: _owner });
+    if (clientConfig.isOutOfHours) {
+      recordEvent({ slug: _slug, event: 'after_hours', sessionId, ownerEmail: _owner });
+    }
+    if (newScore >= 40 && newScore > lastScore) {
+      recordEvent({
+        slug: _slug, event: 'lead_captured', sessionId, ownerEmail: _owner,
+        data: { score: newScore, summary: qualifyEvent?.input?.summary || null },
+      });
+      if (newScore >= 70) {
+        recordEvent({
+          slug: _slug, event: 'lead_hot', sessionId, ownerEmail: _owner,
+          data: { score: newScore, summary: qualifyEvent?.input?.summary || null },
+        });
+      }
+    }
+    for (const e of toolEvents) {
+      if (e.name === 'send_whatsapp_to_owner' && e.result?.ok) {
+        recordEvent({ slug: _slug, event: 'owner_notified', sessionId, ownerEmail: _owner, data: { channel: 'whatsapp' } });
+      } else if (e.name === 'book_calendar_slot' && e.result?.ok) {
+        recordEvent({ slug: _slug, event: 'booking_created', sessionId, ownerEmail: _owner });
+      }
+    }
 
     // Dual-shape response: widget reads `data.content[0].text` (Anthropic shape)
     // unchanged; richer consumers can read `reply`, `toolEvents`, `score`, `action`.
@@ -4061,7 +4231,7 @@ app.post('/api/chat/router/stream', async (req, res) => {
       + '\n\n' + policyAddendum(action);
 
     const { streamRouteChat } = await import('./lib/lead_router_stream.js');
-    const { stopReason, toolEvents, score, warning } = await streamRouteChat({
+    const { stopReason, toolEvents, score, warning, usage } = await streamRouteChat({
       claude,
       messages: messages.slice(-24),
       systemPrompt: fullPrompt,
@@ -4070,12 +4240,48 @@ app.post('/api/chat/router/stream', async (req, res) => {
       serverFns: { smartSend, sendWhatsAppMessage },
       onTextDelta: t => { if (!aborted) sse({ text: t }); },
       onToolEvent: e => { if (!aborted) sse({ tool: e.name, result: e.result }); },
+      // Lets the router actually abort the upstream Anthropic stream + skip
+      // irreversible tool dispatch when the visitor closes the tab.
+      isAborted: () => aborted,
       model: model || 'claude-sonnet-4-6',
       maxTokens: max_tokens || 800,
     });
 
+    // Track usage even on aborted streams — tokens already crossed the wire.
+    if (usage) trackUsage(usage.inputTokens, usage.outputTokens);
     if (warning) console.warn('[aria/router-stream]', warning);
     if (sessionId) saveSession(sessionId, { messages: messages.slice(-24) });
+
+    // Funnel analytics — same shape as non-streaming router. We don't record
+    // aborts as `chat_message` because no full exchange occurred.
+    if (stopReason !== 'client_aborted') {
+      const _slug = clientConfig.slug || 'unknown';
+      const _owner = clientConfig.handoffEmail || null;
+      recordEvent({ slug: _slug, event: 'chat_message', sessionId, ownerEmail: _owner });
+      if (clientConfig.isOutOfHours) {
+        recordEvent({ slug: _slug, event: 'after_hours', sessionId, ownerEmail: _owner });
+      }
+      const qualifyEvent = toolEvents.find(e => e.name === 'qualify_lead');
+      if (qualifyEvent && score >= 40 && score > (clientConfig.lastScore ?? 0)) {
+        recordEvent({
+          slug: _slug, event: 'lead_captured', sessionId, ownerEmail: _owner,
+          data: { score, summary: qualifyEvent.input?.summary || null },
+        });
+        if (score >= 70) {
+          recordEvent({
+            slug: _slug, event: 'lead_hot', sessionId, ownerEmail: _owner,
+            data: { score, summary: qualifyEvent.input?.summary || null },
+          });
+        }
+      }
+      for (const e of toolEvents) {
+        if (e.name === 'send_whatsapp_to_owner' && e.result?.ok) {
+          recordEvent({ slug: _slug, event: 'owner_notified', sessionId, ownerEmail: _owner, data: { channel: 'whatsapp' } });
+        } else if (e.name === 'book_calendar_slot' && e.result?.ok) {
+          recordEvent({ slug: _slug, event: 'booking_created', sessionId, ownerEmail: _owner });
+        }
+      }
+    }
 
     if (!aborted) {
       sse({ done: true, score, toolEvents, stopReason, action });
@@ -4091,26 +4297,56 @@ app.post('/api/chat/router/stream', async (req, res) => {
 // ─── Pending action confirmation (two-stage approval for irreversible ops) ──
 // Owner gets emailed a link like /api/pending/confirm?id=<id>&token=<t>
 // which executes the staged WhatsApp send or calendar booking.
+//
+// In-process lock prevents the read→check→execute→append race (Codex B5).
+// Two simultaneous clicks would otherwise both pass the "already actioned"
+// check, both fire sendWhatsAppMessage, and the prospect gets the same WA
+// twice. Single-instance Railway deploy makes a Map-based lock sufficient;
+// a multi-node setup would need a real lease (Redis SETNX or similar).
+const _pendingConfirmInFlight = new Set();
+
+function _resolveWhatsAppCreds(ownerHandoffEmail) {
+  // Sender = agency (Kyle), not the site owner. Try env first (most common),
+  // then per-owner channelConfigs (rare — only set if a client has their own
+  // WABA + Kyle is operating it for them).
+  if (process.env.WA_PHONE_NUMBER_ID && process.env.WA_ACCESS_TOKEN) {
+    return { phoneNumberId: process.env.WA_PHONE_NUMBER_ID, accessToken: process.env.WA_ACCESS_TOKEN };
+  }
+  if (ownerHandoffEmail && typeof channelConfigs !== 'undefined') {
+    const cfg = channelConfigs.get(ownerHandoffEmail);
+    if (cfg?.whatsapp?.phoneNumberId && cfg?.whatsapp?.accessToken) return cfg.whatsapp;
+  }
+  return null;
+}
+
 app.get('/api/pending/confirm', async (req, res) => {
   const { id, token } = req.query;
   if (!id || !token) return res.status(400).send('Missing id or token');
 
+  // Block concurrent confirmations for the same id. The reservation is freed
+  // in finally{} regardless of execute success/failure so a retried link still
+  // works after a transient error (e.g. SMTP timeout).
+  if (_pendingConfirmInFlight.has(id)) {
+    return res.status(409).send('Confirmation already in progress — refresh in a moment.');
+  }
+  _pendingConfirmInFlight.add(id);
+
   let rows;
   try {
-    const raw = await fsp.readFile(resolve('data', 'pending_actions.jsonl'), 'utf8');
-    rows = raw.trim().split('\n').filter(Boolean).map(JSON.parse);
-  } catch {
-    return res.status(404).send('No pending actions');
-  }
+    try {
+      const raw = await fsp.readFile(resolve('data', 'pending_actions.jsonl'), 'utf8');
+      rows = raw.trim().split('\n').filter(Boolean).map(JSON.parse);
+    } catch {
+      return res.status(404).send('No pending actions');
+    }
 
-  // Append-only log: an entry is "live" if its id has no later row with executed_at set.
-  const matches = rows.filter(r => r.id === id);
-  if (!matches.length) return res.status(403).send('Invalid or expired link');
-  const row = matches[0];
-  if (row.token !== token) return res.status(403).send('Invalid token');
-  if (matches.some(r => r.executed_at)) return res.send('Already actioned.');
+    // Append-only log: an entry is "live" if its id has no later row with executed_at set.
+    const matches = rows.filter(r => r.id === id);
+    if (!matches.length) return res.status(403).send('Invalid or expired link');
+    const row = matches[0];
+    if (!_constantTimeEq(row.token, String(token))) return res.status(403).send('Invalid token');
+    if (matches.some(r => r.executed_at)) return res.send('Already actioned.');
 
-  try {
     if (row.kind === 'send_whatsapp_to_owner') {
       const wa = row.payload;
       const ownerWa = row.owner?.handoffWa;
@@ -4118,8 +4354,19 @@ app.get('/api/pending/confirm', async (req, res) => {
         console.error('[aria/pending] cannot send — no handoffWa on staged row', row.id);
         return res.status(500).send('No WhatsApp number configured for this client');
       }
-      await sendWhatsAppMessage({}, ownerWa,
+      const creds = _resolveWhatsAppCreds(row.owner?.handoffEmail);
+      if (!creds) {
+        // Fail loud (Rule #10) — silently swallowing this used to mean the
+        // owner thought their lead was forwarded when nothing actually sent.
+        console.error('[aria/pending] no WhatsApp creds resolved (env or channelConfigs) — id=' + row.id);
+        return res.status(500).send('WhatsApp not configured on this server. Lead saved to dashboard.');
+      }
+      const ok = await sendWhatsAppMessage(creds, ownerWa,
         `New lead from your site (Aria):\n\n${wa.summary}\n\nCallback: ${wa.callback_number}\nUrgency: ${wa.urgency}`);
+      if (!ok) {
+        console.error('[aria/pending] WhatsApp send returned false — id=' + row.id);
+        return res.status(502).send('WhatsApp send failed. Check server logs.');
+      }
     } else if (row.kind === 'book_calendar_slot') {
       // Each client's calendar auth is per-account — full calendar.events.insert
       // wiring is a follow-up. For now: email the owner with the booking details
@@ -4143,6 +4390,8 @@ app.get('/api/pending/confirm', async (req, res) => {
   } catch (e) {
     console.error('[aria/pending] execute failed:', e.message);
     res.status(500).send('Execute failed: ' + e.message);
+  } finally {
+    _pendingConfirmInFlight.delete(id);
   }
 });
 
@@ -4260,7 +4509,9 @@ app.post('/api/lead', async (req, res) => {
   if (session.abVariant && abResults[session.abVariant]) abResults[session.abVariant].leads++;
 
   const insight    = await tagAndScore({ ...session, id:sessionId, messages:session.messages });
-  const adminUrl   = `${req.protocol}://${req.get('host')}/admin?pass=${ADMIN}`;
+  // Magic-link replaces ?pass=ADMIN so the master password never lands in
+  // client inboxes (Codex C5). One-shot, 30min, consumed on first click.
+  const adminUrl   = mintAdminMagicLink(req);
   const alertTo    = ownerTo(ownerEmail);   // per-site owner, or global fallback
 
   // 1. Alert the site owner — use their Gmail if connected, otherwise server SMTP
@@ -4343,7 +4594,8 @@ app.post('/api/booking', async (req, res) => {
   const b = { ...req.body, ts:new Date() };
   bookings.push(b);
   save('bookings', bookings);
-  const adminUrl  = `${req.protocol}://${req.get('host')}/admin?pass=${ADMIN}`;
+  // Magic-link instead of master password in client inboxes (Codex C5).
+  const adminUrl  = mintAdminMagicLink(req);
   const alertTo   = ownerTo(b.ownerEmail);
 
   // 1. Create Google Calendar event (non-blocking — runs in parallel with emails)
@@ -4747,8 +4999,12 @@ app.post('/api/booking/reschedule', async (req, res) => {
 // Admin password resolution (most specific wins):
 //   1. env REVIEWS_ADMIN_PASS_<slug>   — per-client (e.g. REVIEWS_ADMIN_PASS_repwithrobson)
 //   2. env REVIEWS_ADMIN_PASS          — global master (you only)
-//   3. "aria-admin"                    — default, CHANGE ON RAILWAY
-const REVIEWS_MASTER_PASS = process.env.REVIEWS_ADMIN_PASS || 'aria-admin';
+//
+// Note: the historical "aria-admin" default was retired alongside ADMIN_PASS
+// in 2026-05 — a guessable default in an OSS repo meant any reader could
+// moderate every tenant's reviews. Falls back to ADMIN_PASS so existing
+// admin auth still works without needing a separate REVIEWS_ADMIN_PASS env.
+const REVIEWS_MASTER_PASS = process.env.REVIEWS_ADMIN_PASS || ADMIN;
 
 function adminPassForSlug(slug) {
   const perClient = process.env['REVIEWS_ADMIN_PASS_' + slug];
@@ -5443,7 +5699,7 @@ async function autoFulfil(shopifyOrder) {
     console.log(`✅ Auto-fulfilled Shopify #${shopifyOrder.order_number} → ${supplierLabel} ${supplierOrderId || ''}`);
 
     // Notify store owner
-    const adminUrl = `http://localhost:${process.env.PORT||3000}/admin?pass=${ADMIN}`;
+    const adminUrl = mintAdminMagicLink(null);
     const alertTo  = process.env.NOTIFY_EMAIL;
     if (alertTo) {
       sendEmail({
@@ -5585,7 +5841,7 @@ app.post('/api/shopify/webhook', async (req, res) => {
 
 // Search supplier catalogue from admin (supports cj, brandsgateway, printful)
 app.get('/admin/dropship/search', async (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   const keyword = req.query.q, supplier = req.query.supplier || 'cj';
   if (!keyword) return res.status(400).json({ error:'Missing q' });
   try {
@@ -5618,7 +5874,7 @@ app.get('/admin/dropship/search', async (req, res) => {
 
 // Get product variants (any supplier)
 app.get('/admin/dropship/product/:pid', async (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   const supplier = req.query.supplier || 'cj';
   try {
     if (supplier === 'brandsgateway') {
@@ -5637,7 +5893,7 @@ app.get('/admin/dropship/product/:pid', async (req, res) => {
 
 // Add/update a product mapping (Shopify variant → supplier variant)
 app.post('/admin/dropship/map', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   const { shopifyVariantId, cjSku, cjPid, title, costPrice, sellPrice, imageUrl, supplier, supplierProductId, supplierVariantId } = req.body;
   const sku = cjSku || supplierVariantId;
   if (!shopifyVariantId || !sku) return res.status(400).json({ error:'Missing fields' });
@@ -5653,7 +5909,7 @@ app.post('/admin/dropship/map', (req, res) => {
 
 // Remove a product mapping
 app.delete('/admin/dropship/map/:id', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   dsProducts.delete(req.params.id);
   save('dsProducts', Array.from(dsProducts.entries()));
   res.json({ ok: true });
@@ -5661,7 +5917,7 @@ app.delete('/admin/dropship/map/:id', (req, res) => {
 
 // Manually trigger fulfilment (for testing or missed webhooks)
 app.post('/admin/dropship/fulfil/:orderId', async (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   const { SHOPIFY_STORE: store, SHOPIFY_TOKEN: token } = process.env;
   if (!store || !token) return res.status(400).json({ error:'Shopify not configured' });
   try {
@@ -5675,7 +5931,7 @@ app.post('/admin/dropship/fulfil/:orderId', async (req, res) => {
 
 // Poll tracking for all untracked orders
 app.post('/admin/dropship/poll-tracking', async (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   const untracked = dsOrders.filter(o => !o.tracking && o.cjOrderId);
   await Promise.allSettled(untracked.map(pollTracking));
   res.json({ ok: true, polled: untracked.length });
@@ -5683,7 +5939,7 @@ app.post('/admin/dropship/poll-tracking', async (req, res) => {
 
 // Dropship data for admin
 app.get('/admin/dropship/data', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   const today = new Date().toDateString();
   const todayOrders = dsOrders.filter(o => new Date(o.createdAt).toDateString() === today);
   const shipped     = dsOrders.filter(o => o.status === 'shipped');
@@ -5724,7 +5980,7 @@ app.post('/api/handoff', (req, res) => {
   const { sessionId, page, url, ownerEmail, siteName } = req.body;
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2);
   handoffs.set(id, { id, sessionId, page, url, ownerEmail, siteName, userMessages:[], agentMessages:[], status:'waiting', ts:new Date() });
-  const adminUrl  = `${process.env.BASE_URL||'http://localhost:3000'}/admin?pass=${ADMIN}`;
+  const adminUrl  = mintAdminMagicLink(null);
   const alertTo   = ownerTo(ownerEmail);
   // Email alert to site owner
   sendEmail({ to:alertTo, subject:`🙋 Live chat requested — ${siteName||page}`, html:`<p>Someone on <strong>${siteName||page}</strong> has requested a live agent.<br><a href="${adminUrl}">Open admin to respond →</a></p>` });
@@ -5746,7 +6002,7 @@ app.post('/api/handoff/:id/message', (req, res) => {
   const { role = 'agent', text } = req.body;
   if (role === 'agent') {
     // Only admins can send agent messages
-    if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+    if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
     h.agentMessages.push({ role:'agent', text, ts:new Date() });
     h.status = 'active';
   } else {
@@ -5757,7 +6013,7 @@ app.post('/api/handoff/:id/message', (req, res) => {
 });
 
 app.put('/api/handoff/:id/close', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   const h = handoffs.get(req.params.id);
   if (h) { h.status = 'closed'; }
   res.json({ ok:true });
@@ -5793,7 +6049,7 @@ app.post('/api/gap', (req, res) => {
 
 // ─── Lead status management ───────────────────────────────────────────────────
 app.patch('/admin/lead/:email/status', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   const { status, notes } = req.body;
   const valid = ['new','contacted','converted','lost'];
   if (!valid.includes(status)) return res.status(400).json({ error:'Invalid status' });
@@ -5803,13 +6059,126 @@ app.patch('/admin/lead/:email/status', (req, res) => {
   res.json({ ok:true });
 });
 
+// ─── Funnel Analytics — per-client conversion rollup ────────────────────────
+// Reads data/aria_events.jsonl, projects events into a 7/30-day funnel per
+// client. JSON for tooling; HTML view at /admin/analytics.
+app.get('/admin/analytics', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  _hardenAdminResponse(res);
+  const week = rollupForWindow({ windowMs: 7 * 24 * 60 * 60 * 1000 });
+  const month = rollupForWindow({ windowMs: 30 * 24 * 60 * 60 * 1000 });
+  res.json({
+    window7d: week,
+    window30d: month,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+app.get('/admin/analytics/:slug', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  _hardenAdminResponse(res);
+  const week = rollupForWindow({ windowMs: 7 * 24 * 60 * 60 * 1000 });
+  const row = week.slugs?.[req.params.slug];
+  if (!row) return res.status(404).json({ error: 'No events for slug in last 7d' });
+  res.json(row);
+});
+
+// Trigger weekly digest manually (for testing — cron handles the schedule).
+// Body: { dryRun?: bool, ownerEmail?: string }
+app.post('/admin/analytics/send-digest', async (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  _hardenAdminResponse(res);
+  const { dryRun, ownerEmail } = req.body || {};
+  const result = await sendWeeklyDigests({ dryRun: !!dryRun, ownerEmailFilter: ownerEmail });
+  res.json(result);
+});
+
+// Worker — emails each owner their per-client weekly digest. Idempotent
+// within a 24h window via the data/weekly_digest_log.jsonl file.
+async function sendWeeklyDigests({ dryRun = false, ownerEmailFilter = null } = {}) {
+  const week = rollupForWindow({ windowMs: 7 * 24 * 60 * 60 * 1000 });
+  const sent = [];
+  const skipped = [];
+  const failed = [];
+
+  // De-dupe — read digest log, skip slugs already mailed in last 24h.
+  const digestLogPath = resolve('data', 'weekly_digest_log.jsonl');
+  const recentlyMailed = new Set();
+  try {
+    const raw = readFileSync(digestLogPath, 'utf8');
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const line of raw.split('\n')) {
+      if (!line) continue;
+      try {
+        const ev = JSON.parse(line);
+        if (new Date(ev.ts).getTime() > cutoff) recentlyMailed.add(ev.slug);
+      } catch {}
+    }
+  } catch {}
+
+  for (const slug of Object.keys(week.slugs || {})) {
+    const row = week.slugs[slug];
+    const owner = row.ownerEmail;
+    if (!owner) { skipped.push({ slug, reason: 'no ownerEmail recorded' }); continue; }
+    if (ownerEmailFilter && owner !== ownerEmailFilter) { skipped.push({ slug, reason: 'filter mismatch' }); continue; }
+    if (recentlyMailed.has(slug)) { skipped.push({ slug, reason: 'already sent <24h ago' }); continue; }
+
+    // Skip if there's no real signal — sending "0 chats this week" emails to
+    // owners is the fastest way to get them to unsubscribe.
+    const totalEvents = Object.values(row.counts || {}).reduce((a, b) => a + b, 0);
+    if (totalEvents < 3) { skipped.push({ slug, reason: 'low signal' }); continue; }
+
+    const businessType = row.businessType || 'generic';
+    const weekStart = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const weekEnd = new Date().toISOString().slice(0, 10);
+    const html = renderWeeklyDigestHtml({ slug, businessType, weekStart, weekEnd, row });
+    const hot = row.counts?.lead_hot || 0;
+    const subject = hot > 0
+      ? `Aria found ${hot} hot lead${hot === 1 ? '' : 's'} for you this week`
+      : `Your weekly Aria summary`;
+
+    if (dryRun) {
+      sent.push({ slug, ownerEmail: owner, subject, htmlLength: html.length, dryRun: true });
+      continue;
+    }
+    try {
+      await smartSend({ ownerEmail: owner, to: owner, subject, html, replyTo: process.env.NOTIFY_EMAIL });
+      await fsp.appendFile(digestLogPath, JSON.stringify({ ts: new Date().toISOString(), slug, ownerEmail: owner }) + '\n');
+      sent.push({ slug, ownerEmail: owner });
+    } catch (e) {
+      failed.push({ slug, error: e.message });
+    }
+  }
+  return { sent: sent.length, skipped: skipped.length, failed: failed.length, details: { sent, skipped, failed } };
+}
+
+// Cron: every Monday 08:00 UTC. Single-instance Railway deploy makes a
+// process-local setInterval sufficient. We compute the day-of-week + hour
+// every minute and only fire on the right combo, so a restart doesn't
+// re-fire (the digest log dedupes anyway).
+let _lastDigestRunIso = null;
+setInterval(async () => {
+  const now = new Date();
+  const isMon = now.getUTCDay() === 1;
+  const isHour = now.getUTCHours() === 8;
+  const ymd = now.toISOString().slice(0, 10);
+  if (!isMon || !isHour || _lastDigestRunIso === ymd) return;
+  _lastDigestRunIso = ymd;
+  try {
+    const r = await sendWeeklyDigests({});
+    console.log(`📊 Weekly digest run: ${r.sent} sent, ${r.skipped} skipped, ${r.failed} failed`);
+  } catch (e) {
+    console.error('[analytics] weekly digest failed:', e.message);
+  }
+}, 60 * 1000).unref();
+
 // ─── Usage & Settings ─────────────────────────────────────────────────────────
 // ─── Agency Dashboard — per-client lead stats (internal tool for Kyle) ───────
 // Reads data/leads.jsonl, groups by `client` field, returns per-client roll-up
 // of leads_total / leads_7d / leads_30d / hot_rate / last_lead. Powers the
-// HTML view at /admin/clients.html. Gated by ?pass=<ADMIN_PASS>.
+// HTML view at /admin/clients.html.
 app.get('/admin/clients', async (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error: 'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   try {
     let leads = [];
     try {
@@ -5843,7 +6212,7 @@ app.get('/admin/clients', async (req, res) => {
 
 // HTML view of the same — easier for Kyle to glance at on his phone.
 app.get('/admin/clients.html', async (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).send('<h1>Unauthorised</h1>');
+  if (!adminAuth(req)) return res.status(403).send('<h1>Unauthorised</h1>');
   try {
     let leads = [];
     try {
@@ -5917,12 +6286,12 @@ app.get('/admin/clients.html', async (req, res) => {
 
 // ─── Admin Domain Whitelist Endpoints ─────────────────────────────────────────
 app.get('/admin/domains', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error: 'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   res.json({ domains: [...allowedDomains] });
 });
 
 app.post('/admin/domains', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error: 'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   const { domain } = req.body;
   if (!domain) return res.status(400).json({ error: 'domain required' });
   const clean = domain.toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').trim();
@@ -5934,7 +6303,7 @@ app.post('/admin/domains', (req, res) => {
 });
 
 app.delete('/admin/domains', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error: 'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   const { domain } = req.body;
   if (!domain) return res.status(400).json({ error: 'domain required' });
   allowedDomains.delete(domain.toLowerCase());
@@ -5944,19 +6313,19 @@ app.delete('/admin/domains', (req, res) => {
 });
 
 app.get('/admin/usage', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   const cap = siteSettings.capEnabled ? siteSettings.capMessages : null;
   const pct = cap ? Math.round((usage.messages / cap) * 100) : null;
   res.json({ month: usageMonth, ...usage, cap, capEnabled: siteSettings.capEnabled, capPct: pct });
 });
 
 app.get('/admin/settings', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   res.json(siteSettings);
 });
 
 app.post('/admin/settings', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   const allowed = [
     'capEnabled','capMessages','capWarningAt',
     'botName','botColor','welcomeMsg','businessType',
@@ -5985,7 +6354,7 @@ app.get('/api/config', (req, res) => {
 app.get('/api/faqs', (req, res) => res.json(Array.from(faqs.values()).filter(f=>f.approved)));
 
 app.post('/admin/faq', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   const { question, answer } = req.body;
   if (!question||!answer) return res.status(400).json({ error:'Missing fields' });
   const id = faqSeq++;
@@ -5995,7 +6364,7 @@ app.post('/admin/faq', (req, res) => {
 });
 
 app.delete('/admin/faq/:id', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   faqs.delete(parseInt(req.params.id));
   save('faqs', Array.from(faqs.values()));
   res.json({ ok:true });
@@ -6003,7 +6372,7 @@ app.delete('/admin/faq/:id', (req, res) => {
 
 // ─── Auto FAQ generation ──────────────────────────────────────────────────────
 app.post('/admin/generate-faq', async (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   const allMsgs = Array.from(sessions.values()).flatMap(s=>(s.messages||[]).filter(m=>m.role==='user').map(m=>m.content)).slice(0,200);
   if (allMsgs.length < 5) return res.json({ faqHtml:'<p>Not enough conversations yet. Come back after 20+ chats.</p>' });
   try {
@@ -6022,7 +6391,7 @@ Return clean HTML only (no markdown, no code blocks): use <h3> for questions, <p
 
 // ─── Admin data ───────────────────────────────────────────────────────────────
 app.get('/admin/data', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error:'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error:'Unauthorised' });
   const all    = Array.from(sessions.values()).sort((a,b)=>new Date(b.lastActivity)-new Date(a.lastActivity));
   const today  = new Date().toDateString();
   const todayS = all.filter(s=>new Date(s.startedAt).toDateString()===today);
@@ -6097,13 +6466,13 @@ app.get('/auth/admin/whoami', (req, res) => {
 
 // Owner management (for adding new clients/owners post-install).
 app.get('/admin/owners', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error: 'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   const out = {};
   for (const [slug, set] of owners) out[slug] = [...set];
   res.json({ owners: out });
 });
 app.post('/admin/owners', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.status(403).json({ error: 'Unauthorised' });
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   const { slug, emails } = req.body || {};
   if (!slug || !Array.isArray(emails)) return res.status(400).json({ error: 'slug and emails[] required' });
   const cleanSlug = String(slug).toLowerCase().trim();
@@ -6118,8 +6487,18 @@ app.post('/admin/owners', (req, res) => {
 });
 
 // ─── Invite system ───────────────────────────────────────────────────────────
+// Admin auth — accepts (in order of preference):
+//   1. aria_admin_session cookie  — set by /admin/auth magic-link exchange
+//   2. X-Admin-Pass header        — used by curl/scripts (server-side only)
+//   3. ?pass= query string        — legacy, deprecated, kept for old inbox links
+//      until the next deploy. New links never include the password.
 function adminAuth(req) {
-  return req.query.pass === ADMIN || req.headers['x-admin-pass'] === ADMIN;
+  if (_hasValidAdminCookie(req)) return true;
+  const headerPass = req.headers['x-admin-pass'];
+  if (typeof headerPass === 'string' && _constantTimeEq(headerPass, ADMIN)) return true;
+  const queryPass = req.query?.pass;
+  if (typeof queryPass === 'string' && _constantTimeEq(queryPass, ADMIN)) return true;
+  return false;
 }
 
 app.post('/api/admin/invite', (req, res) => {
@@ -6580,7 +6959,7 @@ function showMsg(id, text, type) {
 
 // ─── Client Health Dashboard ─────────────────────────────────────────────────
 app.get('/admin/clients', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.redirect('/admin');
+  if (!adminAuth(req)) return res.redirect('/admin');
 
   const clients = [];
   for (const [email, config] of EMAIL_AUTO_REPLY_ENABLED) {
@@ -6633,7 +7012,7 @@ app.get('/admin/clients', (req, res) => {
     </style>
   </head><body>
     <div class="container">
-      <a class="back" href="/admin?pass=${ADMIN}">← Back to Admin</a>
+      <a class="back" href="/admin">← Back to Admin</a>
       <h1>Client Health</h1>
       <p class="sub">${clients.length} clients total</p>
 
@@ -6663,7 +7042,7 @@ app.get('/admin/clients', (req, res) => {
 
 // ─── Bulk Embed Generator ────────────────────────────────────────────────────
 app.get('/admin/embed', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.redirect('/admin');
+  if (!adminAuth(req)) return res.redirect('/admin');
   const serverUrl = process.env.GOOGLE_REDIRECT_URI?.replace('/auth/gmail/callback', '') || `http://localhost:${process.env.PORT || 3000}`;
 
   res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -6686,7 +7065,7 @@ app.get('/admin/embed', (req, res) => {
     </style>
   </head><body>
     <div class="container">
-      <a class="back" href="/admin?pass=${ADMIN}">← Back to Admin</a>
+      <a class="back" href="/admin">← Back to Admin</a>
       <h1>Embed Generator</h1>
       <p class="sub">Generate the embed code for a client's website</p>
 
@@ -6790,9 +7169,80 @@ setInterval(async () => {
   }
 }, 60 * 60 * 1000);
 
+// ─── Admin auth — magic-link exchange + cookie login + logout ─────────────────
+// All three set/clear an httpOnly aria_admin_session cookie. After login, the
+// 27 inline admin route handlers (via adminAuth(req)) accept the cookie and
+// the URL no longer needs to carry ?pass=.
+
+// Set cookie defenses on every admin response: no-store keeps proxy caches
+// from holding the HTML; Referrer-Policy stops outbound links from leaking
+// the admin URL (mostly cosmetic now that ?pass= is gone, but cheap).
+function _hardenAdminResponse(res) {
+  res.set('Cache-Control', 'no-store');
+  res.set('Referrer-Policy', 'no-referrer');
+}
+
+function _setAdminCookie(res, sessionId) {
+  // SameSite=Lax keeps OAuth callbacks working; Secure required in prod since
+  // Railway terminates TLS. httpOnly keeps JS from reading it.
+  const secure = process.env.NODE_ENV === 'production' || process.env.RAILWAY_PUBLIC_DOMAIN;
+  const attrs = [
+    `aria_admin_session=${sessionId}`,
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${Math.floor(ADMIN_SESSION_TTL_MS / 1000)}`,
+    'Path=/',
+  ];
+  if (secure) attrs.push('Secure');
+  res.set('Set-Cookie', attrs.join('; '));
+}
+
+function _clearAdminCookie(res) {
+  res.set('Set-Cookie', 'aria_admin_session=; HttpOnly; SameSite=Lax; Max-Age=0; Path=/');
+}
+
+// Magic-link exchange. The email-issued link is one-shot — the token is
+// consumed on first hit so a forwarded email can't grant a second session.
+app.get('/admin/auth', (req, res) => {
+  _hardenAdminResponse(res);
+  const token = req.query.t;
+  if (typeof token !== 'string' || !token) return res.status(400).send('Missing token');
+  const entry = adminMagicLinks.get(token);
+  if (!entry || entry.expiresAt < Date.now()) {
+    adminMagicLinks.delete(token);
+    return res.status(410).send('<h1>Link expired</h1><p>Magic links are valid for 30 minutes. Request a new one from the admin page.</p>');
+  }
+  adminMagicLinks.delete(token); // one-shot
+  const sessionId = mintAdminSession(req.ip);
+  _setAdminCookie(res, sessionId);
+  res.redirect('/admin');
+});
+
+// Password login — POST so the password never appears in URLs, logs, or
+// referer headers. Body is JSON. Throttling left to upstream rate limiter.
+app.post('/admin/login', express.json(), (req, res) => {
+  _hardenAdminResponse(res);
+  const pass = req.body?.password;
+  if (typeof pass !== 'string' || !_constantTimeEq(pass, ADMIN)) {
+    return res.status(401).json({ error: 'Wrong password' });
+  }
+  const sessionId = mintAdminSession(req.ip);
+  _setAdminCookie(res, sessionId);
+  res.json({ ok: true });
+});
+
+app.post('/admin/logout', (req, res) => {
+  _hardenAdminResponse(res);
+  const cookies = parseCookies(req);
+  if (cookies.aria_admin_session) adminSessions.delete(cookies.aria_admin_session);
+  _clearAdminCookie(res);
+  res.json({ ok: true });
+});
+
 // ─── Admin dashboard ──────────────────────────────────────────────────────────
 app.get('/admin', (req, res) => {
-  if (req.query.pass !== ADMIN) return res.send(`<!DOCTYPE html><html><head><title>Admin</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,sans-serif;background:#0f0f1a;display:flex;align-items:center;justify-content:center;min-height:100vh;}.box{background:#1a1a2e;border-radius:16px;padding:40px;width:320px;text-align:center;}h2{color:#fff;margin-bottom:24px;}input{width:100%;padding:11px 15px;border-radius:10px;border:1.5px solid #2a2a44;background:#13131f;color:#fff;font-size:14px;outline:none;margin-bottom:12px;}input:focus{border-color:#6C63FF;}button{width:100%;padding:11px;background:#6C63FF;color:#fff;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;}</style></head><body><div class="box"><h2>🔐 Admin Login</h2><form onsubmit="event.preventDefault();window.location='/admin?pass='+document.getElementById('p').value"><input id="p" type="password" placeholder="Admin password" autofocus><button>Enter →</button></form></div></body></html>`);
+  _hardenAdminResponse(res);
+  if (!adminAuth(req)) return res.send(`<!DOCTYPE html><html><head><title>Admin</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,sans-serif;background:#0f0f1a;display:flex;align-items:center;justify-content:center;min-height:100vh;}.box{background:#1a1a2e;border-radius:16px;padding:40px;width:320px;text-align:center;}h2{color:#fff;margin-bottom:24px;}input{width:100%;padding:11px 15px;border-radius:10px;border:1.5px solid #2a2a44;background:#13131f;color:#fff;font-size:14px;outline:none;margin-bottom:12px;}input:focus{border-color:#6C63FF;}button{width:100%;padding:11px;background:#6C63FF;color:#fff;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;}.err{color:#ff6b6b;font-size:12px;margin-top:8px;min-height:16px;}</style></head><body><div class="box"><h2>🔐 Admin Login</h2><form id="f"><input id="p" type="password" placeholder="Admin password" autofocus><button>Enter →</button><div class="err" id="e"></div></form><script>document.getElementById('f').addEventListener('submit',async e=>{e.preventDefault();const p=document.getElementById('p').value;const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p}),credentials:'same-origin'});if(r.ok){window.location='/admin';}else{document.getElementById('e').textContent='Wrong password';}});</script></div></body></html>`);
 
   const PASS = ADMIN;
   res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aria Admin v5</title>
@@ -9531,7 +9981,7 @@ setInterval(async () => {
     const avgRating = ratings.length?(ratings.reduce((a,b)=>a+b,0)/ratings.length).toFixed(1):null;
     const freq={};today.forEach(s=>(s.messages||[]).filter(m=>m.role==='user').forEach(m=>m.content.toLowerCase().split(/\W+/).filter(w=>w.length>4).forEach(w=>{freq[w]=(freq[w]||0)+1;})));
     const topQ=Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,8), topObj=all.filter(s=>s.topObjection).map(s=>s.topObjection).filter(Boolean).slice(0,5);
-    const adminUrl=`http://localhost:${process.env.PORT||3000}/admin?pass=${ADMIN}`;
+    const adminUrl=mintAdminMagicLink(null);
     await sendEmail({ to:process.env.NOTIFY_EMAIL, subject:`📊 Aria Daily Digest — ${day}`, html:digestTpl({ date:day, stats:{ today:today.length, leadsToday:todayLeads.length, avgRating }, topQ, hotLeads, bookingCount:bookings.filter(b=>new Date(b.ts).toDateString()===day).length, abResults, topObjections:topObj, adminUrl }) });
   }
 }, 60_000);
@@ -9552,7 +10002,7 @@ setInterval(async () => {
   const npsThis  = npsScores.filter(n=>new Date(n.ts)>=new Date(week)), npsAvg=npsThis.length?(npsThis.reduce((a,b)=>a+b.score,0)/npsThis.length).toFixed(1):null;
   const freq={};thisWeek.forEach(s=>(s.messages||[]).filter(m=>m.role==='user').forEach(m=>m.content.toLowerCase().split(/\W+/).filter(w=>w.length>4).forEach(w=>{freq[w]=(freq[w]||0)+1;})));
   const topQ=Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,5);
-  const adminUrl=`http://localhost:${process.env.PORT||3000}/admin?pass=${ADMIN}`;
+  const adminUrl=mintAdminMagicLink(null);
   await sendEmail({ to:process.env.NOTIFY_EMAIL, subject:`📈 Aria Weekly Report`, html:weeklyTpl({ period:`${new Date(week).toLocaleDateString()} — ${now.toLocaleDateString()}`, stats:{ total:thisWeek.length, leads:allLeads.length, avgScore }, trend:{ total:thisWeek.length-prevW.length, leads:allLeads.length-prevW.flatMap(s=>(s.leads||[])).length }, topQuestions:topQ, hotLeads, npsAvg, adminUrl }) });
   console.log('📈 Weekly report sent');
 }, 60_000);
@@ -9667,7 +10117,7 @@ setInterval(async () => {
 // ─── Abandoned recovery ───────────────────────────────────────────────────────
 setInterval(async () => {
   if (!process.env.NOTIFY_EMAIL) return;
-  const twoH = 2*60*60*1000, adminUrl=`http://localhost:${process.env.PORT||3000}/admin?pass=${ADMIN}`;
+  const twoH = 2*60*60*1000, adminUrl=mintAdminMagicLink(null);
   for (const [id, s] of sessions) {
     if ((s.leads||[]).length && !s.followupSent && Date.now()-new Date(s.lastActivity)>twoH) {
       s.followupSent = true; sessions.set(id, s);
@@ -9698,7 +10148,9 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   const meta = process.env.META_APP_ID ? '✅' : '❌';
   console.log(`\n  ✦ Aria Chatbot Server v5.2`);
-  console.log(`  → Admin: http://localhost:${PORT}/admin?pass=${ADMIN}`);
+  // Startup print — local dev only. Goes to your own terminal so the leak
+  // surface is the same as the env var itself.
+  console.log(`  → Admin: http://localhost:${PORT}/admin  (login with ADMIN_PASS)`);
   console.log(`  → Health: http://localhost:${PORT}/health`);
   console.log(`  → Meta channels: ${meta} (${metaTokens.size} connected accounts)`);
   console.log('');
