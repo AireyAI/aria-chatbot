@@ -7669,6 +7669,39 @@ app.get('/admin/auth', (req, res) => {
 
 // Password login — POST so the password never appears in URLs, logs, or
 // referer headers. Body is JSON. Throttling left to upstream rate limiter.
+// Magic-link issuance — alternative to password auth. Kyle requests a link
+// to his admin email (NOTIFY_EMAIL); server only emails if the address matches
+// the configured admin email. Always responds 200 OK so a passing scanner
+// can't learn which addresses are admins.
+app.post('/admin/request-magic-link', express.json(), async (req, res) => {
+  const email = String(req.body?.email || '').toLowerCase().trim();
+  const adminEmail = String(process.env.NOTIFY_EMAIL || '').toLowerCase().trim();
+  // Respond OK regardless to avoid leaking which emails are valid admins.
+  res.json({ ok: true, message: 'If that email is a registered admin, a sign-in link is on its way.' });
+  if (!email || !adminEmail || email !== adminEmail) {
+    console.log(`[admin-magic-link] rejected request for ${email || '(empty)'}`);
+    return;
+  }
+  try {
+    const link = mintAdminMagicLink(req);
+    await smartSend({
+      ownerEmail: adminEmail,
+      to: adminEmail,
+      subject: 'Aria — your sign-in link',
+      html: `<div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a2e;">
+        <h2 style="margin:0 0 12px;">Sign in to Aria Admin</h2>
+        <p style="font-size:14px;line-height:1.55;color:#444;">Click the button below to sign in. The link works once and expires in 15 minutes.</p>
+        <p style="margin:22px 0;"><a href="${link}" style="display:inline-block;background:#6C63FF;color:#fff;padding:13px 24px;border-radius:10px;text-decoration:none;font-weight:600;font-size:14px;">Sign in →</a></p>
+        <p style="font-size:11px;color:#888;">If you didn't request this, you can ignore the email — no action needed.</p>
+      </div>`,
+      replyTo: process.env.NOTIFY_EMAIL,
+    });
+    console.log(`[admin-magic-link] sent to ${adminEmail}`);
+  } catch (e) {
+    console.warn('[admin-magic-link] send failed:', e.message);
+  }
+});
+
 app.post('/admin/login', express.json(), (req, res) => {
   _hardenAdminResponse(res);
   const pass = req.body?.password;
@@ -7691,7 +7724,109 @@ app.post('/admin/logout', (req, res) => {
 // ─── Admin dashboard ──────────────────────────────────────────────────────────
 app.get('/admin', (req, res) => {
   _hardenAdminResponse(res);
-  if (!adminAuth(req)) return res.send(`<!DOCTYPE html><html><head><title>Admin</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,sans-serif;background:#0f0f1a;display:flex;align-items:center;justify-content:center;min-height:100vh;}.box{background:#1a1a2e;border-radius:16px;padding:40px;width:320px;text-align:center;}h2{color:#fff;margin-bottom:24px;}input{width:100%;padding:11px 15px;border-radius:10px;border:1.5px solid #2a2a44;background:#13131f;color:#fff;font-size:14px;outline:none;margin-bottom:12px;}input:focus{border-color:#6C63FF;}button{width:100%;padding:11px;background:#6C63FF;color:#fff;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;}.err{color:#ff6b6b;font-size:12px;margin-top:8px;min-height:16px;}</style></head><body><div class="box"><h2>🔐 Admin Login</h2><form id="f"><input id="p" type="password" placeholder="Admin password" autofocus><button>Enter →</button><div class="err" id="e"></div></form><script>document.getElementById('f').addEventListener('submit',async e=>{e.preventDefault();const p=document.getElementById('p').value;const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p}),credentials:'same-origin'});if(r.ok){window.location='/admin';}else{document.getElementById('e').textContent='Wrong password';}});</script></div></body></html>`);
+  if (!adminAuth(req)) return res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aria Admin</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+         background: #0f0f1a; color: #e8e8f8; display: flex; align-items: center;
+         justify-content: center; min-height: 100vh; padding: 20px; }
+  .box { background: #1a1a2e; border-radius: 16px; padding: 36px 32px;
+         width: 100%; max-width: 360px; }
+  h2 { color: #fff; font-size: 20px; font-weight: 700; margin-bottom: 4px; text-align: center; }
+  .sub { color: #8888aa; font-size: 12px; text-align: center; margin-bottom: 26px; }
+  input { width: 100%; padding: 11px 14px; border-radius: 10px;
+          border: 1.5px solid #2a2a44; background: #13131f; color: #fff;
+          font-size: 14px; outline: none; margin-bottom: 10px; font-family: inherit; }
+  input:focus { border-color: #6C63FF; }
+  button { width: 100%; padding: 11px; background: #6C63FF; color: #fff;
+           border: none; border-radius: 10px; font-size: 14px; font-weight: 600;
+           cursor: pointer; font-family: inherit; transition: opacity .15s; }
+  button:hover { opacity: 0.9; }
+  button.alt { background: transparent; border: 1.5px solid #2a2a44; color: #c0c0e0; }
+  .divider { display: flex; align-items: center; gap: 10px; margin: 20px 0;
+             color: #6b6b8a; font-size: 11px; text-transform: uppercase;
+             letter-spacing: 0.1em; font-weight: 600; }
+  .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: #2a2a44; }
+  .msg { font-size: 12px; margin-top: 10px; min-height: 16px; padding: 6px 0; }
+  .msg.err { color: #ff6b6b; }
+  .msg.ok { color: #00e5a0; }
+</style>
+</head>
+<body>
+<div class="box">
+  <h2>Aria Admin</h2>
+  <div class="sub">Sign in to your dashboard</div>
+
+  <form id="passForm">
+    <input id="p" type="password" placeholder="Admin password" autocomplete="current-password">
+    <button type="submit">Sign in with password</button>
+  </form>
+
+  <div class="divider">or</div>
+
+  <form id="linkForm">
+    <input id="em" type="email" placeholder="your@email.com" autocomplete="email">
+    <button type="submit" class="alt">Email me a sign-in link</button>
+  </form>
+
+  <div id="msg" class="msg"></div>
+</div>
+
+<script>
+(function() {
+  const msgEl = document.getElementById('msg');
+  function setMsg(text, kind) {
+    msgEl.textContent = text;
+    msgEl.className = 'msg ' + (kind === 'ok' ? 'ok' : kind === 'err' ? 'err' : '');
+  }
+
+  document.getElementById('passForm').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const pw = document.getElementById('p').value;
+    if (!pw) return;
+    setMsg('Signing in…', '');
+    try {
+      const r = await fetch('/admin/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pw }),
+        credentials: 'same-origin',
+      });
+      if (r.ok) {
+        window.location.href = '/admin';
+      } else {
+        setMsg('Wrong password', 'err');
+      }
+    } catch (e) {
+      setMsg('Network error — try again', 'err');
+    }
+  });
+
+  document.getElementById('linkForm').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const email = document.getElementById('em').value.trim();
+    if (!email) return;
+    setMsg('Sending link…', '');
+    try {
+      await fetch('/admin/request-magic-link', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      setMsg('If that email is a registered admin, a sign-in link is on its way (15 min expiry).', 'ok');
+    } catch (e) {
+      setMsg('Network error — try again', 'err');
+    }
+  });
+})();
+</script>
+</body>
+</html>`);
 
   const PASS = ADMIN;
   res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aria Admin v5</title>
