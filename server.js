@@ -10515,16 +10515,12 @@ function escapeHtml(s) {
 }
 const META_OAUTH_STATES = new Map(); // stateToken → { owner, sessionToken, expiresAt }
 const META_OAUTH_TTL_MS = 10 * 60 * 1000;
-// Modern Facebook Login for Business rejects ad-hoc Instagram/WhatsApp scopes
-// in Dev mode — those require a saved "Configuration" in the dashboard with
-// a config_id passed instead of scope=. Sticking to Page/Messenger scopes for
-// Phase 1 (Messenger DMs). IG + WhatsApp added later via Configuration flow.
-const META_SCOPES = [
-  'pages_show_list',
-  'pages_messaging',
-  'pages_manage_metadata',
-  'business_management',
-].join(',');
+// Facebook Login for Business uses a saved "Configuration" in the Meta
+// dashboard to bundle permissions/assets — we pass config_id= instead of
+// scope=. Configuration "Aria Pages IG WhatsApp" was created 2026-05-23 and
+// includes: pages_show_list, pages_messaging, pages_manage_metadata,
+// business_management, instagram_business_basic, instagram_business_manage_messages.
+const META_LOGIN_CONFIG_ID = process.env.META_LOGIN_CONFIG_ID || '1753616562794235';
 
 function metaPublicBase(req) {
   if (req) return `${req.protocol}://${req.get('host')}`;
@@ -10572,7 +10568,7 @@ app.get('/connect/meta', (req, res) => {
     + `?client_id=${process.env.META_APP_ID}`
     + `&redirect_uri=${encodeURIComponent(redirect)}`
     + `&state=${state}`
-    + `&scope=${encodeURIComponent(META_SCOPES)}`
+    + `&config_id=${encodeURIComponent(META_LOGIN_CONFIG_ID)}`
     + `&response_type=code`;
   res.redirect(url);
 });
