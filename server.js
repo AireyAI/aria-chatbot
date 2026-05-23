@@ -10515,14 +10515,15 @@ function escapeHtml(s) {
 }
 const META_OAUTH_STATES = new Map(); // stateToken → { owner, sessionToken, expiresAt }
 const META_OAUTH_TTL_MS = 10 * 60 * 1000;
+// 2025 scopes — pages_read_engagement requires App Review, IG perms renamed
+// to instagram_business_* in 2024. Keep this list minimal until verified.
 const META_SCOPES = [
   'pages_show_list',
   'pages_messaging',
   'pages_manage_metadata',
-  'pages_read_engagement',
-  'instagram_basic',
-  'instagram_manage_messages',
   'business_management',
+  'instagram_business_basic',
+  'instagram_business_manage_messages',
 ].join(',');
 
 function metaPublicBase(req) {
