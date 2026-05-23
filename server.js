@@ -10767,8 +10767,10 @@ app.get('/connect/instagram', (req, res) => {
   const redirect = `${metaPublicBase(req)}/auth/instagram/callback`;
   // Instagram OAuth uses www.instagram.com/oauth/authorize (not facebook.com).
   // enable_fb_login=0 forces the IG-only flow (no fallback to FB Login).
+  // IG_APP_ID is a separate sub-app auto-created by Meta when you add the
+  // Instagram product. Falls back to META_APP_ID for legacy setups.
   const url = `https://www.instagram.com/oauth/authorize`
-    + `?client_id=${process.env.META_APP_ID}`
+    + `?client_id=${process.env.IG_APP_ID || process.env.META_APP_ID}`
     + `&redirect_uri=${encodeURIComponent(redirect)}`
     + `&state=${state}`
     + `&scope=${encodeURIComponent(IG_SCOPES)}`
@@ -10795,9 +10797,12 @@ app.get('/auth/instagram/callback', async (req, res) => {
 
   try {
     // 1. Exchange code → short-lived IG user access token (1 hour)
+    // IG sub-app credentials when set, else fall back to parent FB app.
+    const igClientId = process.env.IG_APP_ID || process.env.META_APP_ID;
+    const igClientSecret = process.env.IG_APP_SECRET || process.env.META_APP_SECRET;
     const formBody = new URLSearchParams({
-      client_id: process.env.META_APP_ID,
-      client_secret: process.env.META_APP_SECRET,
+      client_id: igClientId,
+      client_secret: igClientSecret,
       grant_type: 'authorization_code',
       redirect_uri: redirect,
       code: String(code),
@@ -10813,7 +10818,7 @@ app.get('/auth/instagram/callback', async (req, res) => {
     // 2. Exchange short-lived → long-lived IG token (60 days)
     const llUrl = `https://graph.instagram.com/access_token`
       + `?grant_type=ig_exchange_token`
-      + `&client_secret=${encodeURIComponent(process.env.META_APP_SECRET)}`
+      + `&client_secret=${encodeURIComponent(igClientSecret)}`
       + `&access_token=${encodeURIComponent(tok.access_token)}`;
     const llRes = await fetch(llUrl);
     const ll = await llRes.json();
