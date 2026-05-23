@@ -2524,11 +2524,11 @@ app.post('/api/dashboard/forgot-password', async (req, res) => {
   try {
     await sendEmail({
       to: owner,
-      subject: 'Aria Dashboard — Password Reset',
+      subject: 'Aria Dashboard — Set or reset your password',
       html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:20px;">
-        <h2 style="color:#1a1a2e;">Reset your password</h2>
-        <p style="color:#666;line-height:1.6;">Someone requested a password reset for your Aria dashboard. Click the button below to set a new password.</p>
-        <a href="${resetLink}" style="display:inline-block;margin:20px 0;padding:14px 28px;background:#00e5a0;color:#0d0d1f;border-radius:12px;text-decoration:none;font-weight:600;">Reset Password</a>
+        <h2 style="color:#1a1a2e;">Set your Aria dashboard password</h2>
+        <p style="color:#666;line-height:1.6;">Click the button below to set (or reset) your password. Use this whether it's your first time signing in or you've forgotten an old one.</p>
+        <a href="${resetLink}" style="display:inline-block;margin:20px 0;padding:14px 28px;background:#00e5a0;color:#0d0d1f;border-radius:12px;text-decoration:none;font-weight:600;">Set your password</a>
         <p style="color:#999;font-size:12px;">This link expires in 30 minutes. If you didn't request this, you can ignore this email.</p>
       </div>`,
     });
@@ -2537,8 +2537,8 @@ app.post('/api/dashboard/forgot-password', async (req, res) => {
     console.warn('Failed to send reset email:', e.message);
     // Fall back — try sending via Gmail if SMTP not configured
     try {
-      await smartSend({ ownerEmail: owner, to: owner, subject: 'Aria Dashboard — Password Reset',
-        html: `<p>Click here to reset your Aria dashboard password:</p><p><a href="${resetLink}">${resetLink}</a></p><p style="color:#999;font-size:12px;">Expires in 30 minutes.</p>` });
+      await smartSend({ ownerEmail: owner, to: owner, subject: 'Aria Dashboard — Set or reset your password',
+        html: `<p>Click here to set or reset your Aria dashboard password:</p><p><a href="${resetLink}">${resetLink}</a></p><p style="color:#999;font-size:12px;">Expires in 30 minutes.</p>` });
       res.json({ ok: true, message: 'Reset link sent to your email' });
     } catch (e2) {
       res.status(500).json({ error: 'Failed to send reset email. Contact support.' });
@@ -2850,7 +2850,7 @@ app.get('/connect/gmail', (req, res) => {
       <div id="msg" class="msg"></div>
       <input type="password" id="pw" placeholder="Enter your password" autofocus onkeydown="if(event.key==='Enter')login()">
       <button class="btn" onclick="login()">Login</button>
-      <button id="forgotBtn" onclick="forgotPw()" style="background:none;border:none;color:#6b6b8a;font-size:12px;cursor:pointer;margin-top:12px;font-family:inherit;">Forgot password?</button>
+      <button id="forgotBtn" onclick="forgotPw()" style="background:none;border:none;color:#6b6b8a;font-size:12px;cursor:pointer;margin-top:12px;font-family:inherit;">Forgot or first time? Reset password →</button>
       <div class="footer">Powered by <a href="https://aireyai.co.uk">AireyAi</a></div>
     </div>
     <script>
@@ -2875,7 +2875,7 @@ app.get('/connect/gmail', (req, res) => {
         const data = await r.json();
         const el = document.getElementById('msg');
         if (data.ok) {
-          el.textContent = 'Reset link sent to your email!';
+          el.textContent = 'Check your email — we just sent a link to set your password.';
           el.className = 'msg';
           el.style.display = 'block';
           el.style.background = 'rgba(0,229,160,0.1)';
@@ -2885,7 +2885,7 @@ app.get('/connect/gmail', (req, res) => {
           el.textContent = data.error || 'Failed to send reset link';
           el.className = 'msg error';
         }
-        btn.textContent = 'Forgot password?';
+        btn.textContent = 'Forgot or first time? Reset password →';
         btn.disabled = false;
       }
     </script>
