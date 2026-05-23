@@ -1884,7 +1884,13 @@ const bookings     = [];
 const reviews      = new Map();  // slug → [{id, name, email, rating, text, service, date, submittedAt, source, approved, rejected}]
 const npsScores    = [];
 const abResults    = { A:{ opens:0, leads:0 }, B:{ opens:0, leads:0 } };
-const gaps         = [];        // knowledge gaps: questions bot couldn't answer
+const gaps         = [];        // knowledge gaps: questions bot couldn't answer (slug-tagged)
+// Self-improvement loop: gaps that have been clustered (>=3 similar visitor
+// questions for the same slug) are promoted to "learning proposals" awaiting
+// owner approval. Approved proposals graduate to regular FAQ entries.
+//   proposal: { id, slug, question, variants[], evidenceCount, suggestedAnswer,
+//               status: 'pending'|'approved'|'rejected', createdAt, decidedAt? }
+const learningProposals = new Map(); // proposalId → proposal
 const leadStatuses = new Map(); // email → { status, notes, updatedAt }
 let faqSeq = 1;
 const MAX_SESS = 2000;
@@ -2028,6 +2034,10 @@ function save(name, data, delay = 500) {
   // Knowledge gaps
   const savedGaps = loadFile('gaps', []);
   gaps.push(...savedGaps);
+
+  // Learning proposals (self-improvement loop — clustered gaps awaiting owner approval)
+  const savedLearnings = loadFile('learningProposals', []);
+  for (const p of savedLearnings) learningProposals.set(p.id, p);
 
   // Dropship product catalogue (critical — losing this means orders can't auto-fulfil)
   const savedProducts = loadFile('dsProducts', []);
@@ -6044,10 +6054,21 @@ app.post('/api/ab', (req, res) => {
 });
 
 // ─── Knowledge gaps ───────────────────────────────────────────────────────────
+// Each gap is now tagged with `slug` so the self-improvement loop can cluster
+// per-client (different businesses have different question patterns — a salon
+// gets "do you do lash tints?" while a roofer gets "how much for flat roof?").
 app.post('/api/gap', (req, res) => {
-  const { question, page, url } = req.body;
+  const { question, page, url, slug: bodySlug } = req.body;
   if (!question?.trim()) return res.json({ ok:true });
-  gaps.unshift({ question: question.trim(), page, url, ts: new Date() });
+  const slug = String(bodySlug || '').toLowerCase().trim() || deriveSlugFromRequest(req) || 'unknown';
+  gaps.unshift({
+    id: 'gap_' + crypto.randomBytes(6).toString('hex'),
+    slug,
+    question: question.trim(),
+    page,
+    url,
+    ts: new Date(),
+  });
   if (gaps.length > 300) gaps.length = 300;
   save('gaps', gaps, 2000);
   res.json({ ok:true });
@@ -6476,6 +6497,193 @@ function deriveSlugFromRequest(req) {
   return host.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || null;
 }
 
+// ─── Self-improvement loop ──────────────────────────────────────────────────
+// Cluster recent gaps for one slug by token-overlap similarity, surface
+// clusters of 3+ as "learning proposals" awaiting owner approval. We
+// deliberately stay simple (no embedding model, no Claude call) — Jaccard
+// on stemmed tokens catches obvious duplicates ("do you do lash extensions"
+// vs "can I book lash extensions") without an external dependency.
+
+// Strip stop-words + punctuation + lowercase. Returns a Set of significant
+// tokens for similarity comparison.
+const _STOPWORDS = new Set([
+  'a','an','and','are','as','at','be','by','do','does','for','from','have',
+  'i','if','in','is','it','my','of','on','or','the','to','was','we','what',
+  'will','with','you','your','about','can','could','would','should','how',
+  'when','where','who','why','this','that','there','any','some','me','our',
+]);
+function _gapTokens(text) {
+  return new Set(
+    String(text || '').toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(w => w.length >= 3 && !_STOPWORDS.has(w))
+  );
+}
+
+// Jaccard similarity: |intersection| / |union|. 0..1, threshold ~0.5 for
+// "same question" on short trade questions. Tuned conservatively to avoid
+// false-positive clustering of "do you do roofs" with "do you do extensions".
+function _gapSimilarity(a, b) {
+  const inter = [...a].filter(t => b.has(t)).length;
+  const union = new Set([...a, ...b]).size;
+  return union === 0 ? 0 : inter / union;
+}
+
+const LEARNING_CLUSTER_MIN = 3;             // Fork 1 (A): need 3+ gaps to propose
+const LEARNING_CLUSTER_THRESHOLD = 0.5;     // Jaccard threshold (lower = more lenient)
+const LEARNING_WINDOW_DAYS = 30;            // only consider recent-ish gaps
+
+// Recompute clusters for one slug and create learning proposals for any
+// cluster of 3+ similar gaps that doesn't already have a pending proposal.
+// Returns the count of new proposals created.
+function refreshLearningProposalsForSlug(slug) {
+  if (!slug || slug === 'unknown') return 0;
+  const cutoff = Date.now() - LEARNING_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  const recent = gaps.filter(g => g.slug === slug && new Date(g.ts).getTime() >= cutoff);
+  if (recent.length < LEARNING_CLUSTER_MIN) return 0;
+
+  // Track which gaps are already covered by an existing pending/approved proposal
+  const usedGapIds = new Set();
+  for (const p of learningProposals.values()) {
+    if (p.slug !== slug) continue;
+    if (p.status === 'rejected') continue;
+    for (const v of (p.variantIds || [])) usedGapIds.add(v);
+  }
+
+  // Greedy clustering — for each unclustered gap, find similar ones, group together
+  const tokens = recent.map(g => ({ gap: g, tk: _gapTokens(g.question) }));
+  const clusters = [];
+  const claimed = new Set();
+  for (let i = 0; i < tokens.length; i++) {
+    if (claimed.has(i) || usedGapIds.has(tokens[i].gap.id)) continue;
+    const cluster = [tokens[i]];
+    claimed.add(i);
+    for (let j = i + 1; j < tokens.length; j++) {
+      if (claimed.has(j) || usedGapIds.has(tokens[j].gap.id)) continue;
+      if (_gapSimilarity(tokens[i].tk, tokens[j].tk) >= LEARNING_CLUSTER_THRESHOLD) {
+        cluster.push(tokens[j]);
+        claimed.add(j);
+      }
+    }
+    if (cluster.length >= LEARNING_CLUSTER_MIN) clusters.push(cluster);
+  }
+
+  let created = 0;
+  for (const cluster of clusters) {
+    // Pick the most recent gap's question as the canonical phrasing — usually
+    // the freshest expression of the pattern.
+    const sorted = [...cluster].sort((a, b) =>
+      new Date(b.gap.ts).getTime() - new Date(a.gap.ts).getTime()
+    );
+    const proposal = {
+      id: 'lp_' + crypto.randomBytes(8).toString('hex'),
+      slug,
+      question: sorted[0].gap.question,
+      variants: cluster.map(c => c.gap.question),
+      variantIds: cluster.map(c => c.gap.id).filter(Boolean),
+      evidenceCount: cluster.length,
+      suggestedAnswer: '',                  // owner fills this in on approval
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      decidedAt: null,
+    };
+    learningProposals.set(proposal.id, proposal);
+    created++;
+  }
+  if (created > 0) {
+    save('learningProposals', [...learningProposals.values()], 1000);
+    console.log(`🧠 Learning proposals: ${created} new for slug=${slug}`);
+  }
+  return created;
+}
+
+// Run clustering for every slug that has had gaps recently. Called by the
+// weekly cron right before the digest goes out.
+function refreshAllLearningProposals() {
+  const slugSet = new Set(gaps.map(g => g.slug).filter(s => s && s !== 'unknown'));
+  let total = 0;
+  for (const slug of slugSet) total += refreshLearningProposalsForSlug(slug);
+  return total;
+}
+
+// Master-admin endpoint: list all pending proposals across slugs. Kyle's
+// at-a-glance "what does Aria want to learn?" view.
+app.get('/api/admin/learning', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  _hardenAdminResponse(res);
+  const all = [...learningProposals.values()];
+  const pending = all.filter(p => p.status === 'pending').sort((a, b) =>
+    b.evidenceCount - a.evidenceCount || new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  );
+  res.json({
+    pending,
+    countsByStatus: {
+      pending: all.filter(p => p.status === 'pending').length,
+      approved: all.filter(p => p.status === 'approved').length,
+      rejected: all.filter(p => p.status === 'rejected').length,
+    },
+  });
+});
+
+// Trigger clustering manually (testing). Body: { slug?: string }
+app.post('/api/admin/learning/refresh', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  _hardenAdminResponse(res);
+  const { slug } = req.body || {};
+  const created = slug ? refreshLearningProposalsForSlug(slug) : refreshAllLearningProposals();
+  res.json({ ok: true, created });
+});
+
+// Approve a proposal: writes a regular FAQ entry with the owner-supplied
+// answer, marks proposal approved. Aria will use the new FAQ on next chat.
+app.post('/api/admin/learning/:id/approve', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  _hardenAdminResponse(res);
+  const { answer } = req.body || {};
+  const proposal = learningProposals.get(req.params.id);
+  if (!proposal) return res.status(404).json({ error: 'Proposal not found' });
+  if (proposal.status !== 'pending') return res.status(400).json({ error: `Already ${proposal.status}` });
+  if (!answer?.trim()) return res.status(400).json({ error: 'answer required' });
+
+  // Promote to FAQ. Reuse the existing faqs Map shape so Aria's chat
+  // handler picks it up without further changes.
+  const faqId = 'faq_' + crypto.randomBytes(6).toString('hex');
+  faqs.set(faqId, {
+    id: faqId,
+    slug: proposal.slug,
+    question: proposal.question,
+    answer: answer.trim(),
+    approved: true,
+    hits: 0,
+    ts: new Date(),
+    source: 'learning_proposal',
+    proposalId: proposal.id,
+  });
+  proposal.status = 'approved';
+  proposal.decidedAt = new Date().toISOString();
+  proposal.suggestedAnswer = answer.trim();
+  proposal.faqId = faqId;
+  save('faqs', [...faqs.values()], 1000);
+  save('learningProposals', [...learningProposals.values()], 1000);
+  console.log(`✅ Learning proposal approved: ${proposal.id} → faq ${faqId} (slug=${proposal.slug})`);
+  res.json({ ok: true, faqId });
+});
+
+// Reject a proposal: marks it dismissed, the underlying gaps stay in the
+// raw gaps array but won't be re-clustered into a new proposal.
+app.post('/api/admin/learning/:id/reject', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  _hardenAdminResponse(res);
+  const proposal = learningProposals.get(req.params.id);
+  if (!proposal) return res.status(404).json({ error: 'Proposal not found' });
+  if (proposal.status !== 'pending') return res.status(400).json({ error: `Already ${proposal.status}` });
+  proposal.status = 'rejected';
+  proposal.decidedAt = new Date().toISOString();
+  save('learningProposals', [...learningProposals.values()], 1000);
+  res.json({ ok: true });
+});
+
 // ─── Onboarding emails ──────────────────────────────────────────────────────
 // Two triggers: welcome email when a new owner is added, first-chat milestone
 // when Aria handles her first conversation on a client site. Both file-backed
@@ -6561,6 +6769,218 @@ async function sendOwnerWelcomeEmail({ slug, ownerEmail, serverUrl }) {
   }
 }
 
+// HTML view of pending learning proposals for Kyle (master admin only).
+// Each proposal shows the canonical question, evidence count, sample
+// visitor variants, and a textarea for the answer. Approve writes it
+// to faqs immediately; Reject dismisses it permanently. All dynamic
+// content rendered via DOM APIs (no innerHTML splicing) per the
+// security review hook.
+app.get('/admin/learning', (req, res) => {
+  _hardenAdminResponse(res);
+  if (!adminAuth(req)) return res.redirect('/admin');
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aria — Learning Proposals</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+         background: #0d0d1f; color: #eeeef8; min-height: 100vh; line-height: 1.5; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 32px 24px; }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px;
+           padding-bottom: 16px; border-bottom: 1px solid #2a2a44; }
+  h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; }
+  .back { font-size: 13px; color: #22D3E0; text-decoration: none; }
+  .empty { background: #1a1a2e; border: 1px dashed #2a2a44; border-radius: 12px;
+           padding: 36px; text-align: center; color: #9898b8; font-size: 14px; }
+  .proposal { background: #1a1a2e; border: 1px solid #2a2a44; border-radius: 12px;
+              padding: 22px; margin-bottom: 16px; }
+  .p-head { display: flex; align-items: center; justify-content: space-between;
+            margin-bottom: 12px; gap: 12px; flex-wrap: wrap; }
+  .p-slug { display: inline-block; padding: 3px 10px; background: #22D3E033;
+            color: #22D3E0; border-radius: 999px; font-size: 11px;
+            font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+  .p-count { font-size: 12px; color: #9898b8; }
+  .p-q { font-size: 16px; color: #eeeef8; font-weight: 600; margin-bottom: 8px; }
+  .p-variants { font-size: 12px; color: #9898b8; margin-bottom: 14px;
+                background: #13131f; border-radius: 8px; padding: 10px 12px;
+                border-left: 2px solid #2a2a44; }
+  .p-variants summary { cursor: pointer; outline: none; }
+  .p-variants ul { margin-top: 8px; padding-left: 18px; }
+  .p-variants li { margin: 4px 0; }
+  textarea.answer { width: 100%; min-height: 80px; padding: 10px 12px;
+                    background: #13131f; border: 1.5px solid #2a2a44;
+                    color: #eeeef8; border-radius: 8px; font-size: 14px;
+                    font-family: inherit; outline: none; resize: vertical;
+                    margin-bottom: 12px; }
+  textarea.answer:focus { border-color: #22D3E0; }
+  .actions { display: flex; gap: 8px; }
+  button { padding: 9px 18px; border-radius: 8px; border: none; cursor: pointer;
+           font-size: 13px; font-weight: 600; font-family: inherit; transition: opacity .15s; }
+  button:hover { opacity: 0.9; }
+  .btn-approve { background: #00e5a0; color: #0d0d1f; }
+  .btn-reject { background: transparent; border: 1px solid #2a2a44; color: #c0c0e0; }
+  .feedback { margin-left: 12px; font-size: 12px; align-self: center; }
+  .feedback.ok { color: #00e5a0; }
+  .feedback.err { color: #ff6b6b; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Aria — Learning Proposals</h1>
+    <a class="back" href="/admin">← back to admin</a>
+  </header>
+  <p style="font-size:13px;color:#9898b8;margin-bottom:24px;">Questions visitors have asked that Aria couldn't answer. Write an answer + approve to teach her permanently. 3+ similar visitor questions trigger a proposal.</p>
+  <div id="mount"><div class="empty">Loading proposals…</div></div>
+</div>
+<script>
+(function() {
+  const mount = document.getElementById('mount');
+
+  function showEmpty(text) {
+    mount.replaceChildren();
+    const e = document.createElement('div');
+    e.className = 'empty';
+    e.textContent = text;
+    mount.appendChild(e);
+  }
+
+  function makeProposal(p) {
+    const wrap = document.createElement('div');
+    wrap.className = 'proposal';
+    wrap.dataset.id = p.id;
+
+    const head = document.createElement('div');
+    head.className = 'p-head';
+    const left = document.createElement('div');
+    const slug = document.createElement('span');
+    slug.className = 'p-slug';
+    slug.textContent = p.slug || 'unknown';
+    left.appendChild(slug);
+    const count = document.createElement('span');
+    count.className = 'p-count';
+    count.style.marginLeft = '10px';
+    count.textContent = (p.evidenceCount || 1) + ' visitor' + (p.evidenceCount === 1 ? '' : 's') + ' asked';
+    left.appendChild(count);
+    head.appendChild(left);
+    wrap.appendChild(head);
+
+    const q = document.createElement('div');
+    q.className = 'p-q';
+    q.textContent = '"' + (p.question || '') + '"';
+    wrap.appendChild(q);
+
+    if (p.variants && p.variants.length > 1) {
+      const det = document.createElement('details');
+      det.className = 'p-variants';
+      const sum = document.createElement('summary');
+      sum.textContent = 'View all ' + p.variants.length + ' visitor phrasings';
+      det.appendChild(sum);
+      const ul = document.createElement('ul');
+      for (const v of p.variants) {
+        const li = document.createElement('li');
+        li.textContent = v;
+        ul.appendChild(li);
+      }
+      det.appendChild(ul);
+      wrap.appendChild(det);
+    }
+
+    const ta = document.createElement('textarea');
+    ta.className = 'answer';
+    ta.placeholder = "Teach Aria how to answer this. She'll use this verbatim with future visitors.";
+    wrap.appendChild(ta);
+
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    const approve = document.createElement('button');
+    approve.className = 'btn-approve';
+    approve.textContent = 'Approve & teach Aria';
+    const reject = document.createElement('button');
+    reject.className = 'btn-reject';
+    reject.textContent = 'Dismiss';
+    const fb = document.createElement('span');
+    fb.className = 'feedback';
+    actions.appendChild(approve);
+    actions.appendChild(reject);
+    actions.appendChild(fb);
+    wrap.appendChild(actions);
+
+    approve.addEventListener('click', async () => {
+      const answer = ta.value.trim();
+      if (!answer) { fb.className = 'feedback err'; fb.textContent = 'Write an answer first'; return; }
+      approve.disabled = true; reject.disabled = true;
+      fb.className = 'feedback'; fb.textContent = 'Saving…';
+      try {
+        const r = await fetch('/api/admin/learning/' + encodeURIComponent(p.id) + '/approve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ answer }),
+        });
+        if (r.ok) {
+          fb.className = 'feedback ok';
+          fb.textContent = 'Approved — Aria will use this now';
+          setTimeout(() => wrap.remove(), 1200);
+        } else {
+          const j = await r.json().catch(() => ({}));
+          fb.className = 'feedback err';
+          fb.textContent = j.error || 'Save failed';
+          approve.disabled = false; reject.disabled = false;
+        }
+      } catch (e) {
+        fb.className = 'feedback err';
+        fb.textContent = 'Network error';
+        approve.disabled = false; reject.disabled = false;
+      }
+    });
+
+    reject.addEventListener('click', async () => {
+      approve.disabled = true; reject.disabled = true;
+      fb.className = 'feedback'; fb.textContent = 'Dismissing…';
+      try {
+        const r = await fetch('/api/admin/learning/' + encodeURIComponent(p.id) + '/reject', {
+          method: 'POST', credentials: 'same-origin',
+        });
+        if (r.ok) { wrap.remove(); }
+        else { fb.className = 'feedback err'; fb.textContent = 'Dismiss failed';
+               approve.disabled = false; reject.disabled = false; }
+      } catch (e) {
+        fb.className = 'feedback err'; fb.textContent = 'Network error';
+        approve.disabled = false; reject.disabled = false;
+      }
+    });
+
+    return wrap;
+  }
+
+  async function load() {
+    try {
+      const r = await fetch('/api/admin/learning', { credentials: 'same-origin' });
+      if (r.status === 403) { location.href = '/admin'; return; }
+      const data = await r.json();
+      const items = data.pending || [];
+      if (!items.length) {
+        showEmpty('No pending proposals. Aria proposes new FAQs after 3+ visitors ask the same unanswered question. Check back next week.');
+        return;
+      }
+      mount.replaceChildren();
+      for (const p of items) mount.appendChild(makeProposal(p));
+    } catch (e) {
+      showEmpty('Failed to load proposals: ' + (e.message || 'unknown error'));
+    }
+  }
+  load();
+})();
+</script>
+</body>
+</html>`);
+});
+
 // Trigger weekly digest manually (for testing — cron handles the schedule).
 // Body: { dryRun?: bool, ownerEmail?: string }
 app.post('/admin/analytics/send-digest', async (req, res) => {
@@ -6609,7 +7029,17 @@ async function sendWeeklyDigests({ dryRun = false, ownerEmailFilter = null } = {
     const businessType = row.businessType || 'generic';
     const weekStart = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
     const weekEnd = new Date().toISOString().slice(0, 10);
-    const html = renderWeeklyDigestHtml({ slug, businessType, weekStart, weekEnd, row });
+    // Surface pending learning proposals for this slug — the digest links to
+    // /admin/learning where Kyle one-clicks approve. Limits to top 5 by evidence.
+    const pendingLearnings = [...learningProposals.values()]
+      .filter(p => p.slug === slug && p.status === 'pending')
+      .sort((a, b) => b.evidenceCount - a.evidenceCount)
+      .slice(0, 5);
+    const html = renderWeeklyDigestHtml({
+      slug, businessType, weekStart, weekEnd, row,
+      pendingLearnings,
+      learningUrl: `${process.env.RAILWAY_PUBLIC_DOMAIN ? 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN : ''}/admin/learning?slug=${encodeURIComponent(slug)}`,
+    });
     const hot = row.counts?.lead_hot || 0;
     const subject = hot > 0
       ? `Aria found ${hot} hot lead${hot === 1 ? '' : 's'} for you this week`
@@ -6643,6 +7073,10 @@ setInterval(async () => {
   if (!isMon || !isHour || _lastDigestRunIso === ymd) return;
   _lastDigestRunIso = ymd;
   try {
+    // Refresh learning proposals first so this week's digest includes any
+    // freshly-clustered gaps from the past 7 days.
+    const lp = refreshAllLearningProposals();
+    if (lp > 0) console.log(`🧠 Weekly cron: ${lp} new learning proposals generated`);
     const r = await sendWeeklyDigests({});
     console.log(`📊 Weekly digest run: ${r.sent} sent, ${r.skipped} skipped, ${r.failed} failed`);
   } catch (e) {
