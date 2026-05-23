@@ -4136,7 +4136,9 @@ app.post('/api/chat/router', async (req, res) => {
 
     // Funnel analytics — one event per chat round-trip, plus higher-signal
     // events for lead capture + hot-lead promotion + after-hours engagement.
-    const _slug = clientConfig.slug || 'unknown';
+    // Prefer explicit clientConfig.slug, then derive from Origin/Referer host
+    // so widgets that forgot to set data-slug still get attributed per site.
+    const _slug = clientConfig.slug || deriveSlugFromRequest(req) || 'unknown';
     const _owner = clientConfig.handoffEmail || null;
     recordEvent({ slug: _slug, event: 'chat_message', sessionId, ownerEmail: _owner });
     // Fire first-chat milestone email exactly once per slug (file-backed dedupe).
@@ -6438,6 +6440,41 @@ app.get('/admin/sessions/:slug', (req, res) => {
   });
   res.json(result);
 });
+
+// ─── Slug auto-detection from request origin ────────────────────────────────
+// When a chat widget POSTs to /api/chat without an explicit clientConfig.slug
+// (the common case for embeds installed before we added the analytics layer),
+// derive a stable slug from the Origin or Referer host. Maps known hosts to
+// their canonical slugs; falls back to host-hyphenated form otherwise.
+//
+// Example: https://ejroofing.co.uk/ → "ejroofing-co-uk"
+//          https://www.dolledbylouise.co.uk/about → "dolledbylouise-co-uk"
+//
+// This means embeds that forgot data-slug still get attributed per site,
+// which fixes the ~97% of chats currently orphaned to slug:"unknown".
+const HOST_SLUG_OVERRIDES = {
+  // Map known hosts to their canonical jarvis-registry slug for cross-system
+  // consistency. Hosts not listed fall back to auto-hyphenation.
+  'ejroofing.co.uk':         'ej_roofing',
+  'howhighscaffolding.co.uk': 'howhighscaffolding',
+  'dolledbylouise.co.uk':    'dolled_by_louise',
+  'theskinden.co.uk':        'the_skin_den',
+};
+function deriveSlugFromRequest(req) {
+  if (!req) return null;
+  const raw = req.get('Origin') || req.get('Referer') || '';
+  if (!raw) return null;
+  let host = '';
+  try { host = new URL(raw).hostname; } catch { return null; }
+  if (!host) return null;
+  host = host.toLowerCase().replace(/^www\./, '');
+  if (HOST_SLUG_OVERRIDES[host]) return HOST_SLUG_OVERRIDES[host];
+  // Reject obvious non-client hosts to avoid polluting analytics with
+  // localhost, Railway preview, or aria.html (the marketing page itself).
+  if (host === 'localhost' || host.endsWith('.up.railway.app') || host === 'aireyai.co.uk') return null;
+  // Generic fallback: ejroofing.co.uk → ejroofing-co-uk
+  return host.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || null;
+}
 
 // ─── Onboarding emails ──────────────────────────────────────────────────────
 // Two triggers: welcome email when a new owner is added, first-chat milestone
