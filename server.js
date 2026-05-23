@@ -6512,12 +6512,20 @@ const _STOPWORDS = new Set([
   'will','with','you','your','about','can','could','would','should','how',
   'when','where','who','why','this','that','there','any','some','me','our',
 ]);
+// Very light stemmer — collapses "weddings"/"wedding", "prices"/"price",
+// "extensions"/"extension" to the same token. Avoids breaking "pass"/"boss"
+// by only stripping when length > 4 and the token doesn't end in "ss".
+function _stem(w) {
+  if (w.length > 4 && w.endsWith('s') && !w.endsWith('ss')) return w.slice(0, -1);
+  return w;
+}
 function _gapTokens(text) {
   return new Set(
     String(text || '').toLowerCase()
       .replace(/[^a-z0-9\s]/g, ' ')
       .split(/\s+/)
       .filter(w => w.length >= 3 && !_STOPWORDS.has(w))
+      .map(_stem)
   );
 }
 
