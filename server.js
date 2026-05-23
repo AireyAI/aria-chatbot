@@ -10086,9 +10086,14 @@ tr:last-child td{border-bottom:none;}
       <div style="padding:16px 20px;">
         <p style="font-size:13px;color:#9898b8;margin-bottom:16px;">Connect your social accounts so Aria can auto-reply to messages.</p>
 
-        <a href="/connect/meta?owner=\${encodeURIComponent(OWNER)}&s=\${encodeURIComponent(TOKEN)}" id="meta-connect-btn" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:13px;background:#1877F2;color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;margin-bottom:20px;">
+        <a href="/connect/meta?owner=\${encodeURIComponent(OWNER)}&s=\${encodeURIComponent(TOKEN)}" id="meta-connect-btn" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:13px;background:#1877F2;color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;margin-bottom:10px;">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg>
-          Connect Facebook &amp; Instagram
+          Connect Facebook (Page + Messenger)
+        </a>
+
+        <a href="/connect/instagram?owner=\${encodeURIComponent(OWNER)}&s=\${encodeURIComponent(TOKEN)}" id="ig-connect-btn" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:13px;background:linear-gradient(45deg,#FED373 0%,#F15245 35%,#D92E7F 65%,#9B36B7 100%);color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;margin-bottom:20px;box-shadow:0 4px 14px rgba(217,46,127,0.25);">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg>
+          Connect Instagram (DMs)
         </a>
 
         <div id="channel-cards" style="display:flex;flex-direction:column;gap:12px;"></div>
@@ -10726,6 +10731,128 @@ app.get('/api/meta/webhook', (req, res) => {
     return res.status(200).send(challenge);
   }
   res.status(403).send('Forbidden');
+});
+
+// ─── Instagram Business Login (standalone, no FB Page required) ──────────────
+// Meta launched IG-direct OAuth in late 2024. Endpoint is api.instagram.com,
+// scopes use instagram_business_* prefix. App must have Instagram product
+// added in Meta dashboard with OAuth redirect URI whitelisted.
+const IG_OAUTH_STATES = new Map();
+const IG_SCOPES = [
+  'instagram_business_basic',
+  'instagram_business_manage_messages',
+  'instagram_business_manage_comments',
+].join(',');
+
+app.get('/connect/instagram', (req, res) => {
+  const owner = (req.query.owner || '').toString();
+  const sessionToken = (req.query.s || '').toString();
+  if (!owner || !sessionToken || !validateSession(sessionToken, owner)) {
+    return res.status(401).send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;min-height:100vh">
+      <h2>Not signed in</h2>
+      <p><a href="/connect/gmail?owner=${encodeURIComponent(owner)}" style="color:#00e5a0">Go to login →</a></p>
+    </body></html>`);
+  }
+  if (!process.env.META_APP_ID || !process.env.META_APP_SECRET) {
+    return res.status(500).send('<h2>Meta credentials not configured</h2>');
+  }
+
+  // Prune expired states
+  const now = Date.now();
+  for (const [k, v] of IG_OAUTH_STATES) if (v.expiresAt < now) IG_OAUTH_STATES.delete(k);
+
+  const state = crypto.randomBytes(24).toString('hex');
+  IG_OAUTH_STATES.set(state, { owner, sessionToken, expiresAt: Date.now() + META_OAUTH_TTL_MS });
+
+  const redirect = `${metaPublicBase(req)}/auth/instagram/callback`;
+  // Instagram OAuth uses www.instagram.com/oauth/authorize (not facebook.com).
+  // enable_fb_login=0 forces the IG-only flow (no fallback to FB Login).
+  const url = `https://www.instagram.com/oauth/authorize`
+    + `?client_id=${process.env.META_APP_ID}`
+    + `&redirect_uri=${encodeURIComponent(redirect)}`
+    + `&state=${state}`
+    + `&scope=${encodeURIComponent(IG_SCOPES)}`
+    + `&response_type=code`
+    + `&enable_fb_login=0`
+    + `&force_authentication=1`;
+  res.redirect(url);
+});
+
+app.get('/auth/instagram/callback', async (req, res) => {
+  const { code, state, error, error_description } = req.query;
+  if (error) {
+    return res.status(400).send(`<html><body style="font-family:sans-serif;padding:40px;background:#0d0d1f;color:#eee;min-height:100vh">
+      <h2>Instagram returned an error</h2>
+      <p><b>${escapeHtml(String(error))}</b>: ${escapeHtml(String(error_description || ''))}</p>
+    </body></html>`);
+  }
+  const st = state && IG_OAUTH_STATES.get(String(state));
+  if (!st) return res.status(400).send('<h2>State expired — start over from your dashboard.</h2>');
+  IG_OAUTH_STATES.delete(String(state));
+
+  const { owner, sessionToken } = st;
+  const redirect = `${metaPublicBase(req)}/auth/instagram/callback`;
+
+  try {
+    // 1. Exchange code → short-lived IG user access token (1 hour)
+    const formBody = new URLSearchParams({
+      client_id: process.env.META_APP_ID,
+      client_secret: process.env.META_APP_SECRET,
+      grant_type: 'authorization_code',
+      redirect_uri: redirect,
+      code: String(code),
+    });
+    const tokRes = await fetch('https://api.instagram.com/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formBody.toString(),
+    });
+    const tok = await tokRes.json();
+    if (!tok.access_token) throw new Error('No access_token from IG: ' + JSON.stringify(tok));
+
+    // 2. Exchange short-lived → long-lived IG token (60 days)
+    const llUrl = `https://graph.instagram.com/access_token`
+      + `?grant_type=ig_exchange_token`
+      + `&client_secret=${encodeURIComponent(process.env.META_APP_SECRET)}`
+      + `&access_token=${encodeURIComponent(tok.access_token)}`;
+    const llRes = await fetch(llUrl);
+    const ll = await llRes.json();
+    const igToken = ll.access_token || tok.access_token;
+
+    // 3. Fetch IG user profile (username, id)
+    const meRes = await fetch(`https://graph.instagram.com/v18.0/me?fields=id,username,user_id,account_type&access_token=${encodeURIComponent(igToken)}`);
+    const me = await meRes.json();
+    if (!me.id) throw new Error('No IG profile: ' + JSON.stringify(me));
+
+    // 4. Save to channelConfigs.instagram (preserve enabled toggle if reconnecting)
+    const existing = channelConfigs.get(owner) || {};
+    existing.instagram = {
+      igUserId: me.user_id || me.id,
+      igUsername: me.username,
+      accountType: me.account_type,
+      accessToken: igToken,
+      enabled: existing.instagram?.enabled === true,
+      source: 'instagram-direct',
+      connectedAt: new Date().toISOString(),
+    };
+    channelConfigs.set(owner, existing);
+    persistChannels();
+
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Aria — Instagram Connected</title></head>
+    <body style="font-family:-apple-system,sans-serif;background:#0d0d1f;color:#eee;min-height:100vh;padding:40px;">
+      <div style="max-width:560px;margin:0 auto;background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:32px;">
+        <h2 style="margin:0 0 8px;background:linear-gradient(45deg,#FED373,#F15245,#D92E7F,#9B36B7);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">✓ Instagram Connected</h2>
+        <p style="color:#9898b8;font-size:14px;margin:0 0 20px;">Aria can now receive DMs sent to <b>@${escapeHtml(me.username || '')}</b>. Replies stay off until you flip the toggle in your dashboard.</p>
+        <a href="/dashboard?owner=${encodeURIComponent(owner)}&s=${encodeURIComponent(sessionToken)}" style="display:inline-block;margin-top:8px;padding:12px 22px;background:linear-gradient(45deg,#F15245,#D92E7F);color:#fff;border-radius:10px;text-decoration:none;font-weight:600;">Back to dashboard →</a>
+      </div>
+    </body></html>`);
+  } catch (e) {
+    console.error('[ig-oauth] callback failed', e);
+    res.status(500).send(`<html><body style="font-family:sans-serif;padding:40px;background:#0d0d1f;color:#eee;min-height:100vh">
+      <h2>Instagram OAuth failed</h2>
+      <pre style="background:#0a0a18;padding:16px;border-radius:8px;overflow:auto">${escapeHtml(e.message)}</pre>
+    </body></html>`);
+  }
 });
 
 app.post('/api/meta/webhook', (req, res) => {
