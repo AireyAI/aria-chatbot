@@ -10502,6 +10502,176 @@ async function loadMessages(page, channel) {
 </body></html>`);
 });
 
+// ─── Meta OAuth (Facebook Login for Business) ────────────────────────────────
+// Flow: /connect/meta?owner=&s= → FB OAuth dialog → /auth/meta/callback
+// On success: enumerates Pages + linked IG accounts, subscribes each Page to
+// the app's webhooks, stores tokens in channelConfigs[owner] with enabled:false.
+// Owner must explicitly toggle each channel on from the dashboard before any
+// reply is generated (handleIncomingChannelMessage gates on `enabled`).
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+const META_OAUTH_STATES = new Map(); // stateToken → { owner, sessionToken, expiresAt }
+const META_OAUTH_TTL_MS = 10 * 60 * 1000;
+const META_SCOPES = [
+  'pages_show_list',
+  'pages_messaging',
+  'pages_manage_metadata',
+  'pages_read_engagement',
+  'instagram_basic',
+  'instagram_manage_messages',
+  'business_management',
+].join(',');
+
+function metaPublicBase(req) {
+  if (req) return `${req.protocol}://${req.get('host')}`;
+  if (process.env.RAILWAY_PUBLIC_DOMAIN) return `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
+  if (process.env.BASE_URL) return process.env.BASE_URL.replace(/\/+$/, '');
+  return `http://localhost:${process.env.PORT || 3000}`;
+}
+
+function pruneMetaStates() {
+  const now = Date.now();
+  for (const [k, v] of META_OAUTH_STATES) if (v.expiresAt < now) META_OAUTH_STATES.delete(k);
+}
+
+app.get('/connect/meta', (req, res) => {
+  const owner = (req.query.owner || '').toString();
+  const sessionToken = (req.query.s || '').toString();
+  if (!owner || !sessionToken || !validateSession(sessionToken, owner)) {
+    return res.status(401).send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;min-height:100vh">
+      <h2>Not signed in</h2>
+      <p>Sign in to your dashboard first, then come back to <code>/connect/meta</code>.</p>
+      <p><a href="/connect/gmail?owner=${encodeURIComponent(owner)}" style="color:#00e5a0">Go to login →</a></p>
+    </body></html>`);
+  }
+  if (!process.env.META_APP_ID || !process.env.META_APP_SECRET) {
+    return res.status(500).send('<h2>Meta credentials not configured</h2>');
+  }
+
+  pruneMetaStates();
+  const state = crypto.randomBytes(24).toString('hex');
+  META_OAUTH_STATES.set(state, { owner, sessionToken, expiresAt: Date.now() + META_OAUTH_TTL_MS });
+
+  const redirect = `${metaPublicBase(req)}/auth/meta/callback`;
+  const url = `https://www.facebook.com/v18.0/dialog/oauth`
+    + `?client_id=${process.env.META_APP_ID}`
+    + `&redirect_uri=${encodeURIComponent(redirect)}`
+    + `&state=${state}`
+    + `&scope=${encodeURIComponent(META_SCOPES)}`
+    + `&response_type=code`;
+  res.redirect(url);
+});
+
+app.get('/auth/meta/callback', async (req, res) => {
+  const { code, state, error, error_description } = req.query;
+  if (error) {
+    return res.status(400).send(`<html><body style="font-family:sans-serif;padding:40px;background:#0d0d1f;color:#eee;min-height:100vh">
+      <h2>Facebook returned an error</h2>
+      <p><b>${escapeHtml(String(error))}</b>: ${escapeHtml(String(error_description || ''))}</p>
+    </body></html>`);
+  }
+  pruneMetaStates();
+  const st = state && META_OAUTH_STATES.get(String(state));
+  if (!st) return res.status(400).send('<h2>State expired — start over from your dashboard.</h2>');
+  META_OAUTH_STATES.delete(String(state));
+
+  const { owner, sessionToken } = st;
+  const redirect = `${metaPublicBase(req)}/auth/meta/callback`;
+
+  try {
+    // 1. Short-lived user token
+    const tokenUrl = `https://graph.facebook.com/v18.0/oauth/access_token`
+      + `?client_id=${process.env.META_APP_ID}`
+      + `&client_secret=${process.env.META_APP_SECRET}`
+      + `&redirect_uri=${encodeURIComponent(redirect)}`
+      + `&code=${encodeURIComponent(String(code))}`;
+    const tokRes = await fetch(tokenUrl);
+    const tok = await tokRes.json();
+    if (!tok.access_token) throw new Error('No access_token: ' + JSON.stringify(tok));
+
+    // 2. Exchange for long-lived (60 days)
+    const llUrl = `https://graph.facebook.com/v18.0/oauth/access_token`
+      + `?grant_type=fb_exchange_token`
+      + `&client_id=${process.env.META_APP_ID}`
+      + `&client_secret=${process.env.META_APP_SECRET}`
+      + `&fb_exchange_token=${tok.access_token}`;
+    const llRes = await fetch(llUrl);
+    const ll = await llRes.json();
+    const userToken = ll.access_token || tok.access_token;
+
+    // 3. Fetch pages + linked IG accounts
+    const pagesRes = await fetch(`https://graph.facebook.com/v18.0/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}&access_token=${userToken}`);
+    const pagesData = await pagesRes.json();
+    const pages = pagesData.data || [];
+
+    if (!pages.length) {
+      return res.send(`<html><body style="font-family:sans-serif;padding:40px;background:#0d0d1f;color:#eee;min-height:100vh">
+        <h2>No Facebook Pages found on your account</h2>
+        <p>You need to be an admin of at least one Page. Create or get admin access to a Page, then re-run /connect/meta.</p>
+      </body></html>`);
+    }
+
+    // 4. Subscribe each page to webhooks + save to channelConfigs
+    const existing = channelConfigs.get(owner) || {};
+    const summary = [];
+    for (const p of pages) {
+      try {
+        const subRes = await fetch(`https://graph.facebook.com/v18.0/${p.id}/subscribed_apps?subscribed_fields=messages,messaging_postbacks,message_deliveries,message_reads&access_token=${p.access_token}`, { method: 'POST' });
+        const subData = await subRes.json();
+        if (!subData.success) console.warn('[meta-oauth] page subscribe failed', p.id, subData);
+      } catch (e) {
+        console.warn('[meta-oauth] page subscribe error', p.id, e.message);
+      }
+      // Save Page (Messenger) channel — disabled by default
+      existing.facebook = existing.facebook || {};
+      existing.facebook = {
+        pageId: p.id,
+        pageName: p.name,
+        accessToken: p.access_token,
+        enabled: existing.facebook?.enabled === true, // preserve prior toggle if reconnecting
+        connectedAt: new Date().toISOString(),
+      };
+      summary.push({ type: 'page', id: p.id, name: p.name });
+
+      // If page has linked IG Business account, save that too
+      const ig = p.instagram_business_account;
+      if (ig?.id) {
+        existing.instagram = {
+          igUserId: ig.id,
+          igUsername: ig.username,
+          pageId: p.id,
+          accessToken: p.access_token, // IG Messaging uses the Page token
+          enabled: existing.instagram?.enabled === true,
+          connectedAt: new Date().toISOString(),
+        };
+        summary.push({ type: 'instagram', id: ig.id, name: '@' + ig.username });
+      }
+    }
+    channelConfigs.set(owner, existing);
+    persistChannels();
+
+    const rows = summary.map(s => `<li><b>${s.type === 'page' ? '📘 Messenger' : '📷 Instagram'}:</b> ${escapeHtml(s.name)} <span style="color:#6b6b8a">(${s.id})</span></li>`).join('');
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Aria — Connected</title></head>
+    <body style="font-family:-apple-system,sans-serif;background:#0d0d1f;color:#eee;min-height:100vh;padding:40px;">
+      <div style="max-width:560px;margin:0 auto;background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:32px;">
+        <h2 style="margin:0 0 8px;color:#00e5a0;">✓ Connected to Facebook</h2>
+        <p style="color:#9898b8;font-size:14px;margin:0 0 20px;">Aria can now <i>receive</i> messages from these channels. Replies stay off until you flip the toggle in your dashboard.</p>
+        <ul style="line-height:1.9;font-size:14px;list-style:none;padding:0;">${rows}</ul>
+        <a href="/dashboard?owner=${encodeURIComponent(owner)}&s=${encodeURIComponent(sessionToken)}" style="display:inline-block;margin-top:20px;padding:12px 22px;background:#00e5a0;color:#0d0d1f;border-radius:10px;text-decoration:none;font-weight:600;">Back to dashboard →</a>
+      </div>
+    </body></html>`);
+  } catch (e) {
+    console.error('[meta-oauth] callback failed', e);
+    res.status(500).send(`<html><body style="font-family:sans-serif;padding:40px;background:#0d0d1f;color:#eee;min-height:100vh">
+      <h2>OAuth callback failed</h2>
+      <pre style="background:#0a0a18;padding:16px;border-radius:8px;overflow:auto">${escapeHtml(e.message)}</pre>
+    </body></html>`);
+  }
+});
+
 // ─── Meta Webhook ────────────────────────────────────────────────────────────
 app.get('/api/meta/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
