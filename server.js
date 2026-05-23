@@ -10537,6 +10537,17 @@ function pruneMetaStates() {
   for (const [k, v] of META_OAUTH_STATES) if (v.expiresAt < now) META_OAUTH_STATES.delete(k);
 }
 
+// Admin-only: mint a dashboard session for any email and kick off /connect/meta.
+// Used by Kyle to connect Meta channels on behalf of any owner without
+// requiring the owner to have a password set up first.
+app.get('/admin/connect/meta-as', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).send('<h2>Admin auth required</h2><p><a href="/admin">Sign in</a></p>');
+  const owner = (req.query.owner || '').toString().toLowerCase().trim();
+  if (!owner || !owner.includes('@')) return res.status(400).send('<h2>Missing ?owner=email</h2>');
+  const token = createSession(owner);
+  res.redirect(`/connect/meta?owner=${encodeURIComponent(owner)}&s=${encodeURIComponent(token)}`);
+});
+
 app.get('/connect/meta', (req, res) => {
   const owner = (req.query.owner || '').toString();
   const sessionToken = (req.query.s || '').toString();
