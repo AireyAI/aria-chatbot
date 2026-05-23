@@ -10086,9 +10086,9 @@ tr:last-child td{border-bottom:none;}
       <div style="padding:16px 20px;">
         <p style="font-size:13px;color:#9898b8;margin-bottom:16px;">Connect your social accounts so Aria can auto-reply to messages.</p>
 
-        <a href="/auth/meta/start?owner=\${encodeURIComponent(OWNER)}&s=\${encodeURIComponent(TOKEN)}" id="meta-connect-btn" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:13px;background:#1877F2;color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;margin-bottom:20px;">
+        <a href="/connect/meta?owner=\${encodeURIComponent(OWNER)}&s=\${encodeURIComponent(TOKEN)}" id="meta-connect-btn" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:13px;background:#1877F2;color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;margin-bottom:20px;">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg>
-          Connect with Facebook
+          Connect Facebook &amp; Instagram
         </a>
 
         <div id="channel-cards" style="display:flex;flex-direction:column;gap:12px;"></div>
@@ -10658,10 +10658,46 @@ app.get('/auth/meta/callback', async (req, res) => {
         summary.push({ type: 'instagram', id: ig.id, name: '@' + ig.username });
       }
     }
+
+    // 5. Look for WhatsApp Business accounts the user manages via Business
+    // Portfolio. Only fires when user has Business Portfolio with WA set up.
+    try {
+      const wabaRes = await fetch(`https://graph.facebook.com/v18.0/me/businesses?fields=id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number}}&access_token=${userToken}`);
+      const wabaData = await wabaRes.json();
+      for (const biz of (wabaData.data || [])) {
+        for (const waba of (biz.owned_whatsapp_business_accounts?.data || [])) {
+          const phone = (waba.phone_numbers?.data || [])[0];
+          if (!phone) continue;
+          existing.whatsapp = {
+            phoneNumberId: phone.id,
+            displayPhone: phone.display_phone_number,
+            wabaId: waba.id,
+            businessName: biz.name,
+            accessToken: userToken,
+            enabled: existing.whatsapp?.enabled === true,
+            connectedAt: new Date().toISOString(),
+          };
+          summary.push({ type: 'whatsapp', id: phone.id, name: phone.display_phone_number });
+          // Subscribe WABA to webhooks
+          try {
+            await fetch(`https://graph.facebook.com/v18.0/${waba.id}/subscribed_apps`, {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${userToken}` },
+            });
+          } catch (e) { console.warn('[meta-oauth] WABA subscribe error', waba.id, e.message); }
+          break; // one WA number per owner for now
+        }
+        if (existing.whatsapp) break;
+      }
+    } catch (e) {
+      console.warn('[meta-oauth] WA enumeration failed:', e.message);
+    }
+
     channelConfigs.set(owner, existing);
     persistChannels();
 
-    const rows = summary.map(s => `<li><b>${s.type === 'page' ? '📘 Messenger' : '📷 Instagram'}:</b> ${escapeHtml(s.name)} <span style="color:#6b6b8a">(${s.id})</span></li>`).join('');
+    const ICONS = { page: '📘 Messenger', instagram: '📷 Instagram', whatsapp: '💬 WhatsApp' };
+    const rows = summary.map(s => `<li><b>${ICONS[s.type] || s.type}:</b> ${escapeHtml(s.name)} <span style="color:#6b6b8a">(${s.id})</span></li>`).join('');
     res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Aria — Connected</title></head>
     <body style="font-family:-apple-system,sans-serif;background:#0d0d1f;color:#eee;min-height:100vh;padding:40px;">
       <div style="max-width:560px;margin:0 auto;background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:32px;">
@@ -11043,168 +11079,10 @@ app.get('/api/channel/reject', (req, res) => {
   </body></html>`);
 });
 
-// ─── Meta OAuth (Facebook Login) ─────────────────────────────────────────────
-app.get('/auth/meta/start', (req, res) => {
-  if (!process.env.META_APP_ID || !process.env.META_APP_SECRET) {
-    return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><h2>Meta app not configured</h2></body></html>');
-  }
-  const ownerEmail = req.query.owner || '';
-  const sessionToken = req.query.s || '';
-  if (!ownerEmail || !validateSession(sessionToken, ownerEmail)) {
-    return res.redirect('/dashboard?owner=' + encodeURIComponent(ownerEmail));
-  }
-
-  const redirectUri = (process.env.GOOGLE_REDIRECT_URI?.replace('/auth/gmail/callback', '') || `http://localhost:${process.env.PORT || 3000}`) + '/auth/meta/callback';
-  const state = JSON.stringify({ owner: ownerEmail, s: sessionToken });
-  const scopes = [
-    'pages_show_list', 'pages_messaging',
-    'instagram_basic', 'instagram_manage_messages',
-    'whatsapp_business_management', 'whatsapp_business_messaging',
-    'business_management',
-  ].join(',');
-
-  const url = `https://www.facebook.com/v21.0/dialog/oauth?client_id=${process.env.META_APP_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state)}&scope=${encodeURIComponent(scopes)}&response_type=code`;
-  res.redirect(url);
-});
-
-app.get('/auth/meta/callback', async (req, res) => {
-  const { code, state } = req.query;
-  let ownerEmail = '', sessionToken = '';
-  try {
-    const parsed = JSON.parse(state);
-    ownerEmail = parsed.owner;
-    sessionToken = parsed.s;
-  } catch {}
-
-  if (!code || !ownerEmail) {
-    return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><h2>Connection failed</h2><p style="color:#9898b8">Missing authorization code.</p></body></html>');
-  }
-
-  const redirectUri = (process.env.GOOGLE_REDIRECT_URI?.replace('/auth/gmail/callback', '') || `http://localhost:${process.env.PORT || 3000}`) + '/auth/meta/callback';
-
-  try {
-    // Exchange code for short-lived user token
-    const tokenUrl = `https://graph.facebook.com/v21.0/oauth/access_token?client_id=${process.env.META_APP_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&client_secret=${process.env.META_APP_SECRET}&code=${code}`;
-    const tokenRes = await fetch(tokenUrl);
-    const tokenData = await tokenRes.json();
-    if (tokenData.error) throw new Error(tokenData.error.message);
-
-    // Exchange for long-lived token (60 days)
-    const longUrl = `https://graph.facebook.com/v21.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${process.env.META_APP_ID}&client_secret=${process.env.META_APP_SECRET}&fb_exchange_token=${tokenData.access_token}`;
-    const longRes = await fetch(longUrl);
-    const longData = await longRes.json();
-    if (longData.error) throw new Error(longData.error.message);
-
-    const userToken = longData.access_token;
-    const expiresIn = longData.expires_in || 5184000;
-
-    // Fetch pages the user manages
-    const pagesRes = await fetch(`https://graph.facebook.com/v21.0/me/accounts?access_token=${userToken}&fields=id,name,access_token,instagram_business_account{id,username}`);
-    const pagesData = await pagesRes.json();
-    if (pagesData.error) throw new Error(pagesData.error.message);
-
-    const pages = (pagesData.data || []).map(p => ({
-      pageId: p.id,
-      pageName: p.name,
-      accessToken: p.access_token,
-      igUserId: p.instagram_business_account?.id || null,
-      igUsername: p.instagram_business_account?.username || null,
-      wabaId: null,
-      waPhoneNumberId: null,
-      waDisplayPhone: null,
-    }));
-
-    // Check for WhatsApp Business accounts
-    const wabaRes = await fetch(`https://graph.facebook.com/v21.0/me/businesses?access_token=${userToken}&fields=id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number}}`);
-    const wabaData = await wabaRes.json();
-
-    if (wabaData.data) {
-      for (const biz of wabaData.data) {
-        const wabas = biz.owned_whatsapp_business_accounts?.data || [];
-        for (const waba of wabas) {
-          const phones = waba.phone_numbers?.data || [];
-          if (phones.length > 0) {
-            const target = pages[0] || { pageId: null, pageName: biz.name, accessToken: userToken };
-            target.wabaId = waba.id;
-            target.waPhoneNumberId = phones[0].id;
-            target.waDisplayPhone = phones[0].display_phone_number;
-            if (!pages.length) pages.push(target);
-          }
-        }
-      }
-    }
-
-    // Store tokens
-    metaTokens.set(ownerEmail, {
-      userToken,
-      userTokenExpiry: Date.now() + expiresIn * 1000,
-      pages,
-    });
-    persistMetaTokens();
-
-    // Update channelConfigs with available channels
-    const existing = channelConfigs.get(ownerEmail) || {};
-    const page = pages[0];
-    if (page) {
-      if (page.pageId) {
-        existing.facebook = {
-          enabled: existing.facebook?.enabled ?? true,
-          pageId: page.pageId,
-          pageName: page.pageName,
-          accessToken: page.accessToken,
-          connectedAt: new Date().toISOString(),
-        };
-
-        // Subscribe page to webhook
-        try {
-          await fetch(`https://graph.facebook.com/v21.0/${page.pageId}/subscribed_apps?access_token=${page.accessToken}&subscribed_fields=messages,messaging_postbacks`, { method: 'POST' });
-          console.log(`📱 Subscribed page ${page.pageName} to webhook`);
-        } catch (e) { console.warn('Page subscription failed:', e.message); }
-      }
-      if (page.igUserId) {
-        existing.instagram = {
-          enabled: existing.instagram?.enabled ?? true,
-          igUserId: page.igUserId,
-          igUsername: page.igUsername,
-          accessToken: page.accessToken,
-          connectedAt: new Date().toISOString(),
-        };
-      }
-      if (page.waPhoneNumberId) {
-        existing.whatsapp = {
-          enabled: existing.whatsapp?.enabled ?? true,
-          phoneNumberId: page.waPhoneNumberId,
-          wabaId: page.wabaId,
-          accessToken: userToken,
-          displayPhone: page.waDisplayPhone,
-          connectedAt: new Date().toISOString(),
-        };
-
-        try {
-          await fetch(`https://graph.facebook.com/v21.0/${page.wabaId}/subscribed_apps`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${userToken}` },
-          });
-          console.log(`📱 Subscribed WhatsApp ${page.waDisplayPhone} to webhook`);
-        } catch (e) { console.warn('WA subscription failed:', e.message); }
-      }
-    }
-    channelConfigs.set(ownerEmail, existing);
-    persistChannels();
-
-    console.log(`📱 Meta connected for ${ownerEmail}: ${pages.length} page(s), FB=${!!page?.pageId}, IG=${!!page?.igUserId}, WA=${!!page?.waPhoneNumberId}`);
-
-    res.redirect(`/dashboard?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}&meta_connected=1`);
-
-  } catch (e) {
-    console.error('Meta OAuth error:', e.message);
-    res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;">
-      <h2 style="color:#ff6b6b;">Connection failed</h2>
-      <p style="color:#9898b8;">${e.message}</p>
-      <a href="/dashboard?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}" style="color:#00e5a0;">Back to Dashboard</a>
-    </body></html>`);
-  }
-});
+// Note: legacy /auth/meta/start + duplicate /auth/meta/callback removed
+// 2026-05-24. Dashboard now routes through /connect/meta (config_id flow).
+// The duplicate callback was dead code — Express resolves the earlier
+// declaration first.
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ status:'ok', sessions:sessions.size, faqs:faqs.size, handoffs:handoffs.size }));
