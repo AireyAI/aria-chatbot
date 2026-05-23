@@ -47,7 +47,7 @@ import { promises as fsp } from 'node:fs';
 import { routeChat }                    from './lib/lead_router.js';
 import { decideLeadAction, policyAddendum } from './lib/lead_policy.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
-import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue } from './lib/analytics.js';
+import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
 const app    = express();
 // Railway terminates TLS at its edge proxy and forwards X-Forwarded-Proto.
@@ -4139,6 +4139,8 @@ app.post('/api/chat/router', async (req, res) => {
     const _slug = clientConfig.slug || 'unknown';
     const _owner = clientConfig.handoffEmail || null;
     recordEvent({ slug: _slug, event: 'chat_message', sessionId, ownerEmail: _owner });
+    // Fire first-chat milestone email exactly once per slug (file-backed dedupe).
+    maybeFireFirstChatMilestone({ slug: _slug, ownerEmail: _owner, serverUrl: `${req.protocol}://${req.get('host')}` });
     if (clientConfig.isOutOfHours) {
       recordEvent({ slug: _slug, event: 'after_hours', sessionId, ownerEmail: _owner });
     }
@@ -4258,6 +4260,8 @@ app.post('/api/chat/router/stream', async (req, res) => {
       const _slug = clientConfig.slug || 'unknown';
       const _owner = clientConfig.handoffEmail || null;
       recordEvent({ slug: _slug, event: 'chat_message', sessionId, ownerEmail: _owner });
+    // Fire first-chat milestone email exactly once per slug (file-backed dedupe).
+    maybeFireFirstChatMilestone({ slug: _slug, ownerEmail: _owner, serverUrl: `${req.protocol}://${req.get('host')}` });
       if (clientConfig.isOutOfHours) {
         recordEvent({ slug: _slug, event: 'after_hours', sessionId, ownerEmail: _owner });
       }
@@ -6083,6 +6087,443 @@ app.get('/admin/analytics/:slug', (req, res) => {
   res.json(row);
 });
 
+// ─── Client-facing analytics ────────────────────────────────────────────────
+// Same data as /admin/analytics/:slug but behind the CLIENT's auth (X-Aria-Token)
+// so each owner can see their own funnel without master admin access. Slug is
+// derived from the verified token — clients can never see another client's data.
+app.get('/api/dashboard/analytics', (req, res) => {
+  const token = req.get('X-Aria-Token') || '';
+  const slugQuery = String(req.query.slug || '').toLowerCase();
+  if (!slugQuery) return res.status(400).json({ error: 'slug query param required' });
+  const verified = verifyAdminToken(token, slugQuery);
+  if (!verified) return res.status(401).json({ error: 'not authenticated' });
+  const week = rollupForWindow({ windowMs: 7 * 24 * 60 * 60 * 1000 });
+  const month = rollupForWindow({ windowMs: 30 * 24 * 60 * 60 * 1000 });
+  const slug = verified.slug;
+  const row7 = week.slugs?.[slug] || { slug, counts: {}, sampleHotLeads: [] };
+  const row30 = month.slugs?.[slug] || { slug, counts: {}, sampleHotLeads: [] };
+  // Derive headline metrics for the client to read directly.
+  const c7 = row7.counts || {}, c30 = row30.counts || {};
+  const businessType = (typeof BUSINESS_TYPE_FOR_SLUG !== 'undefined' && BUSINESS_TYPE_FOR_SLUG[slug]) || 'generic';
+  const hot7 = c7.lead_hot || 0;
+  const warm7 = Math.max(0, (c7.lead_captured || 0) - hot7);
+  const value7 = estimateLeadValue(businessType, hot7, warm7);
+  const hot30 = c30.lead_hot || 0;
+  const warm30 = Math.max(0, (c30.lead_captured || 0) - hot30);
+  const value30 = estimateLeadValue(businessType, hot30, warm30);
+  res.json({
+    slug,
+    ownerEmail: verified.email,
+    businessType,
+    window7d: {
+      chats: c7.chat_message || 0,
+      widgetLoads: c7.widget_loaded || 0,
+      chatOpens: c7.chat_opened || 0,
+      leadsCaptured: c7.lead_captured || 0,
+      hotLeads: hot7,
+      bookings: c7.booking_created || 0,
+      ownerNotified: c7.owner_notified || 0,
+      afterHours: c7.after_hours || 0,
+      estimatedValueGbp: value7,
+      sampleHotLeads: (row7.sampleHotLeads || []).slice(0, 5),
+      firstEventTs: row7.firstEventTs || null,
+      lastEventTs: row7.lastEventTs || null,
+    },
+    window30d: {
+      chats: c30.chat_message || 0,
+      leadsCaptured: c30.lead_captured || 0,
+      hotLeads: hot30,
+      bookings: c30.booking_created || 0,
+      estimatedValueGbp: value30,
+    },
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// HTML page for the client-facing analytics dashboard. Auth is handled
+// client-side via the existing X-Aria-Token flow. The page redirects to
+// /auth/admin/start on first visit and stores the token in sessionStorage.
+// All dynamic values are written via textContent or safe DOM APIs to avoid XSS.
+app.get('/dashboard/analytics', (req, res) => {
+  const slug = String(req.query.slug || '').toLowerCase();
+  if (!slug) {
+    return res.status(400).send('Missing slug. Add ?slug=your_business to the URL.');
+  }
+  if (!owners.has(slug)) {
+    return res.status(404).send('Unknown client slug. Ask Kyle to add you to owners.json.');
+  }
+  const SERVER = `${req.protocol}://${req.get('host')}`;
+  // slug is owner-validated above; safe to embed as JSON literal.
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aria dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+         background: #0d0d1f; color: #eeeef8; min-height: 100vh; line-height: 1.5; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 40px 24px; }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 32px;
+           padding-bottom: 16px; border-bottom: 1px solid #2a2a44; }
+  h1 { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; }
+  h1 .badge { display: inline-block; padding: 3px 10px; margin-left: 8px;
+              background: #22D3E033; color: #22D3E0; border-radius: 999px;
+              font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+  .who { font-size: 13px; color: #9898b8; }
+  .who-email { color: #22D3E0; text-decoration: none; cursor: pointer; }
+  .hero { background: linear-gradient(135deg, #1a1a2e 0%, #1f1f3b 100%);
+          border: 1px solid #2a2a44; border-radius: 16px; padding: 32px;
+          margin-bottom: 24px; text-align: center; }
+  .hero .label { font-size: 12px; font-weight: 600; color: #9898b8;
+                 text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px; }
+  .hero .value { font-size: 56px; font-weight: 800; color: #00E5A0; letter-spacing: -0.04em;
+                 line-height: 1; margin-bottom: 8px; }
+  .hero .sub { font-size: 14px; color: #9898b8; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+          gap: 14px; margin-bottom: 32px; }
+  .stat { background: #1a1a2e; border: 1px solid #2a2a44; border-radius: 12px;
+          padding: 18px 20px; }
+  .stat .num { font-size: 32px; font-weight: 800; color: #eeeef8; letter-spacing: -0.02em; }
+  .stat .lbl { font-size: 12px; color: #9898b8; margin-top: 4px;
+               text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+  .section { margin-bottom: 32px; }
+  .section h2 { font-size: 16px; font-weight: 700; margin-bottom: 12px;
+                color: #eeeef8; letter-spacing: -0.01em; }
+  .empty { background: #1a1a2e; border: 1px dashed #2a2a44; border-radius: 12px;
+           padding: 28px; text-align: center; color: #9898b8; font-size: 14px; }
+  .empty .icon { font-size: 32px; margin-bottom: 8px; opacity: 0.5; }
+  .session-row { background: #1a1a2e; border: 1px solid #2a2a44; border-radius: 10px;
+                 padding: 14px 18px; margin-bottom: 8px; display: flex; justify-content: space-between;
+                 align-items: center; gap: 12px; }
+  .session-out { font-size: 13px; color: #eeeef8; font-weight: 600; }
+  .session-meta { font-size: 11px; color: #6b6b8a; margin-top: 2px; }
+  .session-id { font-size: 11px; color: #6b6b8a; font-family: ui-monospace, "SF Mono", monospace; }
+  .footer-note { margin-top: 40px; padding-top: 20px; border-top: 1px solid #2a2a44;
+                 font-size: 12px; color: #6b6b8a; text-align: center; }
+  .footer-note a { color: #22D3E0; text-decoration: none; }
+  .loading { display: inline-block; padding: 4px 12px; background: #1a1a2e;
+             border-radius: 999px; font-size: 12px; color: #9898b8; }
+  .err { padding: 16px; background: #2a1a1a; border: 1px solid #5a2a2a;
+         border-radius: 8px; color: #ff9090; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Aria <span class="badge" id="slug-badge"></span></h1>
+    <div class="who" id="who"><span class="loading">Signing in…</span></div>
+  </header>
+
+  <div id="content" style="display:none;">
+    <div class="hero">
+      <div class="label">Estimated value Aria delivered this week</div>
+      <div class="value" id="hero-value">£0</div>
+      <div class="sub" id="hero-sub">No activity yet. Aria will start counting as soon as visitors chat with her.</div>
+    </div>
+
+    <div class="grid">
+      <div class="stat"><div class="num" id="s-chats">0</div><div class="lbl">Conversations (7d)</div></div>
+      <div class="stat"><div class="num" id="s-leads">0</div><div class="lbl">Leads captured</div></div>
+      <div class="stat"><div class="num" id="s-hot">0</div><div class="lbl">Hot leads</div></div>
+      <div class="stat"><div class="num" id="s-bookings">0</div><div class="lbl">Bookings</div></div>
+      <div class="stat"><div class="num" id="s-notified">0</div><div class="lbl">Pings sent to you</div></div>
+      <div class="stat"><div class="num" id="s-afterhours">0</div><div class="lbl">After-hours chats</div></div>
+    </div>
+
+    <div class="section">
+      <h2>30-day rollup</h2>
+      <div class="grid">
+        <div class="stat"><div class="num" id="m-chats">0</div><div class="lbl">Conversations</div></div>
+        <div class="stat"><div class="num" id="m-leads">0</div><div class="lbl">Leads</div></div>
+        <div class="stat"><div class="num" id="m-bookings">0</div><div class="lbl">Bookings</div></div>
+        <div class="stat"><div class="num" id="m-value">£0</div><div class="lbl">Estimated value</div></div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Recent visitors</h2>
+      <div id="sessions-mount"><div class="empty">Loading recent conversations…</div></div>
+    </div>
+
+    <div class="footer-note">
+      Data refreshes on page load. Questions? Email
+      <a href="mailto:apcapital.ai@gmail.com">apcapital.ai@gmail.com</a>
+    </div>
+  </div>
+
+  <div id="error" style="display:none;"></div>
+</div>
+
+<script>
+(function() {
+  const SLUG = ${JSON.stringify(slug)};
+  const SERVER = ${JSON.stringify(SERVER)};
+  const TOKEN_KEY = 'aria_token_' + SLUG;
+
+  // Slug badge — set safely via textContent
+  document.getElementById('slug-badge').textContent = SLUG;
+
+  // Pick up token from URL hash if returning from OAuth
+  if (location.hash.startsWith('#aria_token=')) {
+    const t = location.hash.slice('#aria_token='.length);
+    sessionStorage.setItem(TOKEN_KEY, t);
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+
+  const token = sessionStorage.getItem(TOKEN_KEY);
+  if (!token) {
+    const returnTo = encodeURIComponent(SERVER + '/dashboard/analytics?slug=' + SLUG);
+    location.href = SERVER + '/auth/admin/start?slug=' + SLUG + '&return_to=' + returnTo;
+    return;
+  }
+
+  const headers = { 'X-Aria-Token': token };
+
+  function setWhoSignedIn(email) {
+    const whoEl = document.getElementById('who');
+    whoEl.replaceChildren();
+    whoEl.appendChild(document.createTextNode('Signed in as '));
+    const link = document.createElement('a');
+    link.className = 'who-email';
+    link.href = '#';
+    link.textContent = email;
+    link.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      sessionStorage.removeItem(TOKEN_KEY);
+      location.reload();
+    });
+    whoEl.appendChild(link);
+  }
+
+  function showError(msg) {
+    const errEl = document.getElementById('error');
+    errEl.replaceChildren();
+    const box = document.createElement('div');
+    box.className = 'err';
+    box.textContent = msg;
+    errEl.appendChild(box);
+    errEl.style.display = 'block';
+  }
+
+  async function load() {
+    try {
+      const whoR = await fetch(SERVER + '/auth/admin/whoami?slug=' + SLUG, { headers });
+      if (whoR.status === 401) {
+        sessionStorage.removeItem(TOKEN_KEY);
+        location.reload();
+        return;
+      }
+      const who = await whoR.json();
+      setWhoSignedIn(who.email || 'unknown');
+
+      const aR = await fetch(SERVER + '/api/dashboard/analytics?slug=' + SLUG, { headers });
+      if (!aR.ok) throw new Error('Analytics fetch failed (' + aR.status + ')');
+      const a = await aR.json();
+      document.getElementById('content').style.display = 'block';
+      const w = a.window7d || {}, m = a.window30d || {};
+      const fmt = (n) => '£' + (n || 0).toLocaleString('en-GB');
+      document.getElementById('hero-value').textContent = fmt(w.estimatedValueGbp);
+      if ((w.chats || 0) > 0) {
+        const chatsTxt = w.chats + ' conversation' + (w.chats === 1 ? '' : 's');
+        const hotTxt = w.hotLeads + ' hot lead' + (w.hotLeads === 1 ? '' : 's');
+        document.getElementById('hero-sub').textContent =
+          'Across ' + chatsTxt + ', ' + hotTxt + ' captured. Estimate uses ' + a.businessType + ' rate.';
+      }
+      document.getElementById('s-chats').textContent = w.chats || 0;
+      document.getElementById('s-leads').textContent = w.leadsCaptured || 0;
+      document.getElementById('s-hot').textContent = w.hotLeads || 0;
+      document.getElementById('s-bookings').textContent = w.bookings || 0;
+      document.getElementById('s-notified').textContent = w.ownerNotified || 0;
+      document.getElementById('s-afterhours').textContent = w.afterHours || 0;
+      document.getElementById('m-chats').textContent = m.chats || 0;
+      document.getElementById('m-leads').textContent = m.leadsCaptured || 0;
+      document.getElementById('m-bookings').textContent = m.bookings || 0;
+      document.getElementById('m-value').textContent = fmt(m.estimatedValueGbp);
+
+      // Sessions list — Stage 3 endpoint, best effort
+      try {
+        const sR = await fetch(SERVER + '/api/dashboard/sessions?slug=' + SLUG, { headers });
+        if (sR.ok) {
+          const s = await sR.json();
+          renderSessions(s.sessions || []);
+        } else {
+          renderSessions([]);
+        }
+      } catch (e) {
+        renderSessions([]);
+      }
+    } catch (e) {
+      showError(e.message || 'Failed to load dashboard');
+    }
+  }
+
+  function renderSessions(sessions) {
+    const mount = document.getElementById('sessions-mount');
+    mount.replaceChildren();
+    if (!sessions || !sessions.length) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No visitor conversations yet. Aria starts counting when someone chats.';
+      mount.appendChild(empty);
+      return;
+    }
+    sessions.slice(0, 20).forEach(s => {
+      const t = s.startedAt ? new Date(s.startedAt).toLocaleString('en-GB', { dateStyle: 'short', timeStyle: 'short' }) : '';
+      const outcomeText = s.bookingCreated ? 'Booked'
+                        : s.leadHot ? 'Hot lead'
+                        : s.leadCaptured ? 'Lead captured'
+                        : s.afterHours ? 'After-hours'
+                        : 'Chat only';
+      const msgCount = (s.messages || 0);
+      const msgTxt = msgCount + ' message' + (msgCount === 1 ? '' : 's');
+
+      const row = document.createElement('div');
+      row.className = 'session-row';
+      const left = document.createElement('div');
+      const out = document.createElement('div');
+      out.className = 'session-out';
+      out.textContent = outcomeText;
+      const meta = document.createElement('div');
+      meta.className = 'session-meta';
+      meta.textContent = msgTxt + (t ? ' · ' + t : '');
+      left.appendChild(out);
+      left.appendChild(meta);
+      const idEl = document.createElement('div');
+      idEl.className = 'session-id';
+      idEl.textContent = (s.sessionId || '').slice(0, 8);
+      row.appendChild(left);
+      row.appendChild(idEl);
+      mount.appendChild(row);
+    });
+  }
+
+  load();
+})();
+</script>
+</body>
+</html>`);
+});
+
+// ─── Per-visitor sessions (drill-down) ──────────────────────────────────────
+// Returns one row per visitor session in the last 7 days, with derived outcome
+// flags (booked / hot lead / captured / abandoned). Powers the "Recent visitors"
+// section of the client dashboard + Kyle's master per-client visitor view.
+
+// Client-facing — auth scoped to slug derived from X-Aria-Token.
+app.get('/api/dashboard/sessions', (req, res) => {
+  const token = req.get('X-Aria-Token') || '';
+  const slugQuery = String(req.query.slug || '').toLowerCase();
+  if (!slugQuery) return res.status(400).json({ error: 'slug query param required' });
+  const verified = verifyAdminToken(token, slugQuery);
+  if (!verified) return res.status(401).json({ error: 'not authenticated' });
+  const windowDays = Math.max(1, Math.min(90, Number(req.query.days) || 7));
+  const result = sessionsForSlugWindow({
+    slug: verified.slug,
+    windowMs: windowDays * 24 * 60 * 60 * 1000,
+  });
+  res.json(result);
+});
+
+// Master-admin — Kyle can drill into any slug from his admin dashboard.
+app.get('/admin/sessions/:slug', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  _hardenAdminResponse(res);
+  const windowDays = Math.max(1, Math.min(90, Number(req.query.days) || 7));
+  const result = sessionsForSlugWindow({
+    slug: String(req.params.slug || '').toLowerCase(),
+    windowMs: windowDays * 24 * 60 * 60 * 1000,
+  });
+  res.json(result);
+});
+
+// ─── Onboarding emails ──────────────────────────────────────────────────────
+// Two triggers: welcome email when a new owner is added, first-chat milestone
+// when Aria handles her first conversation on a client site. Both file-backed
+// for idempotency across server restarts.
+
+const FIRST_CHAT_LOG = resolve('data', 'first_chat_milestones.jsonl');
+const _firedFirstChats = new Set();
+
+(function _loadFirstChatLog() {
+  try {
+    if (!existsSync(FIRST_CHAT_LOG)) return;
+    const raw = readFileSync(FIRST_CHAT_LOG, 'utf8');
+    for (const line of raw.split('\n')) {
+      if (!line) continue;
+      try {
+        const e = JSON.parse(line);
+        if (e.slug) _firedFirstChats.add(e.slug);
+      } catch { /* skip malformed */ }
+    }
+    console.log(`📨 First-chat milestones loaded: ${_firedFirstChats.size} slug(s)`);
+  } catch (e) { console.warn('Failed to load first-chat log:', e.message); }
+})();
+
+async function maybeFireFirstChatMilestone({ slug, ownerEmail, serverUrl }) {
+  if (!slug || !ownerEmail) return;
+  if (_firedFirstChats.has(slug)) return;
+  _firedFirstChats.add(slug);
+  try {
+    const dashboardUrl = `${serverUrl || ''}/dashboard/analytics?slug=${encodeURIComponent(slug)}`;
+    const friendlyName = slug.replace(/[_-]/g, ' ');
+    const html = `<div style="font-family:-apple-system,sans-serif;color:#1a1a2e;max-width:560px;margin:0 auto;padding:30px 20px;">
+      <h2 style="margin:0 0 12px;color:#22D3E0;">Aria just handled her first chat</h2>
+      <p style="font-size:15px;line-height:1.55;color:#444;">She's officially live on your site. Someone messaged your business through the widget and Aria responded.</p>
+      <p style="font-size:15px;line-height:1.55;color:#444;">Want to see what she said and start tracking your numbers?</p>
+      <p style="margin:24px 0;"><a href="${dashboardUrl}" style="display:inline-block;background:#22D3E0;color:#0d0d1f;padding:12px 22px;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px;">Open your dashboard →</a></p>
+      <p style="font-size:13px;color:#666;margin-top:30px;">From now on Aria's working for you 24/7. You'll get a weekly summary every Monday with leads and bookings.</p>
+      <p style="font-size:13px;color:#666;">— Kyle</p>
+    </div>`;
+    await smartSend({
+      ownerEmail,
+      to: ownerEmail,
+      subject: `Aria just answered her first message on ${friendlyName}`,
+      html,
+      replyTo: process.env.NOTIFY_EMAIL,
+    });
+    await fsp.appendFile(FIRST_CHAT_LOG, JSON.stringify({
+      slug, ownerEmail, ts: new Date().toISOString(),
+    }) + '\n');
+    console.log(`🎉 First-chat milestone sent: ${slug} -> ${ownerEmail}`);
+  } catch (e) {
+    _firedFirstChats.delete(slug);
+    console.warn(`[onboarding] first-chat milestone failed for ${slug}:`, e.message);
+  }
+}
+
+async function sendOwnerWelcomeEmail({ slug, ownerEmail, serverUrl }) {
+  if (!ownerEmail) return;
+  try {
+    const dashboardUrl = `${serverUrl || ''}/dashboard/analytics?slug=${encodeURIComponent(slug)}`;
+    const friendlyName = slug.replace(/[_-]/g, ' ');
+    const html = `<div style="font-family:-apple-system,sans-serif;color:#1a1a2e;max-width:560px;margin:0 auto;padding:30px 20px;">
+      <h2 style="margin:0 0 14px;">Welcome — Aria's set up for you</h2>
+      <p style="font-size:15px;line-height:1.55;color:#444;">Hi! Kyle here. I've just provisioned Aria, your 24/7 AI receptionist, for <b>${friendlyName}</b>.</p>
+      <p style="font-size:15px;line-height:1.55;color:#444;">She's already wired in. Here's what happens next:</p>
+      <ul style="font-size:14px;color:#444;line-height:1.7;padding-left:20px;">
+        <li>Aria starts answering visitor questions on your site</li>
+        <li>When someone leaves their details, she texts or emails you straight away</li>
+        <li>Every Monday morning you get a "this is what Aria did for you" summary</li>
+      </ul>
+      <p style="margin:24px 0;"><a href="${dashboardUrl}" style="display:inline-block;background:#22D3E0;color:#0d0d1f;padding:12px 22px;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px;">Open your dashboard →</a></p>
+      <p style="font-size:13px;color:#666;margin-top:30px;">Hit reply if you want to change anything — her tone, what she asks, what counts as a hot lead. — Kyle</p>
+    </div>`;
+    await smartSend({
+      ownerEmail,
+      to: ownerEmail,
+      subject: `Aria is live on your site (${friendlyName})`,
+      html,
+      replyTo: process.env.NOTIFY_EMAIL,
+    });
+    console.log(`📨 Welcome email sent: ${slug} -> ${ownerEmail}`);
+  } catch (e) {
+    console.warn(`[onboarding] welcome email failed for ${slug}:`, e.message);
+  }
+}
+
 // Trigger weekly digest manually (for testing — cron handles the schedule).
 // Body: { dryRun?: bool, ownerEmail?: string }
 app.post('/admin/analytics/send-digest', async (req, res) => {
@@ -6477,13 +6918,21 @@ app.post('/admin/owners', (req, res) => {
   if (!slug || !Array.isArray(emails)) return res.status(400).json({ error: 'slug and emails[] required' });
   const cleanSlug = String(slug).toLowerCase().trim();
   const cleanEmails = emails.map(e => String(e).toLowerCase().trim()).filter(Boolean);
+  // Compute which emails are newly added — fire welcome email to those only.
+  const existing = owners.get(cleanSlug) || new Set();
+  const newlyAdded = cleanEmails.filter(e => !existing.has(e));
   owners.set(cleanSlug, new Set(cleanEmails));
   // Persist
   const obj = {};
   for (const [s, set] of owners) obj[s] = [...set];
   _ownersWF(OWNERS_FILE, JSON.stringify(obj, null, 2));
-  console.log(`👥 Owners updated for slug=${cleanSlug}: ${cleanEmails.join(', ')}`);
-  res.json({ ok: true, slug: cleanSlug, emails: cleanEmails });
+  console.log(`👥 Owners updated for slug=${cleanSlug}: ${cleanEmails.join(', ')} (${newlyAdded.length} new)`);
+  // Fire welcome emails async — don't block the response or fail on smtp errors
+  const serverUrl = `${req.protocol}://${req.get('host')}`;
+  for (const ownerEmail of newlyAdded) {
+    sendOwnerWelcomeEmail({ slug: cleanSlug, ownerEmail, serverUrl }).catch(() => {});
+  }
+  res.json({ ok: true, slug: cleanSlug, emails: cleanEmails, newlyAdded });
 });
 
 // ─── Invite system ───────────────────────────────────────────────────────────
