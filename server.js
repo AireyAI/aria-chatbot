@@ -11608,12 +11608,28 @@ app.get('/dashboard', (req, res) => {
     </body></html>`);
   }
 
-  // Authenticated — if onboarding hasn't been completed, route them
-  // through the 5-step wizard first. Idempotent: the wizard sets
-  // onboardingComplete on the profile when finished, so this only
-  // fires once per owner unless they explicitly re-visit /start.
+  // Authenticated — route brand-new owners through the wizard.
+  //
+  // "Brand-new" = onboardingComplete is unset AND no existing config
+  // signals (no businessName, no knowledge docs, no connected channels).
+  // This way pre-this-commit owners who already configured the old way
+  // don't get bounced into a fresh wizard — only genuinely fresh accounts
+  // do. Wizard itself sets onboardingComplete:true on step 5 so the
+  // redirect stops firing for them too.
   const _onboardingProfile = getOwnerProfile(ownerEmail)?.profile;
-  if (_onboardingProfile && !_onboardingProfile.onboardingComplete && !req.query.skipOnboarding) {
+  const _alreadyConfigured = !!(
+       _onboardingProfile?.businessName
+    || (knowledgeDocs.get(ownerEmail) || []).length > 0
+    || (() => {
+         const ch = channelConfigs.get(ownerEmail) || {};
+         return ['facebook', 'instagram', 'whatsapp'].some(k => ch[k]?.accessToken);
+       })()
+    || gmailTokens.has(ownerEmail)
+  );
+  if (_onboardingProfile
+      && !_onboardingProfile.onboardingComplete
+      && !_alreadyConfigured
+      && !req.query.skipOnboarding) {
     return res.redirect(`/start?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}`);
   }
 
