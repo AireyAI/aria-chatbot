@@ -9687,6 +9687,27 @@ app.get('/api/dashboard/stats', (req, res) => {
   const cold = (stats.leads?.cold || 0) + (chLeads.cold || 0);
   const totalLeads = hot + warm + cold;
   const autoReplyConfig = EMAIL_AUTO_REPLY_ENABLED.get(owner);
+  // CSAT tally — derive from the append-only ledger, scoped to this owner
+  // + last 90 days. Cheap O(file lines) since CSAT is rare events only.
+  let csatPos = 0, csatNeg = 0;
+  try {
+    if (existsSync(CSAT_FILE)) {
+      const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+      for (const line of readFileSync(CSAT_FILE, 'utf8').split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const e = JSON.parse(line);
+          if (e.ownerEmail !== owner) continue;
+          if (new Date(e.ts).getTime() < cutoff) continue;
+          if (e.rating === 'positive') csatPos++;
+          else if (e.rating === 'negative') csatNeg++;
+        } catch {}
+      }
+    }
+  } catch {}
+  const csatTotal = csatPos + csatNeg;
+  const csatScore = csatTotal > 0 ? Math.round((csatPos / csatTotal) * 100) : null;
+
   res.json({
     emailsReplied: { week: emailsWeek, total: stats.replied || 0 },
     bookings: { week: bookingsWeek, total: stats.bookings || 0 },
@@ -9695,6 +9716,11 @@ app.get('/api/dashboard/stats', (req, res) => {
       email:   { hot: stats.leads?.hot  || 0, warm: stats.leads?.warm  || 0, cold: stats.leads?.cold  || 0 },
       channel: { hot: chLeads.hot       || 0, warm: chLeads.warm       || 0, cold: chLeads.cold       || 0 },
     },
+    csat: { positive: csatPos, negative: csatNeg, total: csatTotal, scorePct: csatScore },
+    budget: (() => {
+      const b = checkBudget(owner, autoReplyConfig?.config?.tokensPerDay);
+      return { usedToday: b.used, capToday: b.cap, repliesToday: b.replies, pctUsed: Math.round((b.used / b.cap) * 100) };
+    })(),
     autoReplyEnabled: !!autoReplyConfig?.enabled,
     gmailConnected: gmailTokens.has(owner)
   });
@@ -11109,9 +11135,10 @@ Rules:
       parsed.suggestedReplies = Array.isArray(parsed.suggestedReplies)
         ? parsed.suggestedReplies.filter(s => typeof s === 'string' && s.trim()).slice(0, 3)
         : [];
+      parsed._tokensUsed = (r.usage?.input_tokens || 0) + (r.usage?.output_tokens || 0);
       return parsed;
     } catch {
-      return { text, booking: null, contact: { name: null, email: null, phone: null }, sentiment: 'neutral', urgency: 'low', outOfScope: false, needsHuman: false, handoffReason: null, suggestedReplies: [] };
+      return { text, booking: null, contact: { name: null, email: null, phone: null }, sentiment: 'neutral', urgency: 'low', outOfScope: false, needsHuman: false, handoffReason: null, suggestedReplies: [], _tokensUsed: (r.usage?.input_tokens || 0) + (r.usage?.output_tokens || 0) };
     }
   } catch (e) {
     console.warn('Channel reply generation failed:', e.message);
@@ -11170,6 +11197,106 @@ Plain text, 3 bullets, no preamble.` }],
     return `Customer ${senderName} needs you to take over. Reason: ${reason}.`;
   }
 }
+
+// Repeat-customer index. In-memory map keyed by owner → contact-key → past
+// summary. Lets Aria say "welcome back John, last time you asked about X"
+// when she recognises a returning customer by extracted email/phone/name.
+// Rebuilt at startup from channel_leads.jsonl + persists incrementally as
+// new contacts come in.
+const customerIndex = new Map(); // ownerEmail → Map(contactKey → {name, lastSeen, channels:Set, messagePreviews:[]})
+
+function customerKey(contact) {
+  if (!contact) return null;
+  if (contact.email) return 'email:' + String(contact.email).trim().toLowerCase();
+  if (contact.phone) return 'phone:' + String(contact.phone).replace(/[^\d+]/g, '');
+  if (contact.name)  return 'name:'  + String(contact.name).trim().toLowerCase();
+  return null;
+}
+
+function recordCustomerTouch(ownerEmail, { contact, channel, messagePreview, leadScore }) {
+  const key = customerKey(contact);
+  if (!key) return;
+  if (!customerIndex.has(ownerEmail)) customerIndex.set(ownerEmail, new Map());
+  const owned = customerIndex.get(ownerEmail);
+  const prev = owned.get(key) || { name: null, lastSeen: null, channels: new Set(), recent: [], totalTouches: 0 };
+  prev.name = contact?.name || prev.name;
+  prev.lastSeen = new Date().toISOString();
+  prev.channels.add(channel);
+  prev.recent.unshift({ ts: prev.lastSeen, channel, leadScore, preview: (messagePreview || '').slice(0, 120) });
+  if (prev.recent.length > 5) prev.recent = prev.recent.slice(0, 5);
+  prev.totalTouches++;
+  owned.set(key, prev);
+}
+
+function lookupReturningCustomer(ownerEmail, contact) {
+  const key = customerKey(contact);
+  if (!key) return null;
+  const owned = customerIndex.get(ownerEmail);
+  if (!owned) return null;
+  const hit = owned.get(key);
+  // Only "returning" if we've seen them before this current touch
+  if (!hit || hit.totalTouches < 2) return null;
+  return hit;
+}
+
+// Rebuild from JSONL ledger at startup so server restarts don't lose history
+function rebuildCustomerIndex() {
+  try {
+    if (!existsSync(CHANNEL_LEADS_FILE)) return;
+    for (const line of readFileSync(CHANNEL_LEADS_FILE, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const e = JSON.parse(line);
+        if (!e.ownerEmail || !e.contact) continue;
+        recordCustomerTouch(e.ownerEmail, { contact: e.contact, channel: e.channel, messagePreview: e.messagePreview, leadScore: e.leadScore });
+      } catch {}
+    }
+    console.log(`👥 Rebuilt customer index: ${[...customerIndex.values()].reduce((a, m) => a + m.size, 0)} unique contacts across ${customerIndex.size} owners`);
+  } catch (e) { console.warn('Customer index rebuild failed:', e.message); }
+}
+rebuildCustomerIndex();
+
+// Per-owner-per-day token budget for channel replies. Default 50k/day
+// (~250-500 replies depending on length). Prevents a single chatty
+// customer (or DM spam attack) from draining the Anthropic spend on
+// behalf of one client. Owners can raise via profile config.tokensPerDay.
+const DEFAULT_DAILY_TOKEN_BUDGET = 50000;
+const tokenUsageDaily = new Map(); // `${ownerEmail}::YYYY-MM-DD` → { tokens, replies }
+
+function todayKey(ownerEmail) {
+  return `${ownerEmail}::${new Date().toISOString().slice(0, 10)}`;
+}
+function checkBudget(ownerEmail, capOverride) {
+  const cap = capOverride || DEFAULT_DAILY_TOKEN_BUDGET;
+  const usage = tokenUsageDaily.get(todayKey(ownerEmail)) || { tokens: 0, replies: 0 };
+  return { allowed: usage.tokens < cap, used: usage.tokens, cap, replies: usage.replies };
+}
+function recordTokenUsage(ownerEmail, tokensUsed) {
+  const key = todayKey(ownerEmail);
+  const usage = tokenUsageDaily.get(key) || { tokens: 0, replies: 0 };
+  usage.tokens += tokensUsed || 0;
+  usage.replies += 1;
+  tokenUsageDaily.set(key, usage);
+  // Garbage-collect entries older than 3 days to keep map bounded
+  const cutoff = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  for (const k of tokenUsageDaily.keys()) {
+    if (k.split('::')[1] < cutoff) tokenUsageDaily.delete(k);
+  }
+}
+
+// CSAT ledger — append-only, one line per rating event.
+const CSAT_FILE = resolve('data/csat.jsonl');
+function appendCsat(entry) {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    appendFileSync(CSAT_FILE, JSON.stringify(entry) + '\n');
+  } catch (e) { console.warn('[csat] append failed:', e.message); }
+}
+
+// Conversation-closure heuristic. Fires CSAT prompt when a customer says one
+// of these and the conv has progressed (>=2 message exchanges). Keep loose
+// — better to over-prompt than miss closings.
+const CLOSURE_RE = /\b(thanks|thank you|cheers|ta|perfect|great|brilliant|sorted|got it|all good|amazing|appreciate it|grand)[!. ]*$/i;
 
 // Append-only ledger of channel-sourced leads. One line per scored message
 // so we never lose history (Engineering Rule 13). Consumers derive current
@@ -11259,6 +11386,30 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
   // conv (e.g. after escalation), Aria stops auto-replying until resumed.
   const memKey = `${ownerEmail}::${channel}::${senderId}`;
   const convState = conversationState.get(memKey);
+
+  // CSAT response capture — if we sent a 👍/👎 prompt and this message is
+  // the rating, log it + skip the normal reply flow (don't re-engage on a
+  // rating message, looks weird).
+  if (convState?.csatPending) {
+    const rated = /^[👍👎]|^(thumbs up|thumbs down|good|bad|👌|👏|🙏|⭐+|[1-5]\/5|[1-5] *out of *5)/i.test(messageText.trim());
+    if (rated) {
+      const positive = /👍|👌|👏|good|great|brilliant|perfect|amazing|⭐⭐⭐⭐⭐|⭐⭐⭐⭐|[45]\/5|[45] *out of *5/i.test(messageText);
+      appendCsat({
+        ts: new Date().toISOString(),
+        ownerEmail, channel, senderId, senderName,
+        rating: positive ? 'positive' : 'negative',
+        raw: messageText.slice(0, 200),
+      });
+      const st = conversationState.get(memKey) || {};
+      delete st.csatPending;
+      conversationState.set(memKey, st);
+      persistConversationState();
+      // Brief thank-you, no new conv loop
+      await sendChannelReply(channel, ownerChannels[channel], senderId, positive ? 'Thanks for the feedback! 🙏' : 'Thanks for letting us know — we\'ll do better next time.');
+      console.log(`⭐ [${channel}] CSAT recorded: ${positive ? 'positive' : 'negative'} from ${senderName}`);
+      return;
+    }
+  }
   if (convState?.paused) {
     console.log(`📱 [${channel}] Conv paused (escalated) — skipping auto-reply for ${senderId}`);
     return;
@@ -11269,6 +11420,32 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
   const systemPrompt = profile?.systemPrompt || `You are a helpful business assistant for ${ownerEmail}.`;
   const allowedTopics = profile?.config?.allowedTopics || profile?.allowedTopics || null;
 
+  // Budget gate — bail before spending tokens if today's cap is hit.
+  // Owner gets one alert email per day per cap-hit. After cap, we stop
+  // auto-replying entirely until midnight rollover.
+  const budget = checkBudget(ownerEmail, profile?.config?.tokensPerDay);
+  if (!budget.allowed) {
+    const st = conversationState.get(memKey) || {};
+    if (!st.budgetAlertSentToday || st.budgetAlertSentToday !== new Date().toISOString().slice(0, 10)) {
+      try {
+        await smartSend({
+          ownerEmail, to: ownerEmail,
+          subject: `⚠️ Aria daily token budget hit for ${channel}`,
+          html: `<div style="font-family:sans-serif;padding:20px;max-width:520px;margin:0 auto;">
+            <h2 style="color:#fbbf24;">Daily limit reached</h2>
+            <p>Aria has hit your daily token budget (${budget.cap.toLocaleString()} tokens, ${budget.replies} replies sent today).</p>
+            <p>She'll resume auto-replying tomorrow. You can raise the cap via your dashboard settings if this is happening too often.</p>
+          </div>`,
+        });
+        st.budgetAlertSentToday = new Date().toISOString().slice(0, 10);
+        conversationState.set(memKey, st);
+        persistConversationState();
+      } catch {}
+    }
+    console.log(`💸 [${channel}] Budget hit for ${ownerEmail} — skipping reply (used ${budget.used}/${budget.cap})`);
+    return;
+  }
+
   // Slot tracking — if a booking is in progress, surface which slots are
   // still empty so Aria asks for ONE missing piece at a time instead of
   // either re-asking everything or skipping the missing field.
@@ -11277,6 +11454,17 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     ? `\n\nBOOKING IN PROGRESS — we already collected: ${JSON.stringify(pendingBooking)}. Still need (in priority order): ${
         ['name', 'contact', 'service', 'datetime'].filter(slot => !pendingBooking[slot]).join(', ') || 'nothing — confirm and close out'
       }. Ask for the NEXT missing slot only, don't re-ask filled ones.`
+    : '';
+
+  // Returning-customer recognition. We can only check known contacts (name
+  // captured from this senderId's past conv via slot filling, or matched
+  // by past extracted email/phone). Personalises the opener.
+  const knownContact = (convState?.pendingBooking)
+    ? { name: convState.pendingBooking.name, email: convState.pendingBooking.contact?.includes('@') ? convState.pendingBooking.contact : null, phone: !convState.pendingBooking.contact?.includes('@') ? convState.pendingBooking.contact : null }
+    : null;
+  const returning = knownContact ? lookupReturningCustomer(ownerEmail, knownContact) : null;
+  const returningContext = returning
+    ? `\n\nRETURNING CUSTOMER — you've spoken with ${returning.name || senderName} before. Last touch: ${returning.lastSeen}. Recent topics: ${returning.recent.slice(0, 3).map(r => r.preview).join(' | ')}. Acknowledge briefly ("welcome back") but don't repeat their history at them — just reply to current message with the context in mind.`
     : '';
 
   // Knowledge base
@@ -11304,9 +11492,9 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
   };
   const channelInstructions = `\n\nYou are replying via ${channel}. ${channelLimits[channel]} Never mention you are AI — write as a team member.`;
 
-  // Generate reply (with optional scope guardrail + slot context)
+  // Generate reply (with optional scope guardrail + slot + returning context)
   const reply = await generateChannelReply(
-    systemPrompt + kbContext + convContext + slotContext + channelInstructions,
+    systemPrompt + kbContext + convContext + slotContext + returningContext + channelInstructions,
     senderName, messageText,
     { allowedTopics }
   );
@@ -11315,6 +11503,9 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     console.warn(`📱 [${channel}] Failed to generate reply for ${senderId}`);
     return;
   }
+
+  // Charge budget (input + output tokens for THIS reply)
+  recordTokenUsage(ownerEmail, reply._tokensUsed || 0);
 
   // Save incoming to conversation memory + summarise on overflow.
   // Sliding-window pattern: most recent CONV_MAX_RAW entries kept verbatim,
@@ -11469,8 +11660,36 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
       contact: reply.contact || {},
       messagePreview: messageText,
     });
+    // Update the in-memory repeat-customer index too so the NEXT message
+    // can use the recognition logic.
+    recordCustomerTouch(ownerEmail, {
+      contact: reply.contact || { name: senderName },
+      channel, messagePreview: messageText, leadScore,
+    });
     console.log(`📱 [${channel}] Lead scored: ${leadScore} / ${category} (conv=${convLen})`);
   } catch (e) { console.warn('[channel-lead] scoring failed:', e.message); }
+
+  // CSAT trigger — when the customer's CURRENT message contains closure
+  // language and we have at least 2 exchanges deep + haven't asked CSAT
+  // recently. Fire as a follow-up message with Quick Reply buttons.
+  if (CLOSURE_RE.test(messageText) && history.length >= 3 && !convState?.csatPending) {
+    const lastCsatTime = convState?.lastCsatAt ? new Date(convState.lastCsatAt).getTime() : 0;
+    const cooldownMs = 7 * 24 * 60 * 60 * 1000; // don't re-prompt same conv within a week
+    if (Date.now() - lastCsatTime > cooldownMs) {
+      // Wait ~3s so it lands AFTER Aria's main reply (most channels render in arrival order)
+      setTimeout(async () => {
+        try {
+          await sendChannelReply(channel, ownerChannels[channel], senderId, 'Quick one — did that help?', ['👍 Yes', '👎 Not really']);
+          const st = conversationState.get(memKey) || {};
+          st.csatPending = true;
+          st.lastCsatAt = new Date().toISOString();
+          conversationState.set(memKey, st);
+          persistConversationState();
+          console.log(`⭐ [${channel}] CSAT prompt sent to ${senderName}`);
+        } catch (e) { console.warn('CSAT prompt failed:', e.message); }
+      }, 3000);
+    }
+  }
 
   // Slot-filled booking pipeline. Merge any new booking fields into the
   // running pendingBooking state. Only push to the real bookings[] when the
