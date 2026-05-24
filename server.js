@@ -458,11 +458,16 @@ async function smartSend({ ownerEmail, to, subject, html, replyTo, attachments }
 }
 
 // ─── Multi-Channel Send ─────────────────────────────────────────────────────
-async function sendChannelReply(channel, channelConfig, recipientId, text) {
+// quickReplies (optional): array of up to 3 short strings (max ~20 chars).
+// Renders as tappable button row beneath the message on FB Messenger + IG.
+// WhatsApp uses a different interactive-message format (reply_buttons).
+// Falls back to plain text silently if channel doesn't support buttons.
+async function sendChannelReply(channel, channelConfig, recipientId, text, quickReplies) {
   try {
-    if (channel === 'whatsapp') return await sendWhatsAppMessage(channelConfig, recipientId, text);
-    if (channel === 'instagram') return await sendInstagramMessage(channelConfig, recipientId, text);
-    if (channel === 'facebook') return await sendFacebookMessage(channelConfig, recipientId, text);
+    const qr = Array.isArray(quickReplies) ? quickReplies.filter(s => typeof s === 'string' && s.trim()).slice(0, 3) : [];
+    if (channel === 'whatsapp') return await sendWhatsAppMessage(channelConfig, recipientId, text, qr);
+    if (channel === 'instagram') return await sendInstagramMessage(channelConfig, recipientId, text, qr);
+    if (channel === 'facebook') return await sendFacebookMessage(channelConfig, recipientId, text, qr);
     return false;
   } catch (e) {
     console.warn(`📱 [${channel}] Send failed:`, e.message);
@@ -470,19 +475,35 @@ async function sendChannelReply(channel, channelConfig, recipientId, text) {
   }
 }
 
-async function sendWhatsAppMessage(config, recipientPhone, text) {
+async function sendWhatsAppMessage(config, recipientPhone, text, quickReplies = []) {
+  // WhatsApp interactive reply_buttons supports up to 3 buttons, each title
+  // max 20 chars. Falls back to plain text if no quickReplies provided.
+  const body = quickReplies.length
+    ? {
+        messaging_product: 'whatsapp',
+        to: recipientPhone,
+        type: 'interactive',
+        interactive: {
+          type: 'button',
+          body: { text: text.slice(0, 1024) },
+          action: {
+            buttons: quickReplies.slice(0, 3).map((title, i) => ({
+              type: 'reply',
+              reply: { id: `qr_${i}`, title: title.slice(0, 20) },
+            })),
+          },
+        },
+      }
+    : {
+        messaging_product: 'whatsapp',
+        to: recipientPhone,
+        type: 'text',
+        text: { body: text },
+      };
   const r = await fetch(`https://graph.facebook.com/v21.0/${config.phoneNumberId}/messages`, {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${config.accessToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      messaging_product: 'whatsapp',
-      to: recipientPhone,
-      type: 'text',
-      text: { body: text },
-    }),
+    headers: { 'Authorization': `Bearer ${config.accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
   if (!r.ok) {
     const err = await r.text();
@@ -492,17 +513,19 @@ async function sendWhatsAppMessage(config, recipientPhone, text) {
   return true;
 }
 
-async function sendInstagramMessage(config, recipientId, text) {
+async function sendInstagramMessage(config, recipientId, text, quickReplies = []) {
+  const message = { text };
+  if (quickReplies.length) {
+    message.quick_replies = quickReplies.slice(0, 13).map(title => ({
+      content_type: 'text',
+      title: title.slice(0, 20),
+      payload: title.slice(0, 1000),
+    }));
+  }
   const r = await fetch(`https://graph.facebook.com/v21.0/${config.igUserId}/messages`, {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${config.accessToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      recipient: { id: recipientId },
-      message: { text },
-    }),
+    headers: { 'Authorization': `Bearer ${config.accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ recipient: { id: recipientId }, message }),
   });
   if (!r.ok) {
     const err = await r.text();
@@ -512,15 +535,19 @@ async function sendInstagramMessage(config, recipientId, text) {
   return true;
 }
 
-async function sendFacebookMessage(config, recipientId, text) {
+async function sendFacebookMessage(config, recipientId, text, quickReplies = []) {
+  const message = { text };
+  if (quickReplies.length) {
+    message.quick_replies = quickReplies.slice(0, 13).map(title => ({
+      content_type: 'text',
+      title: title.slice(0, 20),
+      payload: title.slice(0, 1000),
+    }));
+  }
   const r = await fetch(`https://graph.facebook.com/v21.0/me/messages?access_token=${config.accessToken}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      messaging_type: 'RESPONSE',
-      recipient: { id: recipientId },
-      message: { text },
-    }),
+    body: JSON.stringify({ messaging_type: 'RESPONSE', recipient: { id: recipientId }, message }),
   });
   if (!r.ok) {
     const err = await r.text();
@@ -11049,7 +11076,8 @@ Respond with valid JSON only:
   "urgency": "low" | "medium" | "high",
   "outOfScope": true | false,
   "needsHuman": true | false,
-  "handoffReason": "short reason if needsHuman, else null"
+  "handoffReason": "short reason if needsHuman, else null",
+  "suggestedReplies": ["Btn 1", "Btn 2", "Btn 3"] or []
 }
 
 Rules:
@@ -11063,7 +11091,8 @@ Rules:
 - If sender shared their email or phone anywhere in this message OR conversation history, extract into contact object — otherwise leave fields null
 - sentiment: classify the sender's tone. "angry" = swearing, threats, all-caps frustration, repeated complaints. "negative" = frustrated but civil. "neutral" = transactional. "positive" = thankful/excited.
 - urgency: "high" = explicit deadline today/asap/emergency/urgent/now/leaking/broken; "medium" = "this week"/"soon"/quote-soon; "low" = browsing, future planning, no time pressure
-- needsHuman: true ONLY when the user explicitly asks for a human/manager OR you genuinely cannot help (refund disputes, complex billing, complaints about specific staff). Set handoffReason concisely. Don't escalate easy stuff.${scopeRule}` }],
+- needsHuman: true ONLY when the user explicitly asks for a human/manager OR you genuinely cannot help (refund disputes, complex billing, complaints about specific staff). Set handoffReason concisely. Don't escalate easy stuff.
+- suggestedReplies: 2-3 SHORT (≤20 chars each) tappable button options that match likely next actions for this customer. Examples: ["Get a quote", "Book a call", "See examples"]. Leave [] if no obvious next step (e.g. complaint, off-topic, post-handoff). Never include "Talk to a human" if you've already set needsHuman=true.${scopeRule}` }],
       system: systemPrompt,
     });
     const text = r.content[0]?.text || '';
@@ -11077,9 +11106,12 @@ Rules:
       parsed.outOfScope = !!parsed.outOfScope;
       parsed.needsHuman = !!parsed.needsHuman;
       parsed.handoffReason = parsed.handoffReason || null;
+      parsed.suggestedReplies = Array.isArray(parsed.suggestedReplies)
+        ? parsed.suggestedReplies.filter(s => typeof s === 'string' && s.trim()).slice(0, 3)
+        : [];
       return parsed;
     } catch {
-      return { text, booking: null, contact: { name: null, email: null, phone: null }, sentiment: 'neutral', urgency: 'low', outOfScope: false, needsHuman: false, handoffReason: null };
+      return { text, booking: null, contact: { name: null, email: null, phone: null }, sentiment: 'neutral', urgency: 'low', outOfScope: false, needsHuman: false, handoffReason: null, suggestedReplies: [] };
     }
   } catch (e) {
     console.warn('Channel reply generation failed:', e.message);
@@ -11309,7 +11341,9 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     const approvalId = generateSessionToken();
     channelApprovals.set(approvalId, {
       ownerEmail, channel, senderId, senderName, messageText,
-      draftReply: reply.text, booking: reply.booking, createdAt: Date.now(),
+      draftReply: reply.text, booking: reply.booking,
+      suggestedReplies: reply.suggestedReplies || [],
+      createdAt: Date.now(),
     });
     persistChannelApprovals();
 
@@ -11337,8 +11371,10 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     return;
   }
 
-  // Send reply directly
-  const sent = await sendChannelReply(channel, channelConfig, senderId, reply.text);
+  // Send reply directly. Quick-reply buttons attached when Claude provided
+  // suggestedReplies — Messenger + IG render as tappable chips, WhatsApp
+  // renders as interactive reply buttons (max 3).
+  const sent = await sendChannelReply(channel, channelConfig, senderId, reply.text, reply.suggestedReplies);
   if (!sent) {
     console.warn(`📱 [${channel}] Failed to send reply to ${senderId}`);
     return;
@@ -11402,7 +11438,7 @@ app.get('/api/channel/approve', async (req, res) => {
     return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center"><h2>Expired or already handled</h2></body></html>');
   }
 
-  const { ownerEmail, channel, senderId, draftReply, booking } = approval;
+  const { ownerEmail, channel, senderId, draftReply, booking, suggestedReplies } = approval;
   const ownerChannels = channelConfigs.get(ownerEmail);
   const channelConfig = ownerChannels?.[channel];
 
@@ -11410,7 +11446,7 @@ app.get('/api/channel/approve', async (req, res) => {
     return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center"><h2>Channel no longer connected</h2></body></html>');
   }
 
-  const sent = await sendChannelReply(channel, channelConfig, senderId, draftReply);
+  const sent = await sendChannelReply(channel, channelConfig, senderId, draftReply, suggestedReplies);
 
   channelApprovals.delete(id);
   persistChannelApprovals();
