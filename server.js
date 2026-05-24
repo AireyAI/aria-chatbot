@@ -9937,6 +9937,45 @@ app.get('/api/dashboard/activity', (req, res) => {
   res.json({ events: events.slice(0, limit) });
 });
 
+// GET /api/dashboard/conversation/:memKey — full thread for one sender
+// (drill-down from the Conversations table). Pulls from conversationMemory
+// for raw history + adds metadata (paused state, last lead score, etc.).
+app.get('/api/dashboard/conversation/:memKey', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const memKey = decodeURIComponent(req.params.memKey || '');
+  if (!memKey.startsWith(owner + '::')) return res.status(403).json({ error: 'not your conversation' });
+  const history = conversationMemory.get(memKey) || [];
+  const state = conversationState.get(memKey) || {};
+  const [, channel, senderId] = memKey.split('::');
+  res.json({ memKey, channel, senderId, history, state });
+});
+
+// GET /api/dashboard/csat-detail — list recent 👎 ratings with conversation
+// preview so owners can learn from negative feedback.
+app.get('/api/dashboard/csat-detail', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const negatives = [];
+  try {
+    if (existsSync(CSAT_FILE)) {
+      const lines = readFileSync(CSAT_FILE, 'utf8').split('\n').filter(Boolean).slice(-500);
+      for (const l of lines) {
+        try {
+          const e = JSON.parse(l);
+          if (e.ownerEmail !== owner) continue;
+          if (e.rating !== 'negative') continue;
+          const memKey = `${e.ownerEmail}::${e.channel}::${e.senderId}`;
+          const history = (conversationMemory.get(memKey) || []).slice(-6);
+          negatives.push({ ...e, history });
+        } catch {}
+      }
+    }
+  } catch {}
+  negatives.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+  res.json({ items: negatives.slice(0, 30) });
+});
+
 // GET /api/dashboard/escalations — list paused (handed-off) conversations
 app.get('/api/dashboard/escalations', (req, res) => {
   const owner = requireDashboardAuth(req, res);
@@ -10309,6 +10348,24 @@ a{color:#00e5a0;text-decoration:none;}
 .activity-detail{color:#8888aa;font-size:11.5px;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .activity-time{font-size:11px;color:#6b6b8a;flex-shrink:0;}
 .activity-channel{font-size:10px;background:rgba(255,255,255,0.06);color:#9898b8;padding:1px 7px;border-radius:10px;text-transform:capitalize;}
+/* Section status badges */
+.section-header .badge-attn{background:rgba(251,191,36,0.15);color:#fbbf24;border:1px solid rgba(251,191,36,0.3);padding:2px 8px;border-radius:10px;font-size:10.5px;font-weight:600;margin-left:8px;}
+/* Drill-down modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:500;display:none;align-items:center;justify-content:center;padding:20px;}
+.modal-overlay.show{display:flex;}
+.modal{background:#161630;border:1px solid rgba(255,255,255,0.1);border-radius:16px;max-width:640px;width:100%;max-height:80vh;overflow-y:auto;padding:24px;}
+.modal h3{font-size:16px;color:#fff;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;}
+.modal .close-x{background:none;border:none;color:#8888aa;font-size:22px;cursor:pointer;line-height:1;}
+.thread-msg{padding:10px 14px;margin-bottom:8px;border-radius:10px;font-size:13px;line-height:1.5;max-width:85%;}
+.thread-msg.them{background:#1f1f3a;color:#eee;}
+.thread-msg.us{background:rgba(0,229,160,0.12);color:#cfffe8;margin-left:auto;}
+.thread-msg.summary{background:rgba(155,89,182,0.08);border:1px dashed rgba(155,89,182,0.3);color:#c9a4dc;font-style:italic;}
+.thread-meta{font-size:10.5px;color:#6b6b8a;margin-bottom:4px;}
+/* CTAs */
+.cta-card{background:linear-gradient(135deg,rgba(0,229,160,0.08),rgba(0,229,160,0.02));border:1px dashed rgba(0,229,160,0.3);border-radius:12px;padding:18px 22px;text-align:center;margin:8px 0;}
+.cta-card h4{font-size:14px;color:#fff;margin-bottom:6px;font-weight:600;}
+.cta-card p{font-size:12.5px;color:#9898b8;margin-bottom:12px;}
+.cta-btn{display:inline-block;background:#00e5a0;color:#0d0d1f;padding:8px 18px;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none;border:none;cursor:pointer;font-family:inherit;}
 .btn-logout{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 14px;font-size:12px;color:#ff6b6b;cursor:pointer;font-family:inherit;font-weight:500;}
 .btn-logout:hover{background:rgba(255,80,80,0.1);}
 .container{max-width:960px;margin:0 auto;padding:24px 16px 60px;}
@@ -10364,14 +10421,19 @@ tr:last-child td{border-bottom:none;}
 .gmail-link svg{width:20px;height:20px;}
 .gmail-card{background:linear-gradient(135deg,rgba(0,229,160,0.08),rgba(0,229,160,0.02));border:1px solid rgba(0,229,160,0.2);border-radius:14px;padding:20px;margin-bottom:16px;text-align:center;}
 .gmail-card p{font-size:13px;color:#9898b8;margin-bottom:14px;}
-@media(max-width:600px){
+@media(max-width:700px){
   .topbar{padding:12px 16px;}
   .topbar .logo span{font-size:18px;}
   .email-badge{display:none;}
+  .hero{grid-template-columns:1fr;gap:14px;padding:18px;}
+  .hero-metrics{justify-content:flex-start;gap:18px;}
+  .hero-actions{align-items:flex-start;}
   .stats-row{grid-template-columns:1fr 1fr;}
   .stat-card .value{font-size:24px;}
   table{font-size:12px;}
   td,th{padding:8px 6px;}
+  .channel-strip{gap:6px;}
+  .channel-chip{padding:6px 10px;font-size:12px;}
 }
 </style>
 </head><body>
@@ -10518,6 +10580,11 @@ tr:last-child td{border-bottom:none;}
 
 </div>
 
+<!-- Drill-down modal for conversation threads + CSAT detail -->
+<div class="modal-overlay" id="modal-overlay" onclick="if(event.target.id==='modal-overlay')closeModal()">
+  <div class="modal" id="modal-content"></div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -10585,7 +10652,7 @@ async function loadStats() {
       '<div class="hero-metric"><div class="v">' + chTotal + '</div><div class="l">Replies</div></div>' +
       '<div class="hero-metric"><div class="v">' + d.leads.total + '</div><div class="l">Leads</div></div>' +
       '<div class="hero-metric"><div class="v">' + d.bookings.total + '</div><div class="l">Bookings</div></div>' +
-      (csat.scorePct != null ? '<div class="hero-metric"><div class="v" style="color:' + (csat.scorePct >= 80 ? '#00e5a0' : csat.scorePct >= 50 ? '#fbbf24' : '#ff6b6b') + '">' + csat.scorePct + '%</div><div class="l">CSAT</div></div>' : '');
+      (csat.scorePct != null ? '<div class="hero-metric" style="cursor:pointer" onclick="showCsatDetail()" title="Click to see negative ratings"><div class="v" style="color:' + (csat.scorePct >= 80 ? '#00e5a0' : csat.scorePct >= 50 ? '#fbbf24' : '#ff6b6b') + '">' + csat.scorePct + '%</div><div class="l">CSAT</div></div>' : '');
     // Hero actions: master pause/resume (visual only — channel-toggle is per-channel via chips)
     document.getElementById('hero-actions').innerHTML =
       '<div style="font-size:11px;color:#6b6b8a;">' + d.emailsReplied.week + ' emails / ' + d.bookings.week + ' bookings this week</div>';
@@ -10665,14 +10732,25 @@ async function loadStats() {
       </div>
     \`;
     // Escalations banner — if any conv is paused waiting for owner takeover
+    // Also adds an "attention" badge on the Conversations section header.
     try {
       const esc = await api('/api/dashboard/escalations');
       const escDiv = document.getElementById('escalations-banner');
+      const convHeader = document.querySelector('#sec-conversations .section-header h3');
+      // Strip any previous attention badge
+      const oldBadge = convHeader?.querySelector('.badge-attn');
+      if (oldBadge) oldBadge.remove();
       if (escDiv) {
         if (esc.items?.length) {
           const rows = esc.items.slice(0, 5).map(e => '<li>' + escH(e.channel) + ' · ' + escH(e.senderId) + ' · <i>' + escH(e.reason || 'human requested') + '</i> <button onclick="resumeConv(\\'' + e.memKey + '\\')" style="margin-left:8px;background:#00e5a0;color:#0d0d1f;border:none;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;">Resume</button></li>').join('');
           escDiv.innerHTML = '<div style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);border-radius:12px;padding:14px 18px;margin-bottom:20px;"><b style="color:#fbbf24;">🤝 ' + esc.items.length + ' conversation(s) handed to you</b><ul style="margin:8px 0 0 0;padding-left:18px;font-size:13px;color:#ccc;line-height:1.7;">' + rows + '</ul></div>';
           escDiv.style.display = 'block';
+          if (convHeader) {
+            const b = document.createElement('span');
+            b.className = 'badge-attn';
+            b.textContent = esc.items.length + ' need attention';
+            convHeader.appendChild(b);
+          }
         } else {
           escDiv.style.display = 'none';
         }
@@ -10742,6 +10820,71 @@ async function loadSection(name) {
   else if (name === 'train') await loadTrainAria();
 }
 
+// ─── Modal + drill-down helpers ─────────────────────────────────────────
+function openModal(html) {
+  document.getElementById('modal-content').innerHTML = html;
+  document.getElementById('modal-overlay').classList.add('show');
+}
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('show');
+}
+
+async function showThread(memKey) {
+  openModal('<div style="color:#8888aa;text-align:center;padding:24px">Loading conversation…</div>');
+  try {
+    const d = await api('/api/dashboard/conversation/' + encodeURIComponent(memKey));
+    const rows = (d.history || []).map(h => {
+      const cls = h.role === 'sender' ? 'them' : (h.role === 'summary' ? 'summary' : 'us');
+      const label = h.role === 'sender' ? 'Customer' : (h.role === 'summary' ? 'Earlier summary' : 'Aria');
+      return '<div>' +
+        '<div class="thread-meta">' + escH(label) + ' · ' + timeAgo(h.date) + '</div>' +
+        '<div class="thread-msg ' + cls + '">' + escH(h.preview || '') + '</div>' +
+      '</div>';
+    }).join('');
+    const pauseChip = d.state?.paused
+      ? '<span style="background:rgba(251,191,36,0.15);color:#fbbf24;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;margin-left:8px;">PAUSED · ' + escH(d.state.reason || 'human takeover') + '</span>'
+      : '';
+    openModal(
+      '<h3>💬 ' + escH(d.channel || 'channel') + ' conversation' + pauseChip +
+        '<button class="close-x" onclick="closeModal()">×</button></h3>' +
+      '<div style="font-size:11.5px;color:#6b6b8a;margin-bottom:14px;">With ' + escH(d.senderId) + '</div>' +
+      (rows || '<div class="empty" style="padding:14px 0">No messages stored.</div>') +
+      (d.state?.paused ? '<div style="margin-top:16px;text-align:center;"><button class="cta-btn" onclick="resumeConv(\\'' + memKey + '\\');closeModal()">Resume Aria on this conversation</button></div>' : '')
+    );
+  } catch (e) { openModal('<div style="color:#ff6b6b">Failed to load conversation: ' + e.message + '</div>'); }
+}
+
+async function showCsatDetail() {
+  openModal('<div style="color:#8888aa;text-align:center;padding:24px">Loading 👎 ratings…</div>');
+  try {
+    const d = await api('/api/dashboard/csat-detail');
+    if (!d.items?.length) {
+      openModal('<h3>⭐ CSAT details<button class="close-x" onclick="closeModal()">×</button></h3>' +
+        '<div class="empty" style="padding:24px 0">No 👎 ratings yet — Aria\\'s been doing well!</div>');
+      return;
+    }
+    const rows = d.items.map(item => {
+      const recent = (item.history || []).slice(-3).map(h =>
+        '<div class="thread-meta">' + (h.role === 'sender' ? 'Customer' : 'Aria') + ' · ' + timeAgo(h.date) + '</div>' +
+        '<div class="thread-msg ' + (h.role === 'sender' ? 'them' : 'us') + '">' + escH(h.preview || '') + '</div>'
+      ).join('');
+      return '<div style="border-bottom:1px solid rgba(255,255,255,0.06);padding:14px 0;">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">' +
+          '<div style="color:#fff;font-weight:600;font-size:13px;">👎 ' + escH(item.senderName || item.senderId) + ' <span style="font-weight:400;color:#8888aa;font-size:11px;">on ' + escH(item.channel) + '</span></div>' +
+          '<div style="font-size:11px;color:#8888aa;">' + timeAgo(item.ts) + '</div>' +
+        '</div>' +
+        (item.raw ? '<div style="font-size:12px;color:#8888aa;font-style:italic;margin-bottom:8px;">"' + escH(item.raw) + '"</div>' : '') +
+        (recent || '<div style="font-size:12px;color:#6b6b8a;">No conversation history retained.</div>') +
+      '</div>';
+    }).join('');
+    openModal(
+      '<h3>👎 Negative ratings — last 30<button class="close-x" onclick="closeModal()">×</button></h3>' +
+      '<p style="font-size:12px;color:#8888aa;margin-bottom:14px;">Customers who rated Aria\\'s replies negatively. Use these to improve your Knowledge Documents or Topic Scope.</p>' +
+      rows
+    );
+  } catch (e) { openModal('<div style="color:#ff6b6b">Failed: ' + e.message + '</div>'); }
+}
+
 // Quick-toggle helper used by channel chips for email auto-reply
 async function toggleSetting(key, value) {
   try {
@@ -10773,7 +10916,9 @@ async function loadUnifiedConvs(filter) {
       const d = await api('/api/dashboard/messages?channel=' + chFilter + '&page=1');
       for (const m of (d.items || [])) {
         items.push({
-          channel: m.channel, from: m.senderName || m.senderId,
+          channel: m.channel,
+          from: m.senderName || m.senderId,
+          senderId: m.senderId,
           msg: m.message, reply: m.reply, ts: m.timestamp,
         });
       }
@@ -10796,7 +10941,13 @@ async function loadUnifiedConvs(filter) {
     const icons = { email: '📧', facebook: '📘', instagram: '📷', whatsapp: '💬' };
     let html = '<table><thead><tr><th></th><th>From</th><th>Message</th><th>Aria\\'s reply</th><th>When</th></tr></thead><tbody>';
     for (const it of items.slice(0, 50)) {
-      html += '<tr>' +
+      // Channel messages get a memKey we can use for thread drill-down.
+      // Email entries don't yet (separate ledger) — clicking does nothing for email.
+      const memKey = it.channel !== 'email' && it.senderId
+        ? OWNER + '::' + it.channel + '::' + it.senderId
+        : null;
+      const clickAttr = memKey ? ' onclick="showThread(\\'' + memKey + '\\')" style="cursor:pointer"' : '';
+      html += '<tr' + clickAttr + '>' +
         '<td style="width:24px">' + (icons[it.channel] || '') + '</td>' +
         '<td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH(it.from || '—') + '</td>' +
         '<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH((it.msg || '').substring(0, 100)) + '</td>' +
@@ -11007,7 +11158,10 @@ async function loadLeads() {
   const body = document.getElementById('body-leads');
   try {
     const d = await api('/api/dashboard/leads');
-    if (!d.leads.length) { body.innerHTML = '<div class="empty">No leads captured yet.</div>'; return; }
+    if (!d.leads.length) {
+      body.innerHTML = '<div class="cta-card"><h4>No leads yet</h4><p>Leads show up here when Aria captures contact info during a conversation. Make sure you have at least one channel connected.</p><button class="cta-btn" onclick="toggleSection(\\'channels\\');document.getElementById(\\'sec-channels\\').scrollIntoView({behavior:\\'smooth\\'})">Connect a channel →</button></div>';
+      return;
+    }
     let html = '<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th></tr></thead><tbody>';
     for (const l of d.leads) {
       html += '<tr><td>' + escH(l.name || '—') + '</td><td>' + escH(l.email) + '</td><td>' + escH(l.phone || '—') + '</td></tr>';
@@ -11021,7 +11175,10 @@ async function loadBookings() {
   const body = document.getElementById('body-bookings');
   try {
     const d = await api('/api/dashboard/bookings');
-    if (!d.bookings.length) { body.innerHTML = '<div class="empty">No bookings yet.</div>'; return; }
+    if (!d.bookings.length) {
+      body.innerHTML = '<div class="cta-card"><h4>No bookings yet</h4><p>When customers DM asking to book/hire, Aria collects the details (name, contact, when) and saves it here. Customers can ask via any connected channel.</p></div>';
+      return;
+    }
     let html = '<table><thead><tr><th>Date</th><th>Client</th><th>Service</th></tr></thead><tbody>';
     for (const b of d.bookings) {
       html += '<tr><td>' + escH(b.datetime || b.date || '—') + '</td><td>' + escH(b.name || '—') + '</td><td>' + escH(b.service || b.siteName || '—') + '</td></tr>';
