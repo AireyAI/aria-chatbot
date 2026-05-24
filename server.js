@@ -10863,10 +10863,11 @@ tr:last-child td{border-bottom:none;}
       <div style="padding:8px 0;">
         <p style="font-size:13px;color:#9898b8;margin-bottom:16px;">Connect more social accounts or reconnect existing ones.</p>
 
-        <a href="/connect/meta?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}" id="meta-connect-btn" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:13px;background:#1877F2;color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;margin-bottom:10px;">
+        <a href="/connect/meta?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}" id="meta-connect-btn" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:13px;background:#1877F2;color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;margin-bottom:6px;">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg>
           <span>Connect Facebook (Page + Messenger)</span>
         </a>
+        <p style="font-size:11.5px;color:#8888aa;margin:0 0 14px;padding:0 4px;line-height:1.5;">🔒 You'll log in with your personal Facebook so Meta can verify you're a Page admin — but Aria <b>only connects to the Business Page you select</b>. She never sees your personal DMs, posts, or friends. If you admin multiple Pages, you'll get to pick which one.</p>
 
         <a href="/connect/instagram?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}" id="ig-connect-btn" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:13px;background:linear-gradient(45deg,#FED373 0%,#F15245 35%,#D92E7F 65%,#9B36B7 100%);color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;margin-bottom:20px;box-shadow:0 4px 14px rgba(217,46,127,0.25);">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg>
@@ -12072,6 +12073,16 @@ app.get('/admin/connect/meta-as', (req, res) => {
   res.redirect(`/connect/meta?owner=${encodeURIComponent(owner)}&s=${encodeURIComponent(token)}`);
 });
 
+// Pending-choices map for the multi-Page picker step. Keyed by a fresh
+// state token (so the original META_OAUTH_STATES is consumed once, can't
+// be reused). 15-minute TTL — owner needs to pick before then or restart.
+const META_PENDING_CHOICES = new Map();
+const META_PENDING_TTL_MS = 15 * 60 * 1000;
+function prunePendingChoices() {
+  const now = Date.now();
+  for (const [k, v] of META_PENDING_CHOICES) if (v.expiresAt < now) META_PENDING_CHOICES.delete(k);
+}
+
 app.get('/connect/meta', (req, res) => {
   const owner = (req.query.owner || '').toString();
   const sessionToken = (req.query.s || '').toString();
@@ -12143,97 +12154,35 @@ app.get('/auth/meta/callback', async (req, res) => {
     const pages = pagesData.data || [];
 
     if (!pages.length) {
-      return res.send(`<html><body style="font-family:sans-serif;padding:40px;background:#0d0d1f;color:#eee;min-height:100vh">
-        <h2>No Facebook Pages found on your account</h2>
-        <p>You need to be an admin of at least one Page. Create or get admin access to a Page, then re-run /connect/meta.</p>
-      </body></html>`);
+      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Aria — No Business Page found</title></head>
+        <body style="font-family:-apple-system,sans-serif;background:#0d0d1f;color:#eee;min-height:100vh;padding:40px;">
+        <div style="max-width:560px;margin:0 auto;background:#161630;border:1px solid rgba(251,191,36,0.3);border-radius:16px;padding:32px;">
+          <h2 style="color:#fbbf24;margin:0 0 12px;">⚠️ No Facebook Business Page found</h2>
+          <p style="color:#ccc;line-height:1.7;font-size:14.5px;margin:0 0 14px;">Aria connects to your <b>Facebook Business Page</b> — not your personal profile. You don't currently have a Business Page on your Facebook account.</p>
+          <p style="color:#9898b8;font-size:13.5px;line-height:1.7;margin:0 0 20px;"><b>To fix:</b><br>1. Open Facebook → menu → <b>Pages</b> → <b>Create new Page</b><br>2. Fill in your business name + category (takes ~2 mins)<br>3. Come back here and click Connect Facebook again</p>
+          <p style="color:#6b6b8a;font-size:12px;margin:0 0 20px;">Your personal Facebook account is NOT connected. Aria only ever sees messages sent to your Business Page.</p>
+          <a href="https://www.facebook.com/pages/creation/" target="_blank" style="display:inline-block;padding:12px 22px;background:#1877F2;color:#fff;border-radius:10px;text-decoration:none;font-weight:600;margin-right:8px;">Create a Page →</a>
+          <a href="/dashboard?owner=${encodeURIComponent(owner)}&s=${encodeURIComponent(sessionToken)}" style="display:inline-block;padding:12px 22px;background:rgba(255,255,255,0.06);color:#ccc;border-radius:10px;text-decoration:none;font-size:13px;">Back to dashboard</a>
+        </div></body></html>`);
     }
 
-    // 4. Subscribe each page to webhooks + save to channelConfigs
-    const existing = channelConfigs.get(owner) || {};
-    const summary = [];
-    for (const p of pages) {
-      try {
-        const subRes = await fetch(`https://graph.facebook.com/v18.0/${p.id}/subscribed_apps?subscribed_fields=messages,messaging_postbacks,message_deliveries,message_reads&access_token=${p.access_token}`, { method: 'POST' });
-        const subData = await subRes.json();
-        if (!subData.success) console.warn('[meta-oauth] page subscribe failed', p.id, subData);
-      } catch (e) {
-        console.warn('[meta-oauth] page subscribe error', p.id, e.message);
-      }
-      // Save Page (Messenger) channel — disabled by default
-      existing.facebook = existing.facebook || {};
-      existing.facebook = {
-        pageId: p.id,
-        pageName: p.name,
-        accessToken: p.access_token,
-        enabled: existing.facebook?.enabled === true, // preserve prior toggle if reconnecting
-        connectedAt: new Date().toISOString(),
-      };
-      summary.push({ type: 'page', id: p.id, name: p.name });
-
-      // If page has linked IG Business account, save that too
-      const ig = p.instagram_business_account;
-      if (ig?.id) {
-        existing.instagram = {
-          igUserId: ig.id,
-          igUsername: ig.username,
-          pageId: p.id,
-          accessToken: p.access_token, // IG Messaging uses the Page token
-          enabled: existing.instagram?.enabled === true,
-          connectedAt: new Date().toISOString(),
-        };
-        summary.push({ type: 'instagram', id: ig.id, name: '@' + ig.username });
-      }
+    // If multiple Pages — interrupt the flow with a Page picker so the
+    // owner explicitly chooses which Business Page Aria should connect
+    // to (instead of silently saving whichever Meta returned first).
+    if (pages.length > 1) {
+      prunePendingChoices();
+      const pickerState = crypto.randomBytes(24).toString('hex');
+      META_PENDING_CHOICES.set(pickerState, {
+        owner, sessionToken, userToken, pages,
+        expiresAt: Date.now() + META_PENDING_TTL_MS,
+      });
+      return res.redirect(`/connect/meta/pick-page?state=${pickerState}`);
     }
 
-    // 5. Look for WhatsApp Business accounts the user manages via Business
-    // Portfolio. Only fires when user has Business Portfolio with WA set up.
-    try {
-      const wabaRes = await fetch(`https://graph.facebook.com/v18.0/me/businesses?fields=id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number}}&access_token=${userToken}`);
-      const wabaData = await wabaRes.json();
-      for (const biz of (wabaData.data || [])) {
-        for (const waba of (biz.owned_whatsapp_business_accounts?.data || [])) {
-          const phone = (waba.phone_numbers?.data || [])[0];
-          if (!phone) continue;
-          existing.whatsapp = {
-            phoneNumberId: phone.id,
-            displayPhone: phone.display_phone_number,
-            wabaId: waba.id,
-            businessName: biz.name,
-            accessToken: userToken,
-            enabled: existing.whatsapp?.enabled === true,
-            connectedAt: new Date().toISOString(),
-          };
-          summary.push({ type: 'whatsapp', id: phone.id, name: phone.display_phone_number });
-          // Subscribe WABA to webhooks
-          try {
-            await fetch(`https://graph.facebook.com/v18.0/${waba.id}/subscribed_apps`, {
-              method: 'POST',
-              headers: { 'Authorization': `Bearer ${userToken}` },
-            });
-          } catch (e) { console.warn('[meta-oauth] WABA subscribe error', waba.id, e.message); }
-          break; // one WA number per owner for now
-        }
-        if (existing.whatsapp) break;
-      }
-    } catch (e) {
-      console.warn('[meta-oauth] WA enumeration failed:', e.message);
-    }
+    // Single Page — proceed directly.
+    const summary = await saveMetaSelections({ owner, page: pages[0], userToken });
+    return res.send(renderMetaConnectedHtml({ owner, sessionToken, summary, pageName: pages[0].name }));
 
-    channelConfigs.set(owner, existing);
-    persistChannels();
-
-    const ICONS = { page: '📘 Messenger', instagram: '📷 Instagram', whatsapp: '💬 WhatsApp' };
-    const rows = summary.map(s => `<li><b>${ICONS[s.type] || s.type}:</b> ${escapeHtml(s.name)} <span style="color:#6b6b8a">(${s.id})</span></li>`).join('');
-    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Aria — Connected</title></head>
-    <body style="font-family:-apple-system,sans-serif;background:#0d0d1f;color:#eee;min-height:100vh;padding:40px;">
-      <div style="max-width:560px;margin:0 auto;background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:32px;">
-        <h2 style="margin:0 0 8px;color:#00e5a0;">✓ Connected to Facebook</h2>
-        <p style="color:#9898b8;font-size:14px;margin:0 0 20px;">Aria can now <i>receive</i> messages from these channels. Replies stay off until you flip the toggle in your dashboard.</p>
-        <ul style="line-height:1.9;font-size:14px;list-style:none;padding:0;">${rows}</ul>
-        <a href="/dashboard?owner=${encodeURIComponent(owner)}&s=${encodeURIComponent(sessionToken)}" style="display:inline-block;margin-top:20px;padding:12px 22px;background:#00e5a0;color:#0d0d1f;border-radius:10px;text-decoration:none;font-weight:600;">Back to dashboard →</a>
-      </div>
-    </body></html>`);
   } catch (e) {
     console.error('[meta-oauth] callback failed', e);
     res.status(500).send(`<html><body style="font-family:sans-serif;padding:40px;background:#0d0d1f;color:#eee;min-height:100vh">
@@ -12241,6 +12190,147 @@ app.get('/auth/meta/callback', async (req, res) => {
       <pre style="background:#0a0a18;padding:16px;border-radius:8px;overflow:auto">${escapeHtml(e.message)}</pre>
     </body></html>`);
   }
+});
+
+// Helper: save ONE Page + linked IG + scan-for-WhatsApp. Returns summary
+// for the success page render. Used by both single-page auto-save and the
+// multi-page picker route.
+async function saveMetaSelections({ owner, page, userToken }) {
+  const existing = channelConfigs.get(owner) || {};
+  const summary = [];
+
+  // Subscribe the chosen Page to webhooks
+  try {
+    const subRes = await fetch(`https://graph.facebook.com/v18.0/${page.id}/subscribed_apps?subscribed_fields=messages,messaging_postbacks,message_deliveries,message_reads&access_token=${page.access_token}`, { method: 'POST' });
+    const subData = await subRes.json();
+    if (!subData.success) console.warn('[meta-oauth] page subscribe failed', page.id, subData);
+  } catch (e) {
+    console.warn('[meta-oauth] page subscribe error', page.id, e.message);
+  }
+  existing.facebook = {
+    pageId: page.id,
+    pageName: page.name,
+    accessToken: page.access_token,
+    enabled: existing.facebook?.enabled === true, // preserve prior toggle if reconnecting
+    connectedAt: new Date().toISOString(),
+  };
+  summary.push({ type: 'page', id: page.id, name: page.name });
+
+  // Linked IG Business account
+  const ig = page.instagram_business_account;
+  if (ig?.id) {
+    existing.instagram = {
+      igUserId: ig.id,
+      igUsername: ig.username,
+      pageId: page.id,
+      accessToken: page.access_token,
+      enabled: existing.instagram?.enabled === true,
+      connectedAt: new Date().toISOString(),
+    };
+    summary.push({ type: 'instagram', id: ig.id, name: '@' + ig.username });
+  }
+
+  // WhatsApp Business scan (via owner's Business Portfolio). Only fires
+  // when owner has Business Portfolio with WA set up.
+  try {
+    const wabaRes = await fetch(`https://graph.facebook.com/v18.0/me/businesses?fields=id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number}}&access_token=${userToken}`);
+    const wabaData = await wabaRes.json();
+    for (const biz of (wabaData.data || [])) {
+      for (const waba of (biz.owned_whatsapp_business_accounts?.data || [])) {
+        const phone = (waba.phone_numbers?.data || [])[0];
+        if (!phone) continue;
+        existing.whatsapp = {
+          phoneNumberId: phone.id,
+          displayPhone: phone.display_phone_number,
+          wabaId: waba.id,
+          businessName: biz.name,
+          accessToken: userToken,
+          enabled: existing.whatsapp?.enabled === true,
+          connectedAt: new Date().toISOString(),
+        };
+        summary.push({ type: 'whatsapp', id: phone.id, name: phone.display_phone_number });
+        try {
+          await fetch(`https://graph.facebook.com/v18.0/${waba.id}/subscribed_apps`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${userToken}` },
+          });
+        } catch (e) { console.warn('[meta-oauth] WABA subscribe error', waba.id, e.message); }
+        break;
+      }
+      if (existing.whatsapp) break;
+    }
+  } catch (e) {
+    console.warn('[meta-oauth] WA enumeration failed:', e.message);
+  }
+
+  channelConfigs.set(owner, existing);
+  persistChannels();
+  return summary;
+}
+
+// Helper: render the success page after a Page is connected. Now explicit
+// about "we only connect your Business Page, not your personal account".
+function renderMetaConnectedHtml({ owner, sessionToken, summary, pageName }) {
+  const ICONS = { page: '📘 Messenger', instagram: '📷 Instagram', whatsapp: '💬 WhatsApp' };
+  const rows = summary.map(s => `<li><b>${ICONS[s.type] || s.type}:</b> ${escapeHtml(s.name)} <span style="color:#6b6b8a">(${s.id})</span></li>`).join('');
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Aria — Connected</title></head>
+  <body style="font-family:-apple-system,sans-serif;background:#0d0d1f;color:#eee;min-height:100vh;padding:40px;">
+    <div style="max-width:560px;margin:0 auto;background:#161630;border:1px solid rgba(0,229,160,0.3);border-radius:16px;padding:32px;">
+      <h2 style="margin:0 0 6px;color:#00e5a0;">✓ Connected to your Business Page</h2>
+      <p style="color:#fff;font-size:16px;font-weight:600;margin:0 0 8px;">${escapeHtml(pageName)}</p>
+      <p style="color:#9898b8;font-size:13.5px;margin:0 0 18px;line-height:1.6;">Aria can now reply to Messenger DMs sent to this Page. Replies stay off until you flip the toggle in your dashboard.</p>
+      <ul style="line-height:1.9;font-size:14px;list-style:none;padding:0;background:rgba(0,229,160,0.05);border-radius:10px;padding:12px 16px;margin-bottom:18px;">${rows}</ul>
+      <div style="background:rgba(255,255,255,0.04);border-left:3px solid #6b6b8a;padding:10px 14px;margin-bottom:18px;border-radius:6px;">
+        <p style="color:#9898b8;font-size:12.5px;margin:0;line-height:1.6;">🔒 <b>Your personal Facebook is NOT connected.</b> Aria can only see messages sent to your Business Page. She cannot read your DMs, posts, friends, or anything on your personal profile.</p>
+      </div>
+      <a href="/dashboard?owner=${encodeURIComponent(owner)}&s=${encodeURIComponent(sessionToken)}" style="display:inline-block;padding:12px 22px;background:#00e5a0;color:#0d0d1f;border-radius:10px;text-decoration:none;font-weight:600;">Back to dashboard →</a>
+    </div>
+  </body></html>`;
+}
+
+// GET /connect/meta/pick-page — multi-Page picker.
+// Two modes: render the picker form OR finalize on ?pick=PAGEID
+app.get('/connect/meta/pick-page', async (req, res) => {
+  prunePendingChoices();
+  const state = String(req.query.state || '');
+  const pickedPageId = String(req.query.pick || '');
+  const stash = META_PENDING_CHOICES.get(state);
+  if (!stash) return res.status(400).send('<h2>This Page-picker session expired. Please re-run /connect/meta from your dashboard.</h2>');
+
+  // Finalize: owner picked a Page
+  if (pickedPageId) {
+    const chosen = stash.pages.find(p => p.id === pickedPageId);
+    if (!chosen) return res.status(400).send('<h2>Invalid Page selection.</h2>');
+    META_PENDING_CHOICES.delete(state);
+    try {
+      const summary = await saveMetaSelections({ owner: stash.owner, page: chosen, userToken: stash.userToken });
+      return res.send(renderMetaConnectedHtml({ owner: stash.owner, sessionToken: stash.sessionToken, summary, pageName: chosen.name }));
+    } catch (e) {
+      console.error('[meta-oauth] picker save failed', e);
+      return res.status(500).send(`<h2>Failed to save: ${escapeHtml(e.message)}</h2>`);
+    }
+  }
+
+  // Render: picker form
+  const cards = stash.pages.map(p => {
+    const ig = p.instagram_business_account;
+    return `<a href="/connect/meta/pick-page?state=${encodeURIComponent(state)}&pick=${encodeURIComponent(p.id)}" style="display:block;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:12px;padding:16px;margin-bottom:10px;text-decoration:none;color:#eee;transition:all 0.15s;" onmouseover="this.style.borderColor='rgba(0,229,160,0.4)';this.style.background='rgba(0,229,160,0.06)'" onmouseout="this.style.borderColor='rgba(255,255,255,0.1)';this.style.background='rgba(255,255,255,0.04)'">
+      <div style="font-size:15px;font-weight:600;color:#fff;">📘 ${escapeHtml(p.name)}</div>
+      <div style="font-size:12px;color:#8888aa;margin-top:4px;">Page ID: ${escapeHtml(p.id)}</div>
+      ${ig?.username ? `<div style="font-size:12px;color:#E1306C;margin-top:4px;">📷 Linked Instagram: @${escapeHtml(ig.username)}</div>` : ''}
+    </a>`;
+  }).join('');
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Aria — Pick your Business Page</title></head>
+  <body style="font-family:-apple-system,sans-serif;background:#0d0d1f;color:#eee;min-height:100vh;padding:40px;">
+    <div style="max-width:560px;margin:0 auto;background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:32px;">
+      <h2 style="margin:0 0 8px;color:#00e5a0;">Which Page should Aria connect to?</h2>
+      <p style="color:#9898b8;font-size:13.5px;margin:0 0 18px;line-height:1.6;">You admin ${stash.pages.length} Pages on your Facebook. Aria connects to <b>ONE</b> Business Page — pick the one for the business you want her to handle messages for.</p>
+      <div style="margin-bottom:18px;">${cards}</div>
+      <div style="background:rgba(255,255,255,0.04);border-left:3px solid #6b6b8a;padding:10px 14px;border-radius:6px;">
+        <p style="color:#9898b8;font-size:12px;margin:0;line-height:1.6;">🔒 Only the Page you select will be connected. Your personal Facebook + other Pages stay completely separate from Aria.</p>
+      </div>
+    </div>
+  </body></html>`);
 });
 
 // ─── Meta Webhook ────────────────────────────────────────────────────────────
