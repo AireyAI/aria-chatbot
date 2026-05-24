@@ -20,7 +20,7 @@
  *   PORT                   default 3000
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync } from 'fs';
 import { resolve, join } from 'path';
 
 // Load .env file manually (no extra package needed)
@@ -46,6 +46,7 @@ import crypto     from 'crypto';
 import { promises as fsp } from 'node:fs';
 import { routeChat }                    from './lib/lead_router.js';
 import { decideLeadAction, policyAddendum } from './lib/lead_policy.js';
+import { scoreChannelLead, categorizeChannelMessage } from './lib/channel_lead_scorer.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
@@ -9630,12 +9631,23 @@ app.get('/api/dashboard/stats', (req, res) => {
   const history = stats.history || [];
   const emailsWeek = history.filter(h => new Date(h.time) > weekAgo).length;
   const bookingsWeek = history.filter(h => h.type === 'booking' && new Date(h.time) > weekAgo).length;
-  const totalLeads = (stats.leads?.hot || 0) + (stats.leads?.warm || 0) + (stats.leads?.cold || 0);
+  // Combine email leads (EMAIL_REPLY_STATS) + channel leads (channelStats)
+  // so the dashboard's Leads card shows all sources unified.
+  const chStats = channelStats.get(owner) || {};
+  const chLeads = chStats.leads || { hot: 0, warm: 0, cold: 0 };
+  const hot  = (stats.leads?.hot  || 0) + (chLeads.hot  || 0);
+  const warm = (stats.leads?.warm || 0) + (chLeads.warm || 0);
+  const cold = (stats.leads?.cold || 0) + (chLeads.cold || 0);
+  const totalLeads = hot + warm + cold;
   const autoReplyConfig = EMAIL_AUTO_REPLY_ENABLED.get(owner);
   res.json({
     emailsReplied: { week: emailsWeek, total: stats.replied || 0 },
     bookings: { week: bookingsWeek, total: stats.bookings || 0 },
-    leads: { total: totalLeads, hot: stats.leads?.hot || 0, warm: stats.leads?.warm || 0, cold: stats.leads?.cold || 0 },
+    leads: { total: totalLeads, hot, warm, cold },
+    leadsBySource: {
+      email:   { hot: stats.leads?.hot  || 0, warm: stats.leads?.warm  || 0, cold: stats.leads?.cold  || 0 },
+      channel: { hot: chLeads.hot       || 0, warm: chLeads.warm       || 0, cold: chLeads.cold       || 0 },
+    },
     autoReplyEnabled: !!autoReplyConfig?.enabled,
     gmailConnected: gmailTokens.has(owner)
   });
@@ -10975,7 +10987,8 @@ async function generateChannelReply(systemPrompt, senderName, messageText) {
 Respond with valid JSON only:
 {
   "text": "Your plain text reply here (no HTML)",
-  "booking": null or { "name": "customer name", "datetime": "date/time mentioned", "notes": "what they need" }
+  "booking": null or { "name": "customer name", "datetime": "date/time mentioned", "notes": "what they need" },
+  "contact": { "name": "customer name or null", "email": "email if shared, else null", "phone": "phone if shared, else null" }
 }
 
 Rules:
@@ -10985,20 +10998,63 @@ Rules:
 - Offer to arrange a call or visit when appropriate
 - Sign off with the business name
 - Plain text only, no HTML tags
-- If a date/time/appointment is mentioned, extract into booking object` }],
+- If a date/time/appointment is mentioned, extract into booking object
+- If sender shared their email or phone anywhere in this message OR conversation history, extract into contact object — otherwise leave fields null` }],
       system: systemPrompt,
     });
     const text = r.content[0]?.text || '';
     try {
       const parsed = JSON.parse(text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim());
+      // Defensive defaults so downstream code never NPEs on missing fields.
+      parsed.contact = parsed.contact || { name: null, email: null, phone: null };
+      parsed.booking = parsed.booking || null;
       return parsed;
     } catch {
-      return { text, booking: null };
+      return { text, booking: null, contact: { name: null, email: null, phone: null } };
     }
   } catch (e) {
     console.warn('Channel reply generation failed:', e.message);
     return null;
   }
+}
+
+// Append-only ledger of channel-sourced leads. One line per scored message
+// so we never lose history (Engineering Rule 13). Consumers derive current
+// state by reading recent entries.
+const CHANNEL_LEADS_FILE = resolve('data/channel_leads.jsonl');
+function appendChannelLead(entry) {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    appendFileSync(CHANNEL_LEADS_FILE, JSON.stringify(entry) + '\n');
+  } catch (e) { console.warn('[channel-lead] append failed:', e.message); }
+}
+
+// Roll up scored lead into channelStats.{owner}.leads.{hot|warm|cold}
+// + append to the JSONL ledger. The dashboard's /api/dashboard/stats
+// later sums these alongside email leads for a unified Leads card.
+function trackChannelLead(ownerEmail, { channel, senderId, senderName, leadScore, category, contact, messagePreview }) {
+  const stats = channelStats.get(ownerEmail) || {
+    whatsapp: { replied: 0, week: 0, lastReply: null },
+    instagram: { replied: 0, week: 0, lastReply: null },
+    facebook: { replied: 0, week: 0, lastReply: null },
+    total: 0,
+    leads: { hot: 0, warm: 0, cold: 0 },
+    categories: { booking: 0, quote: 0, complaint: 0, feedback: 0, general: 0 },
+  };
+  if (!stats.leads) stats.leads = { hot: 0, warm: 0, cold: 0 };
+  if (!stats.categories) stats.categories = { booking: 0, quote: 0, complaint: 0, feedback: 0, general: 0 };
+  stats.leads[leadScore] = (stats.leads[leadScore] || 0) + 1;
+  stats.categories[category] = (stats.categories[category] || 0) + 1;
+  channelStats.set(ownerEmail, stats);
+  persistChannelStats();
+
+  appendChannelLead({
+    ts: new Date().toISOString(),
+    ownerEmail, channel, senderId, senderName,
+    leadScore, category,
+    contact: contact || {},
+    messagePreview: (messagePreview || '').slice(0, 200),
+  });
 }
 
 function trackChannelReply(ownerEmail, channel) {
@@ -11150,6 +11206,26 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
 
   // Update stats
   trackChannelReply(ownerEmail, channel);
+
+  // Score + promote to lead. Uses conversation depth so longer convs
+  // weigh hotter. Append-only ledger via trackChannelLead.
+  try {
+    const convLen = (conversationMemory.get(memKey) || []).length;
+    const leadScore = scoreChannelLead({
+      senderMessage: messageText,
+      reply,
+      contact: reply.contact || {},
+      conversationLength: convLen,
+    });
+    const category = categorizeChannelMessage(messageText);
+    trackChannelLead(ownerEmail, {
+      channel, senderId, senderName,
+      leadScore, category,
+      contact: reply.contact || {},
+      messagePreview: messageText,
+    });
+    console.log(`📱 [${channel}] Lead scored: ${leadScore} / ${category} (conv=${convLen})`);
+  } catch (e) { console.warn('[channel-lead] scoring failed:', e.message); }
 
   // Detect booking
   if (reply.booking) {
