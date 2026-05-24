@@ -47,6 +47,7 @@ import { promises as fsp } from 'node:fs';
 import { routeChat }                    from './lib/lead_router.js';
 import { decideLeadAction, policyAddendum } from './lib/lead_policy.js';
 import { scoreChannelLead, categorizeChannelMessage } from './lib/channel_lead_scorer.js';
+import { retrieveRelevantChunks } from './lib/rag_retriever.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
@@ -533,6 +534,78 @@ async function sendInstagramMessage(config, recipientId, text, quickReplies = []
     return false;
   }
   return true;
+}
+
+// Sender_action signals "typing_on" / "typing_off" / "mark_seen" for
+// FB Messenger + Instagram. Customer sees "..." dots while Claude composes.
+// Fail-silent — typing indicator is decoration, never block on it.
+async function sendTypingIndicator(channel, channelConfig, recipientId, on = true) {
+  try {
+    if (channel === 'facebook') {
+      await fetch(`https://graph.facebook.com/v21.0/me/messages?access_token=${channelConfig.accessToken}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipient: { id: recipientId }, sender_action: on ? 'typing_on' : 'typing_off' }),
+      });
+    } else if (channel === 'instagram') {
+      await fetch(`https://graph.facebook.com/v21.0/${channelConfig.igUserId}/messages`, {
+        method: 'POST', headers: { 'Authorization': `Bearer ${channelConfig.accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipient: { id: recipientId }, sender_action: on ? 'typing_on' : 'typing_off' }),
+      });
+    }
+    // WhatsApp has no typing-indicator API; mark_as_read is closest but
+    // not used here to avoid double-read receipts.
+  } catch {}
+}
+
+// Generic-template carousel for FB Messenger + IG Direct. Up to 10 cards,
+// each with image_url, title, subtitle (under 80 chars), and 1-3 buttons.
+// Use for browsable service catalogues — way higher conversion than text.
+async function sendFacebookCarousel(config, recipientId, cards) {
+  const elements = cards.slice(0, 10).map(c => ({
+    title: String(c.title || '').slice(0, 80),
+    subtitle: c.subtitle ? String(c.subtitle).slice(0, 80) : undefined,
+    image_url: c.image || undefined,
+    default_action: c.link ? { type: 'web_url', url: c.link, webview_height_ratio: 'tall' } : undefined,
+    buttons: c.link ? [{ type: 'web_url', url: c.link, title: (c.btn_text || 'Learn more').slice(0, 20) }] : undefined,
+  }));
+  const body = {
+    recipient: { id: recipientId },
+    message: { attachment: { type: 'template', payload: { template_type: 'generic', elements } } },
+  };
+  const r = await fetch(`https://graph.facebook.com/v21.0/me/messages?access_token=${config.accessToken}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) { console.warn('FB carousel send error:', await r.text()); return false; }
+  return true;
+}
+
+async function sendInstagramCarousel(config, recipientId, cards) {
+  const elements = cards.slice(0, 10).map(c => ({
+    title: String(c.title || '').slice(0, 80),
+    subtitle: c.subtitle ? String(c.subtitle).slice(0, 80) : undefined,
+    image_url: c.image || undefined,
+    buttons: c.link ? [{ type: 'web_url', url: c.link, title: (c.btn_text || 'Learn more').slice(0, 20) }] : undefined,
+  }));
+  const body = {
+    recipient: { id: recipientId },
+    message: { attachment: { type: 'template', payload: { template_type: 'generic', elements } } },
+  };
+  const r = await fetch(`https://graph.facebook.com/v21.0/${config.igUserId}/messages`, {
+    method: 'POST', headers: { 'Authorization': `Bearer ${config.accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) { console.warn('IG carousel send error:', await r.text()); return false; }
+  return true;
+}
+
+async function sendChannelCarousel(channel, channelConfig, recipientId, cards) {
+  try {
+    if (channel === 'facebook')  return await sendFacebookCarousel(channelConfig, recipientId, cards);
+    if (channel === 'instagram') return await sendInstagramCarousel(channelConfig, recipientId, cards);
+    // WhatsApp: list-message format (different shape, deferred)
+    return false;
+  } catch (e) { console.warn(`[${channel}] carousel send error:`, e.message); return false; }
 }
 
 async function sendFacebookMessage(config, recipientId, text, quickReplies = []) {
@@ -9717,13 +9790,37 @@ app.get('/api/dashboard/stats', (req, res) => {
       channel: { hot: chLeads.hot       || 0, warm: chLeads.warm       || 0, cold: chLeads.cold       || 0 },
     },
     csat: { positive: csatPos, negative: csatNeg, total: csatTotal, scorePct: csatScore },
-    budget: (() => {
-      const b = checkBudget(owner, autoReplyConfig?.config?.tokensPerDay);
-      return { usedToday: b.used, capToday: b.cap, repliesToday: b.replies, pctUsed: Math.round((b.used / b.cap) * 100) };
-    })(),
+    // budget intentionally NOT exposed here — clients should never see how
+    // many tokens they're burning. Kyle-only view at /api/admin/usage.
     autoReplyEnabled: !!autoReplyConfig?.enabled,
     gmailConnected: gmailTokens.has(owner)
   });
+});
+
+// Admin-only — per-owner daily token + reply usage across the whole estate
+app.get('/api/admin/usage', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  const rows = [];
+  // Walk both EMAIL_AUTO_REPLY_ENABLED owners + channelConfigs owners + anyone
+  // who appears in tokenUsageDaily today
+  const owners = new Set([
+    ...Array.from(EMAIL_AUTO_REPLY_ENABLED.keys()),
+    ...Array.from(channelConfigs.keys()),
+  ]);
+  for (const k of tokenUsageDaily.keys()) owners.add(k.split('::')[0]);
+  for (const owner of owners) {
+    const profile = getOwnerProfile(owner);
+    const b = checkBudget(owner, profile?.config?.tokensPerDay);
+    rows.push({
+      ownerEmail: owner,
+      usedToday: b.used,
+      capToday: b.cap,
+      repliesToday: b.replies,
+      pctUsed: Math.round((b.used / b.cap) * 100),
+    });
+  }
+  rows.sort((a, b) => b.usedToday - a.usedToday);
+  res.json({ rows, totalUsedToday: rows.reduce((s, r) => s + r.usedToday, 0) });
 });
 
 // GET /api/dashboard/escalations — list paused (handed-off) conversations
@@ -10287,8 +10384,6 @@ async function loadStats() {
     const chTotal = ch.stats?.total || 0;
     const connected = ['whatsapp','instagram','facebook'].filter(c => ch.channels?.[c]?.accessToken).length;
     const csat = d.csat || { total: 0, scorePct: null };
-    const budget = d.budget || { usedToday: 0, capToday: 50000, pctUsed: 0, repliesToday: 0 };
-    const budgetColor = budget.pctUsed >= 90 ? '#ff6b6b' : budget.pctUsed >= 70 ? '#fbbf24' : '#00e5a0';
     document.getElementById('stats-row').innerHTML = \`
       <div class="stat-card">
         <div class="value">\${d.emailsReplied.total}</div>
@@ -10314,11 +10409,6 @@ async function loadStats() {
         <div class="value" style="color:\${csat.scorePct == null ? '#6b6b8a' : csat.scorePct >= 80 ? '#00e5a0' : csat.scorePct >= 50 ? '#fbbf24' : '#ff6b6b'}">\${csat.scorePct == null ? '—' : csat.scorePct + '%'}</div>
         <div class="label">CSAT</div>
         <div class="sub">\${csat.total} ratings, 90d</div>
-      </div>
-      <div class="stat-card">
-        <div class="value" style="color:\${budgetColor}">\${budget.pctUsed}%</div>
-        <div class="label">Daily Budget</div>
-        <div class="sub">\${budget.repliesToday} replies today</div>
       </div>
       <div class="stat-card \${d.autoReplyEnabled ? 'status-on' : 'status-off'}">
         <div class="value">\${d.autoReplyEnabled ? 'ON' : 'OFF'}</div>
@@ -11115,14 +11205,39 @@ async function processMetaWebhook(payload) {
   }
 }
 
+// Resilient Claude call with retry + Sonnet fallback. Haiku is the workhorse;
+// if it errors 3× we drop to Sonnet for this single call (rarely fires,
+// roughly 10× the cost, only when haiku is misbehaving). Exponential backoff
+// on retryable errors (529 overloaded, 5xx, network) but NOT on 4xx (bad
+// request — retrying won't help).
+async function callClaudeWithFallback(payload) {
+  const models = ['claude-haiku-4-5-20251001', 'claude-haiku-4-5-20251001', 'claude-haiku-4-5-20251001', 'claude-sonnet-4-5-20250929'];
+  let lastErr;
+  for (let i = 0; i < models.length; i++) {
+    try {
+      return await claude.messages.create({ ...payload, model: models[i] });
+    } catch (e) {
+      lastErr = e;
+      const status = e?.status || e?.error?.status;
+      const retryable = !status || status === 429 || status === 529 || status >= 500;
+      if (!retryable) throw e;
+      if (i < models.length - 1) {
+        const wait = Math.min(500 * Math.pow(2, i), 4000);
+        console.warn(`Claude call attempt ${i + 1} failed (${status || 'network'}): ${e.message}. Retrying in ${wait}ms with ${models[i + 1]}`);
+        await new Promise(r => setTimeout(r, wait));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 async function generateChannelReply(systemPrompt, senderName, messageText, opts = {}) {
   const { allowedTopics } = opts;
   const scopeRule = allowedTopics?.length
     ? `\n- SCOPE: this business only handles ${allowedTopics.join(', ')}. If the message is clearly OFF these topics (e.g. asking for legal/medical advice, asking about a different industry), set outOfScope=true and politely redirect in your text reply (say what you can help with, suggest they contact the relevant expert elsewhere). Common related questions still count as in-scope.`
     : '';
   try {
-    const r = await claude.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+    const r = await callClaudeWithFallback({
       max_tokens: 600,
       messages: [{ role: 'user', content: `You received this message from ${senderName}:
 
@@ -11138,7 +11253,9 @@ Respond with valid JSON only:
   "outOfScope": true | false,
   "needsHuman": true | false,
   "handoffReason": "short reason if needsHuman, else null",
-  "suggestedReplies": ["Btn 1", "Btn 2", "Btn 3"] or []
+  "suggestedReplies": ["Btn 1", "Btn 2", "Btn 3"] or [],
+  "language": "en" | "es" | "fr" | "de" | "it" | "pt" | "nl" | "pl" | "ar" | "zh" | "ja" | "ko" | other ISO-639-1 code,
+  "showServicesCarousel": true | false
 }
 
 Rules:
@@ -11153,7 +11270,9 @@ Rules:
 - sentiment: classify the sender's tone. "angry" = swearing, threats, all-caps frustration, repeated complaints. "negative" = frustrated but civil. "neutral" = transactional. "positive" = thankful/excited.
 - urgency: "high" = explicit deadline today/asap/emergency/urgent/now/leaking/broken; "medium" = "this week"/"soon"/quote-soon; "low" = browsing, future planning, no time pressure
 - needsHuman: true ONLY when the user explicitly asks for a human/manager OR you genuinely cannot help (refund disputes, complex billing, complaints about specific staff). Set handoffReason concisely. Don't escalate easy stuff.
-- suggestedReplies: 2-3 SHORT (≤20 chars each) tappable button options that match likely next actions for this customer. Examples: ["Get a quote", "Book a call", "See examples"]. Leave [] if no obvious next step (e.g. complaint, off-topic, post-handoff). Never include "Talk to a human" if you've already set needsHuman=true.${scopeRule}` }],
+- suggestedReplies: 2-3 SHORT (≤20 chars each) tappable button options that match likely next actions for this customer. Examples: ["Get a quote", "Book a call", "See examples"]. Leave [] if no obvious next step (e.g. complaint, off-topic, post-handoff). Never include "Talk to a human" if you've already set needsHuman=true.
+- language: detect the customer's language (ISO-639-1 code: "en", "es", "fr", "de", etc.) and WRITE YOUR REPLY TEXT IN THE SAME LANGUAGE. If they switch mid-conversation, follow them. Default to English when unclear.
+- showServicesCarousel: true ONLY when the customer asks "what do you do/offer", "what services", "show me your products", "what can I get from you" etc. Keep your text reply short ("Here's what we offer:") because a swipeable card carousel will be sent right after. false otherwise.${scopeRule}` }],
       system: systemPrompt,
     });
     const text = r.content[0]?.text || '';
@@ -11170,10 +11289,12 @@ Rules:
       parsed.suggestedReplies = Array.isArray(parsed.suggestedReplies)
         ? parsed.suggestedReplies.filter(s => typeof s === 'string' && s.trim()).slice(0, 3)
         : [];
+      parsed.language = typeof parsed.language === 'string' ? parsed.language.toLowerCase().slice(0, 5) : 'en';
+      parsed.showServicesCarousel = !!parsed.showServicesCarousel;
       parsed._tokensUsed = (r.usage?.input_tokens || 0) + (r.usage?.output_tokens || 0);
       return parsed;
     } catch {
-      return { text, booking: null, contact: { name: null, email: null, phone: null }, sentiment: 'neutral', urgency: 'low', outOfScope: false, needsHuman: false, handoffReason: null, suggestedReplies: [], _tokensUsed: (r.usage?.input_tokens || 0) + (r.usage?.output_tokens || 0) };
+      return { text, booking: null, contact: { name: null, email: null, phone: null }, sentiment: 'neutral', urgency: 'low', outOfScope: false, needsHuman: false, handoffReason: null, suggestedReplies: [], language: 'en', showServicesCarousel: false, _tokensUsed: (r.usage?.input_tokens || 0) + (r.usage?.output_tokens || 0) };
     }
   } catch (e) {
     console.warn('Channel reply generation failed:', e.message);
@@ -11189,8 +11310,7 @@ const CONV_MAX_RAW = 12;            // keep last N raw exchanges verbatim
 const CONV_SUMMARIZE_TRIGGER = 18;  // when total >= this, compress to fit
 async function summarizeOldHistory(oldEntries) {
   try {
-    const r = await claude.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+    const r = await callClaudeWithFallback({
       max_tokens: 200,
       messages: [{ role: 'user', content: `Summarise this customer-service conversation snippet into ONE sentence (under 280 chars). Keep names, services discussed, prices mentioned, time-sensitive commitments. Drop pleasantries.
 
@@ -11209,8 +11329,7 @@ Reply with just the summary sentence, no preamble.` }],
 // the owner gets actionable context instead of a wall of messages.
 async function generateHandoffSummary(senderName, conversationHistory, lastMessage, reason) {
   try {
-    const r = await claude.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+    const r = await callClaudeWithFallback({
       max_tokens: 300,
       messages: [{ role: 'user', content: `Aria needs to hand off a ${senderName} conversation to the business owner. Reason: ${reason || 'human requested'}.
 
@@ -11290,6 +11409,62 @@ function rebuildCustomerIndex() {
   } catch (e) { console.warn('Customer index rebuild failed:', e.message); }
 }
 rebuildCustomerIndex();
+
+// Knowledge documents per owner — uploaded via dashboard, used by RAG
+// retriever to ground Aria's answers in real owner content. Each doc is
+// { title, content, uploadedAt }. Persisted to data/knowledge_docs.json.
+const KNOWLEDGE_DOCS_FILE = resolve('data/knowledge_docs.json');
+const knowledgeDocs = new Map(); // ownerEmail → [{title, content, uploadedAt}]
+try {
+  if (existsSync(KNOWLEDGE_DOCS_FILE)) {
+    const saved = JSON.parse(readFileSync(KNOWLEDGE_DOCS_FILE, 'utf8'));
+    for (const [k, v] of Object.entries(saved)) knowledgeDocs.set(k, v);
+  }
+} catch (e) { console.warn('Failed to load knowledge docs:', e.message); }
+function persistKnowledgeDocs() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [k, v] of knowledgeDocs) obj[k] = v;
+    writeFileSync(KNOWLEDGE_DOCS_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist knowledge docs:', e.message); }
+}
+
+// GET /api/dashboard/knowledge — list owner's docs
+app.get('/api/dashboard/knowledge', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const docs = (knowledgeDocs.get(owner) || []).map(d => ({ title: d.title, charCount: (d.content || '').length, uploadedAt: d.uploadedAt }));
+  res.json({ docs });
+});
+
+// POST /api/dashboard/knowledge — add a doc (title + plain text content)
+app.post('/api/dashboard/knowledge', express.json({ limit: '2mb' }), (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { title, content } = req.body || {};
+  if (!title || !content) return res.status(400).json({ error: 'title + content required' });
+  if (String(content).length > 200000) return res.status(413).json({ error: 'doc too large (200k char max)' });
+  const docs = knowledgeDocs.get(owner) || [];
+  docs.push({ title: String(title).slice(0, 120), content: String(content), uploadedAt: new Date().toISOString() });
+  if (docs.length > 50) docs.shift(); // cap at 50 docs per owner
+  knowledgeDocs.set(owner, docs);
+  persistKnowledgeDocs();
+  res.json({ ok: true, totalDocs: docs.length });
+});
+
+// DELETE /api/dashboard/knowledge/:idx — remove a doc by index
+app.delete('/api/dashboard/knowledge/:idx', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const idx = parseInt(req.params.idx);
+  const docs = knowledgeDocs.get(owner) || [];
+  if (idx < 0 || idx >= docs.length) return res.status(404).json({ error: 'not found' });
+  docs.splice(idx, 1);
+  knowledgeDocs.set(owner, docs);
+  persistKnowledgeDocs();
+  res.json({ ok: true });
+});
 
 // Per-owner-per-day token budget for channel replies. Default 50k/day
 // (~250-500 replies depending on length). Prevents a single chatty
@@ -11502,10 +11677,19 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     ? `\n\nRETURNING CUSTOMER — you've spoken with ${returning.name || senderName} before. Last touch: ${returning.lastSeen}. Recent topics: ${returning.recent.slice(0, 3).map(r => r.preview).join(' | ')}. Acknowledge briefly ("welcome back") but don't repeat their history at them — just reply to current message with the context in mind.`
     : '';
 
-  // Knowledge base
+  // Knowledge base (manual FAQs)
   const kbEntries = knowledgeBase.get(ownerEmail) || [];
   const kbContext = kbEntries.length
     ? '\n\nFREQUENTLY ASKED QUESTIONS:\n' + kbEntries.map(e => `Q: ${e.question}\nA: ${e.answer}`).join('\n\n')
+    : '';
+
+  // RAG over uploaded documents — retrieve top 3 chunks relevant to the
+  // sender's message. Empty silently when owner has no docs uploaded.
+  const ownerDocs = knowledgeDocs.get(ownerEmail) || [];
+  const ragChunks = ownerDocs.length ? retrieveRelevantChunks(messageText, ownerDocs, { topK: 3 }) : [];
+  const ragContext = ragChunks.length
+    ? '\n\nRELEVANT DOCUMENT EXCERPTS (cite these for accuracy — DO NOT make up details not in them):\n' +
+      ragChunks.map(c => `[from "${c.title}"] ${c.content}`).join('\n\n')
     : '';
 
   // Conversation memory (memKey already defined above for paused-state check)
@@ -11527,12 +11711,18 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
   };
   const channelInstructions = `\n\nYou are replying via ${channel}. ${channelLimits[channel]} Never mention you are AI — write as a team member.`;
 
-  // Generate reply (with optional scope guardrail + slot + returning context)
+  // Show "typing…" so the customer knows Aria is composing (institutional UX)
+  sendTypingIndicator(channel, ownerChannels[channel], senderId, true);
+
+  // Generate reply (with scope guardrail + slot + returning + RAG context)
   const reply = await generateChannelReply(
-    systemPrompt + kbContext + convContext + slotContext + returningContext + channelInstructions,
+    systemPrompt + kbContext + ragContext + convContext + slotContext + returningContext + channelInstructions,
     senderName, messageText,
     { allowedTopics }
   );
+
+  // Stop typing whether we got a reply or not
+  sendTypingIndicator(channel, ownerChannels[channel], senderId, false);
 
   if (!reply) {
     console.warn(`📱 [${channel}] Failed to generate reply for ${senderId}`);
@@ -11652,6 +11842,18 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
   // suggestedReplies — Messenger + IG render as tappable chips, WhatsApp
   // renders as interactive reply buttons (max 3).
   const sent = await sendChannelReply(channel, channelConfig, senderId, reply.text, reply.suggestedReplies);
+
+  // Aria asked to show the services carousel and owner has services
+  // defined in their profile — fire it as a follow-up message.
+  const ownerServices = profile?.config?.services;
+  if (reply.showServicesCarousel && Array.isArray(ownerServices) && ownerServices.length) {
+    setTimeout(async () => {
+      try {
+        await sendChannelCarousel(channel, channelConfig, senderId, ownerServices);
+        console.log(`🎠 [${channel}] Sent services carousel (${ownerServices.length} cards) to ${senderName}`);
+      } catch (e) { console.warn('Carousel send failed:', e.message); }
+    }, 1500);
+  }
   if (!sent) {
     console.warn(`📱 [${channel}] Failed to send reply to ${senderId}`);
     return;
