@@ -49,6 +49,7 @@ import { decideLeadAction, policyAddendum } from './lib/lead_policy.js';
 import { scoreChannelLead, categorizeChannelMessage } from './lib/channel_lead_scorer.js';
 import { retrieveRelevantChunks } from './lib/rag_retriever.js';
 import { buildIcsEvent, parseBookingDateTime } from './lib/ics_builder.js';
+import { scheduleTask, cancelTask, listPending, bootstrapFromLedger, registerTaskHandler, startTickLoop } from './lib/outbound_scheduler.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
@@ -10396,7 +10397,7 @@ app.get('/api/dashboard/profile', (req, res) => {
 app.post('/api/dashboard/profile', (req, res) => {
   const owner = requireDashboardAuth(req, res);
   if (!owner) return;
-  const { businessName, services, location, phone, email, hours, tone, servicesCarousel, allowedTopics } = req.body;
+  const { businessName, services, location, phone, email, hours, tone, servicesCarousel, allowedTopics, outbound } = req.body;
   // Find or create profile entry
   let profileKey = null;
   for (const [k, v] of clientProfiles) {
@@ -10414,6 +10415,7 @@ app.post('/api/dashboard/profile', (req, res) => {
   if (tone         !== undefined) updates.tone         = tone         || 'friendly';
   if (servicesCarousel !== undefined) updates.servicesCarousel = Array.isArray(servicesCarousel) ? servicesCarousel : [];
   if (allowedTopics    !== undefined) updates.allowedTopics    = Array.isArray(allowedTopics)    ? allowedTopics    : [];
+  if (outbound         !== undefined && typeof outbound === 'object') updates.outbound = outbound;
   if (profileKey) {
     const existing = clientProfiles.get(profileKey);
     existing.profile = { ...existing.profile, ...updates };
@@ -11828,8 +11830,13 @@ async function saveProfile() {
 async function loadSettings() {
   const body = document.getElementById('body-settings');
   try {
-    const d = await api('/api/dashboard/settings');
+    const [d, profile] = await Promise.all([api('/api/dashboard/settings'), api('/api/dashboard/profile')]);
+    const ob = profile?.profile?.outbound || {};
+    const leadFu = ob.leadFollowup !== false; // default ON
+    const bookRem = ob.bookingReminder !== false;
+    const convRec = ob.convRecovery !== false;
     body.innerHTML = \`
+      <h4 style="font-size:13px;color:#fff;margin:4px 0 12px;">Email auto-reply</h4>
       <div class="toggle-row">
         <div class="info">Auto-Reply<small>Automatically reply to incoming emails using AI</small></div>
         <label class="toggle"><input type="checkbox" id="tog-autoreply" \${d.autoReplyEnabled?'checked':''} onchange="saveSetting('autoReplyEnabled',this.checked)"><span class="slider"></span></label>
@@ -11842,6 +11849,22 @@ async function loadSettings() {
         <div class="info">Follow-Ups<small>Send automatic follow-up emails if no response</small></div>
         <label class="toggle"><input type="checkbox" id="tog-followups" \${d.followUpsEnabled?'checked':''} onchange="saveSetting('followUpsEnabled',this.checked)"><span class="slider"></span></label>
       </div>
+
+      <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">Outbound nudges from Aria</h4>
+      <div class="toggle-row">
+        <div class="info">Lead follow-up email<small>~3 min after a hot lead with email captured, Aria sends a personalised "thanks for getting in touch" email</small></div>
+        <label class="toggle"><input type="checkbox" id="ob-lead" \${leadFu?'checked':''} onchange="saveOutbound('leadFollowup',this.checked)"><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div class="info">Booking reminders<small>24h before each booking, Aria reminds the customer via the channel they booked on + email</small></div>
+        <label class="toggle"><input type="checkbox" id="ob-book" \${bookRem?'checked':''} onchange="saveOutbound('bookingReminder',this.checked)"><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div class="info">Conversation recovery<small>If a 3+ exchange conv goes quiet 24-72h, Aria sends a friendly nudge with "Yes still keen / Not right now" buttons</small></div>
+        <label class="toggle"><input type="checkbox" id="ob-conv" \${convRec?'checked':''} onchange="saveOutbound('convRecovery',this.checked)"><span class="slider"></span></label>
+      </div>
+
+      <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">Connections</h4>
       <div class="toggle-row">
         <div class="info">Gmail Status<small>\${d.gmailConnected ? 'Connected and active' : 'Not connected'}</small></div>
         <div>\${d.gmailConnected ? '<span class="badge-on">Connected</span>' : '<span class="badge-off">Disconnected</span>'}</div>
@@ -11852,6 +11875,17 @@ async function loadSettings() {
       </a>
     \`;
   } catch (e) { body.innerHTML = '<div class="empty">Failed to load settings.</div>'; }
+}
+
+async function saveOutbound(key, value) {
+  try {
+    // Send a partial profile update containing nested outbound flag
+    const profileResp = await api('/api/dashboard/profile');
+    const outbound = profileResp?.profile?.outbound || {};
+    outbound[key] = value;
+    const r = await apiPost('/api/dashboard/profile', { owner: OWNER, outbound });
+    if (r.ok) toast(value ? 'On — Aria will send these' : 'Off');
+  } catch (e) { toast('Failed to update'); }
 }
 
 async function saveSetting(key, value) {
@@ -12699,6 +12733,27 @@ async function confirmAndShipBooking(booking) {
     } catch (e) { console.warn('[booking] channel confirm failed:', e.message); }
   }
 
+  // Schedule a 24h-before reminder — fires via channel + email
+  if (parsedDate) {
+    const reminderAt = parsedDate.getTime() - 24 * 60 * 60 * 1000;
+    if (reminderAt > Date.now() + 60_000) { // only future-schedule if > 1 min ahead
+      try {
+        scheduleTask({
+          type: 'booking_reminder',
+          dueAt: reminderAt,
+          ownerEmail,
+          payload: {
+            channel, senderId, senderName,
+            customerEmail,
+            datetime: bookingData.datetime,
+            service: bookingData.service,
+          },
+        });
+        console.log(`⏰ [booking] Reminder scheduled for ${new Date(reminderAt).toISOString()}`);
+      } catch (e) { console.warn('[booking] schedule reminder failed:', e.message); }
+    }
+  }
+
   return { icsFilename, parsedDate };
 }
 
@@ -13303,6 +13358,26 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
       channel, messagePreview: messageText, leadScore,
     });
     console.log(`📱 [${channel}] Lead scored: ${leadScore} / ${category} (conv=${convLen})`);
+
+    // Auto-schedule personalised follow-up email for HOT leads with email captured.
+    // Fires 3 minutes later so the conversation has a chance to continue naturally
+    // first. Owner-opt-outable via profile.config.outbound.leadFollowup = false.
+    if (leadScore === 'hot' && reply.contact?.email) {
+      try {
+        scheduleTask({
+          type: 'lead_followup',
+          dueAt: Date.now() + 3 * 60 * 1000,
+          ownerEmail,
+          payload: {
+            leadEmail: reply.contact.email,
+            leadName: reply.contact.name || senderName,
+            channel, leadScore,
+            lastMessage: messageText.slice(0, 300),
+          },
+        });
+        console.log(`📨 [${channel}] Lead followup scheduled for ${reply.contact.email} (T+3min)`);
+      } catch (e) { console.warn('[outbound] schedule lead_followup failed:', e.message); }
+    }
   } catch (e) { console.warn('[channel-lead] scoring failed:', e.message); }
 
   // Knowledge gap detection — if Aria's reply fell back to vague language
@@ -13460,6 +13535,190 @@ app.get('/api/channel/reject', (req, res) => {
 // 2026-05-24. Dashboard now routes through /connect/meta (config_id flow).
 // The duplicate callback was dead code — Express resolves the earlier
 // declaration first.
+
+// ─── Outbound Scheduler — lead follow-ups, booking reminders, recovery ──
+//
+// Three task types share one cron loop:
+//   - lead_followup  (fires ~3 min after a hot lead with email captured)
+//   - booking_reminder (fires 24h before a confirmed booking)
+//   - conv_recovery   (fires 24h after a 3+ exchange conv goes quiet)
+//
+// All persisted to data/outbound_tasks.jsonl (append-only). Server restart
+// replays pending tasks. Per Rule 12: each task is an explicit OUTBOUND
+// message — owners can disable per task type via profile.config.outbound.
+
+registerTaskHandler('lead_followup', async (task) => {
+  const { ownerEmail, payload } = task;
+  const { leadEmail, leadName, channel, leadScore, lastMessage } = payload;
+  if (!leadEmail) return false;
+  const profile = getOwnerProfile(ownerEmail);
+  // Per-owner opt-out
+  if (profile?.config?.outbound?.leadFollowup === false) return false;
+  if (profile?.profile?.outbound?.leadFollowup === false) return false;
+  const businessName = profile?.profile?.businessName || profile?.businessName || 'our team';
+  const businessPhone = profile?.profile?.phone || '';
+  const businessEmail = profile?.profile?.email || ownerEmail;
+  // Generate follow-up content via Claude (warm, short, value-add — not pushy)
+  let bodyText = '';
+  try {
+    const r = await callClaudeWithFallback({
+      max_tokens: 400,
+      messages: [{ role: 'user', content: `Write a SHORT (under 120 words) friendly follow-up email from a small business to a customer who just messaged via ${channel}. The customer is a hot lead — they were asking about a service.
+
+Business: ${businessName}
+Customer name: ${leadName || 'there'}
+What the customer said: "${lastMessage || '(no preview)'}"
+Contact details for the business: ${businessPhone || businessEmail}
+
+Write ONLY the email body (no subject, no greeting "Subject:", no signature block — just the message text). Be warm + concise. Acknowledge their question. Offer a clear next step (book a call, get a quote, visit, reply). End with the business name. Don't be pushy or salesy. Don't make up prices/availability.` }],
+    });
+    bodyText = (r.content[0]?.text || '').trim();
+  } catch (e) {
+    console.warn('[outbound] lead_followup body gen failed:', e.message);
+    bodyText = `Hi ${leadName || 'there'},\n\nThanks for getting in touch via ${channel}. We saw your message and wanted to reach out personally — happy to help with what you're after.\n\nReply anytime, or give us a ring on ${businessPhone || 'the number on our website'}.\n\n${businessName}`;
+  }
+  try {
+    await smartSend({
+      ownerEmail, to: leadEmail,
+      replyTo: businessEmail,
+      subject: `Re: your ${channel} message — ${businessName}`,
+      html: `<div style="font-family:-apple-system,sans-serif;max-width:560px;margin:0 auto;padding:20px;color:#222;line-height:1.6;font-size:14.5px;white-space:pre-line;">${bodyText.replace(/</g, '&lt;')}</div>`,
+    });
+    console.log(`📨 [outbound] lead_followup sent to ${leadEmail} for ${ownerEmail}`);
+    return true;
+  } catch (e) {
+    console.warn('[outbound] lead_followup send failed:', e.message);
+    return false;
+  }
+});
+
+registerTaskHandler('booking_reminder', async (task) => {
+  const { ownerEmail, payload } = task;
+  const { channel, senderId, senderName, customerEmail, datetime, service } = payload;
+  const profile = getOwnerProfile(ownerEmail);
+  if (profile?.config?.outbound?.bookingReminder === false) return false;
+  if (profile?.profile?.outbound?.bookingReminder === false) return false;
+  const businessName = profile?.profile?.businessName || 'our team';
+  const parsedDate = parseBookingDateTime(datetime);
+  const dateLabel = parsedDate
+    ? parsedDate.toLocaleString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+    : datetime;
+  const msg = `👋 Friendly reminder — you're booked in with ${businessName}${service ? ' for ' + service : ''} tomorrow at ${dateLabel}. Looking forward to seeing you! Reply here if you need to reschedule.`;
+  // Channel reminder
+  if (channel && senderId) {
+    const channelConfig = channelConfigs.get(ownerEmail)?.[channel];
+    if (channelConfig) {
+      try { await sendChannelReply(channel, channelConfig, senderId, msg); } catch {}
+    }
+  }
+  // Email reminder if we have customer email
+  if (customerEmail) {
+    try {
+      await smartSend({
+        ownerEmail, to: customerEmail,
+        subject: `Reminder: ${businessName} — ${dateLabel}`,
+        html: `<div style="font-family:-apple-system,sans-serif;max-width:520px;margin:0 auto;padding:20px;font-size:14.5px;line-height:1.6;color:#222;">${msg}</div>`,
+      });
+    } catch {}
+  }
+  console.log(`⏰ [outbound] booking_reminder sent to ${senderName} (${ownerEmail})`);
+  return true;
+});
+
+registerTaskHandler('conv_recovery', async (task) => {
+  const { ownerEmail, payload } = task;
+  const { channel, senderId, senderName, lastTopic } = payload;
+  const profile = getOwnerProfile(ownerEmail);
+  if (profile?.config?.outbound?.convRecovery === false) return false;
+  if (profile?.profile?.outbound?.convRecovery === false) return false;
+  // Don't recover if conv has had activity in the last 18h (someone replied)
+  const memKey = `${ownerEmail}::${channel}::${senderId}`;
+  const history = conversationMemory.get(memKey) || [];
+  const lastTs = history[history.length - 1]?.date;
+  if (lastTs && Date.now() - new Date(lastTs).getTime() < 18 * 60 * 60 * 1000) {
+    console.log(`[outbound] conv_recovery skipped — recent activity for ${senderName}`);
+    return true;
+  }
+  const businessName = profile?.profile?.businessName || 'us';
+  const msg = lastTopic
+    ? `Hi ${senderName || 'there'} 👋 Just circling back on your question about ${lastTopic} — still interested? Happy to pick up where we left off.`
+    : `Hi ${senderName || 'there'} 👋 Just checking back in — anything else you'd like to ask ${businessName}? Happy to help.`;
+  const channelConfig = channelConfigs.get(ownerEmail)?.[channel];
+  if (!channelConfig) return false;
+  try {
+    await sendChannelReply(channel, channelConfig, senderId, msg, ['Yes, still keen', 'Not right now']);
+    console.log(`🔁 [outbound] conv_recovery sent to ${senderName} via ${channel}`);
+    return true;
+  } catch (e) {
+    console.warn('[outbound] conv_recovery send failed:', e.message);
+    return false;
+  }
+});
+
+// Boot scheduler at startup
+const _pendingCount = bootstrapFromLedger();
+console.log(`📅 Outbound scheduler: ${_pendingCount} pending tasks loaded from ledger`);
+startTickLoop(60_000);
+
+// Daily sweep — once a day, find conversations that had ≥3 exchanges
+// but went quiet >24h ago. Schedule a recovery nudge for each (one per
+// memKey, dedupe via in-memory set so we don't re-nudge repeatedly).
+const recoveryNudgedToday = new Set();
+let lastRecoverySweepDay = null;
+setInterval(() => {
+  const day = new Date().toISOString().slice(0, 10);
+  if (lastRecoverySweepDay === day) return;
+  // Only sweep at 10am-11am local to land at a polite time
+  const h = new Date().getHours();
+  if (h !== 10) return;
+  lastRecoverySweepDay = day;
+  recoveryNudgedToday.clear();
+  let scheduled = 0;
+  for (const [memKey, history] of conversationMemory) {
+    if (!Array.isArray(history) || history.length < 3) continue;
+    const last = history[history.length - 1];
+    if (!last?.date) continue;
+    const ageMs = Date.now() - new Date(last.date).getTime();
+    // Only nudge convs that went quiet 24-72h ago. Older = dead, skip.
+    if (ageMs < 24 * 60 * 60 * 1000 || ageMs > 72 * 60 * 60 * 1000) continue;
+    if (recoveryNudgedToday.has(memKey)) continue;
+    // Skip paused/escalated convs — owner is handling them
+    if (conversationState.get(memKey)?.paused) continue;
+    const [ownerEmail, channel, senderId] = memKey.split('::');
+    // Need a channel config to send via
+    const channelConfig = channelConfigs.get(ownerEmail)?.[channel];
+    if (!channelConfig?.enabled) continue;
+    // Skip if there's already a pending recovery for this memKey
+    const dup = listPending({ ownerEmail, type: 'conv_recovery' }).find(t =>
+      t.payload?.channel === channel && t.payload?.senderId === senderId);
+    if (dup) continue;
+    // Extract a recent topic hint for the message
+    const recentText = history.slice(-3).filter(h => h.role === 'sender').map(h => h.preview).join(' ');
+    const topicMatch = recentText.match(/\b(quote|booking|price|cost|service|appointment|hire|wedding|haircut)\w*\b/i);
+    try {
+      scheduleTask({
+        type: 'conv_recovery',
+        dueAt: Date.now() + 5 * 60 * 1000, // 5 min so they don't all fire at once
+        ownerEmail,
+        payload: { channel, senderId, senderName: senderId, lastTopic: topicMatch?.[0] || null },
+      });
+      recoveryNudgedToday.add(memKey);
+      scheduled++;
+    } catch (e) {}
+  }
+  if (scheduled) console.log(`🔁 [outbound] Daily recovery sweep scheduled ${scheduled} nudges`);
+}, 5 * 60 * 1000); // check every 5 min
+
+// Admin/debug endpoint to inspect pending tasks
+app.get('/api/dashboard/outbound', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const items = listPending({ ownerEmail: owner }).map(t => ({
+    id: t.id, type: t.type, dueAt: t.dueAt, scheduledAt: t.scheduledAt,
+    payloadSummary: t.payload?.leadName || t.payload?.senderName || t.payload?.customerEmail || '',
+  })).sort((a, b) => a.dueAt - b.dueAt);
+  res.json({ tasks: items });
+});
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ status:'ok', sessions:sessions.size, faqs:faqs.size, handoffs:handoffs.size }));
