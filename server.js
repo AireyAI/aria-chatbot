@@ -10466,6 +10466,146 @@ Reply with valid JSON only:
   }
 });
 
+// POST /api/dashboard/faq-bootstrap — one-click "warm-start" Aria's
+// knowledge base. Takes the top N unanswered question clusters and
+// drafts a KB article for each in PARALLEL via Claude. Owner reviews +
+// bulk-accepts. Designed for cold-start: a brand-new client connects,
+// Aria has nothing to RAG against, accuracy suffers — this surfaces
+// the 8-10 things customers actually asked, drafts answers in 5
+// seconds, and owner approves with one click.
+//
+// Why bulk vs per-cluster: the per-cluster "Draft answer" button (which
+// already exists below) is for ad-hoc one-offs. Bootstrap is for the
+// "fix the whole gap" workflow during onboarding.
+app.post('/api/dashboard/faq-bootstrap', express.json({ limit: '16kb' }), async (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const limit = Math.max(3, Math.min(15, Number(req.body?.limit) || 10));
+
+  // Pull gap clusters using the same logic as the GET endpoint. Rather
+  // than re-write, factor the cluster build into an inline helper here.
+  const items = [];
+  try {
+    if (existsSync(CHANNEL_GAPS_FILE)) {
+      const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+      for (const line of readFileSync(CHANNEL_GAPS_FILE, 'utf8').split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const e = JSON.parse(line);
+          if (e.ownerEmail !== owner) continue;
+          if (new Date(e.ts).getTime() < cutoff) continue;
+          items.push(e);
+        } catch {}
+      }
+    }
+  } catch {}
+
+  if (items.length === 0) return res.json({ drafts: [], message: 'No gaps to bootstrap from yet.' });
+
+  // Quick token-jaccard pre-cluster (cheap, deterministic)
+  const tokenise = (s) => new Set(String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length > 3));
+  const clusters = [];
+  for (const it of items) {
+    const tks = tokenise(it.question);
+    let matched = null;
+    for (const c of clusters) {
+      const inter = [...c.tokens].filter(t => tks.has(t)).length;
+      const union = new Set([...c.tokens, ...tks]).size;
+      const jaccard = union ? inter / union : 0;
+      if (jaccard >= 0.4) { matched = c; break; }
+    }
+    if (matched) {
+      matched.examples.push(it); matched.count++;
+      for (const t of tks) matched.tokens.add(t);
+    } else {
+      clusters.push({ tokens: tks, examples: [it], count: 1 });
+    }
+  }
+  clusters.sort((a, b) => b.count - a.count);
+  const topClusters = clusters.slice(0, limit);
+
+  const profile = getOwnerProfile(owner);
+  const businessHint = profile?.profile?.businessName
+    ? `\nBUSINESS: ${profile.profile.businessName}${profile.profile.services ? ` — services: ${profile.profile.services}` : ''}`
+    : '';
+
+  // Parallel-draft all clusters. Promise.all here is the right call:
+  // each draft is independent + Claude rate limits at the account level
+  // are generous enough that 10 simultaneous Haiku calls land fine
+  // (typically ~3-5s total for 10 vs 30-50s sequential).
+  const drafts = await Promise.all(topClusters.map(async (cluster, idx) => {
+    const questions = cluster.examples.slice(0, 4).map(e => e.question);
+    try {
+      const r = await callClaudeWithFallback({
+        max_tokens: 600,
+        messages: [{ role: 'user', content: `Draft a knowledge document for an AI customer-service bot. Customers have asked these questions but the bot didn't have a confident answer — what should we tell the bot so it CAN answer next time?${businessHint}
+
+UNANSWERED QUESTIONS (cluster ${idx + 1}, asked ${cluster.count}×):
+${questions.map((q, i) => `${i + 1}. "${q}"`).join('\n')}
+
+Reply with valid JSON only:
+{
+  "title": "Short title (e.g. 'Dog grooming services + policy')",
+  "content": "150-350 word knowledge doc the bot will cite. Address the questions above. Be honest about what you DON'T know — leave [PLACEHOLDER: short description] markers for facts the owner needs to fill (e.g. [PLACEHOLDER: starting price for full groom]). Use bullet structure where helpful.",
+  "needsOwnerInput": ["short list of placeholders the owner must fill"]
+}` }],
+      });
+      const text = r.content[0]?.text || '';
+      const parsed = JSON.parse(text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim());
+      return {
+        clusterIdx: idx,
+        count: cluster.count,
+        sampleQuestion: cluster.examples[0].question,
+        draft: {
+          title: parsed.title || `Knowledge entry ${idx + 1}`,
+          content: parsed.content || '',
+          needsOwnerInput: Array.isArray(parsed.needsOwnerInput) ? parsed.needsOwnerInput : [],
+        },
+      };
+    } catch (e) {
+      return {
+        clusterIdx: idx,
+        count: cluster.count,
+        sampleQuestion: cluster.examples[0].question,
+        error: 'Draft failed: ' + e.message,
+      };
+    }
+  }));
+
+  res.json({
+    drafts,
+    totalGaps: items.length,
+    totalClusters: clusters.length,
+  });
+});
+
+// POST /api/dashboard/faq-bootstrap/accept — bulk-save approved drafts
+// to the owner's knowledge base in one call. Caps at 50 docs total
+// (matches single-doc save endpoint).
+app.post('/api/dashboard/faq-bootstrap/accept', express.json({ limit: '512kb' }), (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const accepted = Array.isArray(req.body?.accepted) ? req.body.accepted : [];
+  if (accepted.length === 0) return res.status(400).json({ error: 'accepted array required' });
+
+  const docs = knowledgeDocs.get(owner) || [];
+  let saved = 0, skipped = 0;
+  for (const a of accepted) {
+    if (!a?.title || !a?.content) { skipped++; continue; }
+    if (docs.length >= 50) { skipped++; continue; }
+    docs.push({
+      title:      String(a.title).slice(0, 120),
+      content:    String(a.content).slice(0, 200000),
+      uploadedAt: new Date().toISOString(),
+      source:     'faq-bootstrap',
+    });
+    saved++;
+  }
+  knowledgeDocs.set(owner, docs);
+  persistKnowledgeDocs();
+  res.json({ ok: true, saved, skipped, totalDocs: docs.length });
+});
+
 // POST /api/dashboard/test-aria — sandbox endpoint that runs an owner's
 // test question through the SAME pipeline as a live channel message,
 // minus the actual send. Returns Aria's full response + classification
@@ -12054,7 +12194,22 @@ async function loadKnowledgeGaps() {
         '</div>';
       return;
     }
+    // Bulk-bootstrap banner — only show if there are 3+ clusters (worthwhile)
+    const bootstrapBanner = d.clusters.length >= 3
+      ? '<div style="background:linear-gradient(135deg,rgba(0,229,160,0.08),rgba(157,150,255,0.08));border:1px solid rgba(0,229,160,0.3);border-radius:14px;padding:18px;margin-bottom:14px;">' +
+          '<div style="display:flex;align-items:center;justify-content:space-between;gap:16px;">' +
+            '<div style="flex:1;">' +
+              '<h4 style="font-size:14px;color:#fff;margin:0 0 4px;display:flex;align-items:center;gap:8px;">🚀 Bootstrap Aria\\'s knowledge base in 1 click</h4>' +
+              '<p style="font-size:12px;color:#9898b8;margin:0;line-height:1.5;">She\\'ll draft answers to your top ' + Math.min(10, d.clusters.length) + ' unanswered questions in ~5 seconds. Review and accept the lot in one go.</p>' +
+            '</div>' +
+            '<button onclick="bootstrapFaqs()" id="bootstrap-btn" style="background:#00e5a0;color:#0d0d1f;border:none;border-radius:8px;padding:8px 18px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;flex-shrink:0;">✨ Draft all answers</button>' +
+          '</div>' +
+          '<div id="bootstrap-results" style="margin-top:14px;"></div>' +
+        '</div>'
+      : '';
+
     el.innerHTML =
+      bootstrapBanner +
       '<div style="background:rgba(251,191,36,0.04);border:1px solid rgba(251,191,36,0.25);border-radius:14px;padding:18px;">' +
         '<h4 style="font-size:14px;color:#fff;margin-bottom:6px;display:flex;align-items:center;gap:8px;">🕳️ Knowledge Gaps <span style="background:rgba(251,191,36,0.2);color:#fbbf24;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;">' + d.clusters.length + '</span></h4>' +
         '<p style="font-size:12.5px;color:#9898b8;margin-bottom:14px;line-height:1.6;">Customers asked these questions but Aria fell back to vague answers. Click any to have her draft a knowledge entry that\\'ll fix it.</p>' +
@@ -12103,6 +12258,70 @@ async function draftGapKb(idx) {
       '</div>';
     window._gapDraft = draft;
   } catch (e) { draftEl.innerHTML = '<div style="color:#ff6b6b">Draft failed: ' + e.message + '</div>'; }
+}
+
+async function bootstrapFaqs() {
+  const btn = document.getElementById('bootstrap-btn');
+  const out = document.getElementById('bootstrap-results');
+  if (!btn || !out) return;
+  btn.disabled = true; btn.textContent = '⏳ Drafting…';
+  out.innerHTML = '<div style="background:rgba(255,255,255,0.03);padding:14px;border-radius:10px;color:#8888aa;font-size:12.5px;">Aria is drafting answers in parallel. This takes ~5 seconds for 10 clusters…</div>';
+  try {
+    const r = await apiPost('/api/dashboard/faq-bootstrap', { limit: 10 });
+    btn.disabled = false; btn.textContent = '✨ Re-draft';
+    const drafts = (r.drafts || []).filter(d => d.draft);
+    if (drafts.length === 0) {
+      out.innerHTML = '<div class="empty" style="padding:14px;">No drafts came back — try again or use per-question drafting below.</div>';
+      return;
+    }
+    window._bootstrapDrafts = drafts;
+    const cards = drafts.map((d, i) => {
+      const placeholderWarn = d.draft.needsOwnerInput?.length
+        ? '<div style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.25);border-radius:6px;padding:6px 10px;margin:8px 0;font-size:11px;color:#fbbf24;">⚠️ Fill placeholders: ' + d.draft.needsOwnerInput.map(escH).join(' · ') + '</div>'
+        : '';
+      return '<div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:12px 14px;margin-bottom:10px;">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;">' +
+          '<div style="font-size:11px;color:#8888aa;">' +
+            '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">' +
+              '<input type="checkbox" class="bs-pick" data-idx="' + i + '" checked style="margin:0;">' +
+              '<span>Asked ' + d.count + '× · ' + escH(d.sampleQuestion.slice(0, 70)) + (d.sampleQuestion.length > 70 ? '…' : '') + '</span>' +
+            '</label>' +
+          '</div>' +
+        '</div>' +
+        '<div class="form-group" style="margin-bottom:8px;"><label style="font-size:10.5px;">Title</label><input class="bs-title" data-idx="' + i + '" value="' + escH(d.draft.title) + '" style="font-size:13px;"></div>' +
+        '<div class="form-group" style="margin-bottom:0;"><label style="font-size:10.5px;">Content</label><textarea class="bs-content" data-idx="' + i + '" rows="5" style="font-size:12.5px;">' + escH(d.draft.content) + '</textarea></div>' +
+        placeholderWarn +
+      '</div>';
+    }).join('');
+    out.innerHTML =
+      '<div style="font-size:11.5px;color:#8888aa;margin:8px 0 10px;">Uncheck any you don\\'t want. Edit content freely. Then save the lot.</div>' +
+      cards +
+      '<div style="display:flex;justify-content:flex-end;gap:8px;">' +
+        '<button onclick="document.getElementById(\\'bootstrap-results\\').innerHTML=\\'\\'" style="background:rgba(255,255,255,0.06);color:#8888aa;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:8px 14px;font-size:12px;cursor:pointer;font-family:inherit;">Discard all</button>' +
+        '<button onclick="bulkAcceptFaqs()" style="background:#00e5a0;color:#0d0d1f;border:none;border-radius:8px;padding:8px 18px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;">+ Save all to KB</button>' +
+      '</div>';
+  } catch (e) {
+    btn.disabled = false; btn.textContent = '✨ Draft all answers';
+    out.innerHTML = '<div style="color:#ff6b6b;font-size:12px;">Bootstrap failed: ' + escH(e.message || 'unknown') + '</div>';
+  }
+}
+
+async function bulkAcceptFaqs() {
+  const picks = Array.from(document.querySelectorAll('.bs-pick:checked')).map(c => Number(c.getAttribute('data-idx')));
+  if (picks.length === 0) { toast('Nothing selected'); return; }
+  const accepted = picks.map(idx => ({
+    title:   document.querySelector('.bs-title[data-idx="' + idx + '"]').value.trim(),
+    content: document.querySelector('.bs-content[data-idx="' + idx + '"]').value.trim(),
+  })).filter(a => a.title && a.content);
+  try {
+    const r = await apiPost('/api/dashboard/faq-bootstrap/accept', { accepted });
+    if (r.ok) {
+      toast('✓ Saved ' + r.saved + ' to knowledge base' + (r.skipped ? ' (' + r.skipped + ' skipped)' : ''));
+      document.getElementById('bootstrap-results').innerHTML = '';
+      loadKnowledgeDocs();
+      loadKnowledgeGaps();
+    } else { toast(r.error || 'Save failed'); }
+  } catch (e) { toast('Bulk save failed'); }
 }
 
 async function acceptGapDraft() {
