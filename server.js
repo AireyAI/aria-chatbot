@@ -12696,10 +12696,14 @@ async function loadSettings() {
         Gmail Settings
       </a>
 
+      <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">⭐ Review requests <span style="font-size:11px;font-weight:400;color:#9898b8;">— Aria auto-asks for a Google review 24h after each booking</span></h4>
+      <div id="reviews-panel"><div class="empty" style="padding:14px 0;font-size:12px;">Loading…</div></div>
+
       <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">🔗 Webhooks <span style="font-size:11px;font-weight:400;color:#9898b8;">— pipe Aria events to Zapier, Slack, your CRM</span></h4>
       <div id="webhooks-panel"><div class="empty" style="padding:14px 0;font-size:12px;">Loading…</div></div>
     \`;
     loadWebhooks();
+    loadReviewSettings();
   } catch (e) { body.innerHTML = '<div class="empty">Failed to load settings.</div>'; }
 }
 
@@ -12795,6 +12799,96 @@ async function testWebhook(idx) {
     else toast('✗ ' + (r.reason || r.error || ('status ' + r.status)));
     setTimeout(loadWebhooks, 500);
   } catch (e) { toast('Test failed'); }
+}
+
+// ─── Review-request settings panel ──────────────────────────────────────
+async function loadReviewSettings() {
+  const el = document.getElementById('reviews-panel');
+  if (!el) return;
+  try {
+    const d = await api('/api/dashboard/reviews/settings');
+    const s = d.settings || {};
+    const recent = (d.recent || []).slice(0, 6);
+    const defaultTmpl = d.defaultTemplate || '';
+
+    const statusBadge = s.enabled && s.url
+      ? '<span style="color:#00e5a0;font-size:11px;">● Active</span>'
+      : (s.url ? '<span style="color:#fbbf24;font-size:11px;">● Disabled</span>' : '<span style="color:#6b6b8a;font-size:11px;">● Not configured</span>');
+
+    const recentRows = recent.length ? recent.map(r => {
+      const colour = r.status === 'sent' ? '#00e5a0' : '#8888aa';
+      const lbl = r.status === 'sent' ? 'sent' : (r.status === 'skipped-no-url' ? 'skipped (no URL)' : 'skipped');
+      return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:11.5px;">' +
+        '<span style="color:' + colour + ';font-weight:600;min-width:46px;">' + lbl + '</span>' +
+        '<span style="color:#aaa;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH(r.senderName || r.senderId || '?') + ' on ' + escH(r.channel || '?') + '</span>' +
+        '<span style="color:#6b6b8a;font-size:10.5px;">' + timeAgo(r.ts) + '</span>' +
+      '</div>';
+    }).join('') : '<div class="empty" style="padding:10px 0;font-size:11.5px;">No review requests sent yet — they fire 24h after each confirmed booking once you set a URL below.</div>';
+
+    el.innerHTML =
+      '<div style="background:rgba(0,229,160,0.05);border:1px solid rgba(0,229,160,0.2);border-radius:10px;padding:14px;">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
+          '<div style="font-size:12px;color:#fff;font-weight:600;">Auto-ask for reviews ' + statusBadge + '</div>' +
+          '<label class="toggle"><input type="checkbox" id="rv-enabled" ' + (s.enabled ? 'checked' : '') + '><span class="slider"></span></label>' +
+        '</div>' +
+        '<div class="form-group" style="margin-bottom:10px;">' +
+          '<label style="font-size:11px;">Your Google review link <span style="color:#9898b8;font-weight:400;">(g.page/r/... or any review URL)</span></label>' +
+          '<input id="rv-url" placeholder="https://g.page/r/your-place-id/review" value="' + escH(s.url || '') + '" style="font-family:monospace;font-size:12px;">' +
+          '<div style="font-size:10.5px;color:#8888aa;margin-top:4px;">Find yours at <a href="https://whitespark.ca/google-review-link-generator/" target="_blank" style="color:#00e5a0;">whitespark.ca/google-review-link-generator</a></div>' +
+        '</div>' +
+        '<div style="display:flex;gap:10px;margin-bottom:10px;">' +
+          '<div class="form-group" style="flex:1;margin-bottom:0;">' +
+            '<label style="font-size:11px;">Send how long after booking?</label>' +
+            '<select id="rv-delay" style="width:100%;">' +
+              [2,6,12,24,48,72,168].map(h => '<option value="' + h + '" ' + (s.delayHours === h ? 'selected' : '') + '>' + (h < 24 ? h + ' hour' + (h > 1 ? 's' : '') : (h / 24) + ' day' + (h / 24 > 1 ? 's' : '')) + '</option>').join('') +
+            '</select>' +
+          '</div>' +
+          '<div class="form-group" style="flex:1;margin-bottom:0;display:flex;flex-direction:column;justify-content:flex-end;">' +
+            '<label style="display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:#ccc;cursor:pointer;background:rgba(255,255,255,0.04);padding:8px 12px;border-radius:8px;"><input type="checkbox" id="rv-alwaysEmail" ' + (s.alwaysEmail ? 'checked' : '') + ' style="margin:0;">Also email (not just channel)</label>' +
+          '</div>' +
+        '</div>' +
+        '<div class="form-group" style="margin-bottom:10px;">' +
+          '<label style="font-size:11px;">Message template <span style="color:#9898b8;font-weight:400;">— placeholders: {customer} {business} {service} {url}</span></label>' +
+          '<textarea id="rv-template" rows="3" style="font-family:inherit;font-size:12.5px;width:100%;background:rgba(0,0,0,0.2);border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#fff;padding:8px 10px;resize:vertical;" placeholder="' + escH(defaultTmpl) + '">' + escH(s.template || '') + '</textarea>' +
+          '<div style="font-size:10.5px;color:#8888aa;margin-top:4px;">Leave blank to use the default template shown above.</div>' +
+        '</div>' +
+        '<div style="display:flex;gap:8px;">' +
+          '<button class="btn-save" onclick="saveReviewSettings()" style="flex:1;">Save</button>' +
+          '<button onclick="previewReview()" style="background:rgba(157,150,255,0.1);color:#9d96ff;border:1px solid rgba(157,150,255,0.3);border-radius:8px;padding:8px 14px;font-size:12px;cursor:pointer;font-family:inherit;">Preview</button>' +
+        '</div>' +
+        '<div id="rv-preview" style="margin-top:10px;font-size:12.5px;color:#ccc;background:rgba(0,0,0,0.2);border-left:3px solid #9d96ff;padding:10px 12px;border-radius:6px;display:none;"></div>' +
+      '</div>' +
+      '<h5 style="font-size:11px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin:18px 0 8px;">Recent review requests</h5>' +
+      recentRows;
+  } catch (e) { el.innerHTML = '<div class="empty">Failed to load review settings.</div>'; }
+}
+
+async function saveReviewSettings() {
+  const body = {
+    enabled:    document.getElementById('rv-enabled').checked,
+    url:        document.getElementById('rv-url').value.trim(),
+    delayHours: Number(document.getElementById('rv-delay').value) || 24,
+    template:   document.getElementById('rv-template').value.trim(),
+    alwaysEmail: document.getElementById('rv-alwaysEmail').checked,
+  };
+  try {
+    const r = await apiPost('/api/dashboard/reviews/settings', body);
+    if (r.ok) {
+      toast(body.enabled && body.url ? '✓ Review requests active' : '✓ Saved');
+      loadReviewSettings();
+    } else { toast(r.error || 'Failed to save'); }
+  } catch (e) { toast('Save failed'); }
+}
+
+async function previewReview() {
+  try {
+    const r = await apiPost('/api/dashboard/reviews/test', { customer: 'Sarah', service: 'haircut' });
+    const el = document.getElementById('rv-preview');
+    if (el) {
+      el.style.display = 'block';
+      el.innerHTML = '<div style="color:#9d96ff;font-size:10.5px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Preview — what Sarah would receive:</div>' + escH(r.preview || '(no preview)');
+    }
+  } catch (e) { toast('Preview failed'); }
 }
 
 async function saveOutbound(key, value) {
