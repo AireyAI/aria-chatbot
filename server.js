@@ -8709,7 +8709,12 @@ textarea{resize:vertical;min-height:60px;}
 
   <div id="p-usage" class="panel">
     <div class="card">
-      <h3>📈 Usage This Month</h3>
+      <h3>👥 Per-Client Token Usage Today</h3>
+      <p style="font-size:12px;color:#8888aa;margin-bottom:14px">Channel reply token spend per AireyAI client account. Clients NEVER see this — admin-only.</p>
+      <div id="per-client-usage" style="font-size:13px;"><div style="color:#8888aa">Loading…</div></div>
+    </div>
+    <div class="card">
+      <h3>📈 Total Chatbot Usage This Month</h3>
       <div id="usage-content" style="margin-top:16px"><div style="color:#8888aa;font-size:13px">Loading...</div></div>
     </div>
     <div class="card">
@@ -9195,6 +9200,31 @@ async function removeDomain(domain) {
 }
 
 async function loadUsage() {
+  // Per-client channel-token table (admin-only)
+  try {
+    const pcr = await fetch('/api/admin/usage', { headers: { 'x-admin-password': PASS } });
+    const pcd = await pcr.json();
+    const pcEl = el('per-client-usage');
+    if (!pcd.rows?.length) {
+      pcEl.innerHTML = '<div style="color:#8888aa">No client usage yet today.</div>';
+    } else {
+      const rows = pcd.rows.map(r => {
+        const barColor = r.pctUsed >= 90 ? '#e74c3c' : r.pctUsed >= 70 ? '#f39c12' : '#2ecc71';
+        return '<div style="padding:10px 0;border-bottom:1px solid #1e1e30;">' +
+          '<div style="display:flex;align-items:center;justify-content:space-between;font-size:13px;color:#e8e8f8;margin-bottom:6px;">' +
+            '<span style="font-weight:600">' + r.ownerEmail + '</span>' +
+            '<span style="color:' + barColor + ';font-weight:700">' + r.pctUsed + '% · ' + r.usedToday.toLocaleString() + ' / ' + r.capToday.toLocaleString() + ' tok</span>' +
+          '</div>' +
+          '<div style="background:#13131f;border-radius:20px;height:6px;overflow:hidden;">' +
+            '<div style="width:' + r.pctUsed + '%;height:100%;background:' + barColor + ';"></div>' +
+          '</div>' +
+          '<div style="font-size:11.5px;color:#8888aa;margin-top:3px">' + r.repliesToday + ' replies today</div>' +
+        '</div>';
+      }).join('');
+      pcEl.innerHTML = rows + '<div style="margin-top:12px;font-size:12px;color:#8888aa;text-align:right">Total today: <b style="color:#e8e8f8">' + (pcd.totalUsedToday || 0).toLocaleString() + ' tokens</b></div>';
+    }
+  } catch (e) { el('per-client-usage').innerHTML = '<div style="color:#e74c3c">Failed: ' + e.message + '</div>'; }
+
   const r = await fetch('/admin/usage?pass='+PASS);
   const u = await r.json();
   const pct = u.capEnabled && u.cap ? Math.min(100, Math.round((u.messages / u.cap) * 100)) : null;
