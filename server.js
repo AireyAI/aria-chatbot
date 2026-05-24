@@ -51,6 +51,7 @@ import { retrieveRelevantChunks } from './lib/rag_retriever.js';
 import { buildIcsEvent, parseBookingDateTime } from './lib/ics_builder.js';
 import { scheduleTask, cancelTask, listPending, bootstrapFromLedger, registerTaskHandler, startTickLoop } from './lib/outbound_scheduler.js';
 import { ltvScore, ltvTier } from './lib/customer_ltv.js';
+import { evaluateSchedule } from './lib/business_hours.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
@@ -10611,7 +10612,7 @@ app.get('/api/dashboard/profile', (req, res) => {
 app.post('/api/dashboard/profile', (req, res) => {
   const owner = requireDashboardAuth(req, res);
   if (!owner) return;
-  const { businessName, services, location, phone, email, hours, tone, servicesCarousel, allowedTopics, outbound } = req.body;
+  const { businessName, services, location, phone, email, hours, tone, servicesCarousel, allowedTopics, outbound, schedule } = req.body;
   // Find or create profile entry
   let profileKey = null;
   for (const [k, v] of clientProfiles) {
@@ -10630,6 +10631,7 @@ app.post('/api/dashboard/profile', (req, res) => {
   if (servicesCarousel !== undefined) updates.servicesCarousel = Array.isArray(servicesCarousel) ? servicesCarousel : [];
   if (allowedTopics    !== undefined) updates.allowedTopics    = Array.isArray(allowedTopics)    ? allowedTopics    : [];
   if (outbound         !== undefined && typeof outbound === 'object') updates.outbound = outbound;
+  if (schedule         !== undefined && typeof schedule === 'object') updates.schedule = schedule;
   if (profileKey) {
     const existing = clientProfiles.get(profileKey);
     existing.profile = { ...existing.profile, ...updates };
@@ -11766,17 +11768,18 @@ async function loadUnifiedConvs(filter) {
 async function loadTrainAria() {
   const body = document.getElementById('body-train');
   body.innerHTML = '<div style="padding:8px 0;">' +
-    '<p style="font-size:13px;color:#9898b8;margin-bottom:18px;">Teach Aria your business — answers, documents, services, and what topics she should + shouldn\\'t handle.</p>' +
+    '<p style="font-size:13px;color:#9898b8;margin-bottom:18px;">Teach Aria your business — answers, documents, services, hours, and what topics she should + shouldn\\'t handle.</p>' +
     '<div id="train-test" style="margin-bottom:28px;"></div>' +
     '<div id="train-gaps" style="margin-bottom:28px;"></div>' +
     '<div id="train-quick" style="margin-bottom:28px;"></div>' +
     '<div id="train-knowledge" style="margin-bottom:28px;"></div>' +
     '<div id="train-services" style="margin-bottom:28px;"></div>' +
+    '<div id="train-hours" style="margin-bottom:28px;"></div>' +
     '<div id="train-scope" style="margin-bottom:8px;"></div>' +
   '</div>';
   renderTestAriaCard();
   renderQuickTrainCard();
-  await Promise.all([loadKnowledgeDocs(), loadServicesEditor(), loadScopeEditor(), loadKnowledgeGaps()]);
+  await Promise.all([loadKnowledgeDocs(), loadServicesEditor(), loadScopeEditor(), loadKnowledgeGaps(), loadBusinessHoursEditor()]);
 }
 
 // ─── Test Aria sandbox ────────────────────────────────────────────────────
@@ -12132,6 +12135,135 @@ async function saveServices() {
   try {
     const r = await apiPost('/api/dashboard/profile', { owner: OWNER, servicesCarousel: window._services });
     if (r.ok) toast('Services saved — Aria will show these when asked');
+  } catch (e) { toast('Save failed'); }
+}
+
+// ─── Business Hours editor ───────────────────────────────────────────────
+async function loadBusinessHoursEditor() {
+  const el = document.getElementById('train-hours');
+  try {
+    const d = await api('/api/dashboard/profile');
+    const sched = d.profile?.schedule || { mode: 'always' };
+    window._schedule = JSON.parse(JSON.stringify(sched)); // editable copy
+    renderHoursEditor();
+  } catch (e) { el.innerHTML = '<div class="empty">Failed to load hours.</div>'; }
+}
+
+function renderHoursEditor() {
+  const el = document.getElementById('train-hours');
+  const sched = window._schedule || { mode: 'always' };
+  const mode = sched.mode || 'always';
+  const tz = sched.timezone || 'Europe/London';
+  const hours = sched.businessHours || { mon: '9-18', tue: '9-18', wed: '9-18', thu: '9-18', fri: '9-18', sat: 'closed', sun: 'closed' };
+  const ooh = sched.outOfHoursMode || 'auto_reply';
+  const oohMsg = sched.outOfHoursMessage || 'Thanks for getting in touch! We are currently closed but will reply as soon as we are open.';
+
+  // Live status — uses the SAME logic the server uses
+  const liveBadge = computeLiveScheduleBadge(sched);
+
+  const days = [
+    { key: 'mon', label: 'Mon' }, { key: 'tue', label: 'Tue' }, { key: 'wed', label: 'Wed' },
+    { key: 'thu', label: 'Thu' }, { key: 'fri', label: 'Fri' }, { key: 'sat', label: 'Sat' }, { key: 'sun', label: 'Sun' },
+  ];
+
+  el.innerHTML =
+    '<h4 style="font-size:13px;color:#fff;margin-bottom:6px;display:flex;align-items:center;gap:8px;">🕐 Business Hours <span style="font-size:11px;font-weight:400;color:#9898b8;">— when Aria is allowed to auto-reply</span></h4>' +
+    '<p style="font-size:12px;color:#8888aa;margin-bottom:14px;">' + liveBadge + '</p>' +
+    '<div class="form-group" style="margin-bottom:14px;">' +
+      '<label>Mode</label>' +
+      '<select onchange="updateSchedule(\\'mode\\',this.value)" style="width:auto;min-width:240px;">' +
+        '<option value="always" ' + (mode === 'always' ? 'selected' : '') + '>Always on (24/7)</option>' +
+        '<option value="business_hours" ' + (mode === 'business_hours' ? 'selected' : '') + '>Business hours only</option>' +
+      '</select>' +
+    '</div>' +
+    (mode === 'business_hours' ? (
+      '<div class="form-group" style="margin-bottom:14px;">' +
+        '<label>Timezone</label>' +
+        '<input type="text" value="' + escH(tz) + '" oninput="updateSchedule(\\'timezone\\',this.value)" placeholder="Europe/London" style="max-width:240px;">' +
+      '</div>' +
+      '<div style="display:flex;flex-direction:column;gap:6px;margin-bottom:18px;">' +
+        days.map(d => {
+          const val = hours[d.key] || 'closed';
+          return '<div style="display:flex;align-items:center;gap:10px;background:rgba(255,255,255,0.03);padding:8px 12px;border-radius:8px;">' +
+            '<div style="min-width:40px;font-size:12px;color:#aaa;text-transform:uppercase;font-weight:600;">' + d.label + '</div>' +
+            '<input type="text" value="' + escH(val) + '" oninput="updateHoursDay(\\'' + d.key + '\\',this.value)" placeholder="closed" style="flex:1;font-size:12.5px;background:rgba(255,255,255,0.04);">' +
+          '</div>';
+        }).join('') +
+      '</div>' +
+      '<p style="font-size:11px;color:#6b6b8a;margin-top:-10px;margin-bottom:14px;">Format: "9-18" or "9:30-17:30" · "closed" · "24h"</p>' +
+      '<div class="form-group" style="margin-bottom:14px;">' +
+        '<label>Outside-hours behaviour</label>' +
+        '<select onchange="updateSchedule(\\'outOfHoursMode\\',this.value)" style="width:auto;min-width:240px;">' +
+          '<option value="auto_reply" ' + (ooh === 'auto_reply' ? 'selected' : '') + '>Send polite "we are closed" reply</option>' +
+          '<option value="silent" ' + (ooh === 'silent' ? 'selected' : '') + '>Silent (log message, no reply)</option>' +
+        '</select>' +
+      '</div>' +
+      (ooh === 'auto_reply' ? (
+        '<div class="form-group" style="margin-bottom:14px;">' +
+          '<label>Out-of-hours message</label>' +
+          '<textarea rows="3" oninput="updateSchedule(\\'outOfHoursMessage\\',this.value)" placeholder="Thanks for getting in touch! We are currently closed...">' + escH(oohMsg) + '</textarea>' +
+        '</div>'
+      ) : '')
+    ) : '') +
+    '<button class="btn-save" onclick="saveSchedule()">Save business hours</button>';
+}
+
+function computeLiveScheduleBadge(sched) {
+  if (!sched || sched.mode === 'always' || !sched.mode) {
+    return '<span style="background:rgba(0,229,160,0.1);color:#00e5a0;padding:2px 10px;border-radius:10px;font-weight:600;">🟢 Aria is always on</span>';
+  }
+  // Approximate the server-side check client-side (same logic, in browser TZ)
+  try {
+    const tz = sched.timezone || 'Europe/London';
+    const now = new Date();
+    const fmt = new Intl.DateTimeFormat('en-GB', { timeZone: tz, weekday: 'short', hour: 'numeric', minute: 'numeric', hour12: false });
+    const parts = fmt.formatToParts(now);
+    const wd = parts.find(p => p.type === 'weekday').value.toLowerCase().slice(0, 3);
+    const hour = Number(parts.find(p => p.type === 'hour').value);
+    const min = Number(parts.find(p => p.type === 'minute').value);
+    const minutes = hour * 60 + min;
+    const today = (sched.businessHours || {})[wd] || 'closed';
+    const m = String(today).match(/^\s*(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?\s*$/);
+    let inHours = today === '24h';
+    if (m) {
+      const startMin = Number(m[1]) * 60 + Number(m[2] || 0);
+      const endMin = Number(m[3]) * 60 + Number(m[4] || 0);
+      inHours = minutes >= startMin && minutes < endMin;
+    }
+    return inHours
+      ? '<span style="background:rgba(0,229,160,0.1);color:#00e5a0;padding:2px 10px;border-radius:10px;font-weight:600;">🟢 Aria is ON right now (' + wd + ' ' + String(hour).padStart(2,'0') + ':' + String(min).padStart(2,'0') + ' ' + tz + ')</span>'
+      : '<span style="background:rgba(251,191,36,0.1);color:#fbbf24;padding:2px 10px;border-radius:10px;font-weight:600;">🌙 Aria is OFF right now (' + wd + ' ' + String(hour).padStart(2,'0') + ':' + String(min).padStart(2,'0') + ' ' + tz + ' — outside business hours)</span>';
+  } catch { return ''; }
+}
+
+function updateSchedule(key, value) {
+  window._schedule = window._schedule || {};
+  if (key === 'mode' && value === 'always') {
+    // Switching to always-on — keep stored hours but rerender simpler view
+    window._schedule.mode = 'always';
+  } else {
+    window._schedule[key] = value;
+    if (key === 'mode' && value === 'business_hours' && !window._schedule.businessHours) {
+      window._schedule.businessHours = { mon: '9-18', tue: '9-18', wed: '9-18', thu: '9-18', fri: '9-18', sat: 'closed', sun: 'closed' };
+    }
+  }
+  renderHoursEditor();
+}
+
+function updateHoursDay(day, value) {
+  window._schedule = window._schedule || {};
+  window._schedule.businessHours = window._schedule.businessHours || {};
+  window._schedule.businessHours[day] = value;
+  // Don't full-re-render — just update the live badge so cursor doesn't jump in input
+  const liveDiv = document.querySelector('#train-hours p');
+  if (liveDiv) liveDiv.innerHTML = computeLiveScheduleBadge(window._schedule);
+}
+
+async function saveSchedule() {
+  try {
+    const r = await apiPost('/api/dashboard/profile', { owner: OWNER, schedule: window._schedule });
+    if (r.ok) toast('Business hours saved');
+    loadBusinessHoursEditor(); // refresh badge
   } catch (e) { toast('Save failed'); }
 }
 
@@ -13651,6 +13783,33 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     || profile?.allowedTopics
     || profile?.profile?.allowedTopics
     || null;
+
+  // Business hours gate. Owner-configurable schedule per profile. If outside
+  // hours: either silently log (no reply), or send a polite auto-reply
+  // saying "we are closed". Either way the message + lead are still saved.
+  const schedule = profile?.profile?.schedule || profile?.schedule || profile?.config?.schedule;
+  if (schedule) {
+    const evalRes = evaluateSchedule(schedule, new Date());
+    if (!evalRes.inHours) {
+      console.log(`🕐 [${channel}] Out of hours for ${ownerEmail} (${evalRes.todayLocal} ${Math.floor(evalRes.minutesLocal/60)}:${String(evalRes.minutesLocal%60).padStart(2,'0')} ${evalRes.timezone})`);
+      if (evalRes.outOfHoursMode === 'auto_reply' && evalRes.outOfHoursMessage) {
+        try {
+          await sendChannelReply(channel, ownerChannels[channel], senderId, evalRes.outOfHoursMessage);
+        } catch (e) { console.warn('[ooh] auto-reply send failed:', e.message); }
+      }
+      // Log incoming message so it's visible in dashboard + activity feed
+      const msgs = channelMessages.get(ownerEmail) || [];
+      msgs.push({
+        id: messageId, channel, senderId, senderName,
+        message: messageText, reply: evalRes.outOfHoursMode === 'auto_reply' ? evalRes.outOfHoursMessage : '(out of hours — not replied)',
+        timestamp: new Date().toISOString(), status: 'ooh',
+      });
+      if (msgs.length > 500) msgs.splice(0, msgs.length - 500);
+      channelMessages.set(ownerEmail, msgs);
+      persistChannelMessages();
+      return;
+    }
+  }
 
   // Budget gate — bail before spending tokens if today's cap is hit.
   // Owner gets one alert email per day per cap-hit. After cap, we stop
