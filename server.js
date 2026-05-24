@@ -10036,27 +10036,30 @@ app.get('/api/dashboard/profile', (req, res) => {
 app.post('/api/dashboard/profile', (req, res) => {
   const owner = requireDashboardAuth(req, res);
   if (!owner) return;
-  const { businessName, services, location, phone, email, hours, tone } = req.body;
+  const { businessName, services, location, phone, email, hours, tone, servicesCarousel, allowedTopics } = req.body;
   // Find or create profile entry
   let profileKey = null;
   for (const [k, v] of clientProfiles) {
     if (v.profile?.email === owner) { profileKey = k; break; }
   }
-  const updatedProfile = {
-    businessName: businessName || '',
-    services: services || '',
-    location: location || '',
-    phone: phone || '',
-    email: email || owner,
-    hours: hours || '',
-    tone: tone || 'friendly'
-  };
+  // Partial-update semantics: only set keys that were actually sent so a
+  // services-only save doesn't wipe out tone, etc.
+  const updates = {};
+  if (businessName !== undefined) updates.businessName = businessName || '';
+  if (services     !== undefined) updates.services     = services     || '';
+  if (location     !== undefined) updates.location     = location     || '';
+  if (phone        !== undefined) updates.phone        = phone        || '';
+  if (email        !== undefined) updates.email        = email        || owner;
+  if (hours        !== undefined) updates.hours        = hours        || '';
+  if (tone         !== undefined) updates.tone         = tone         || 'friendly';
+  if (servicesCarousel !== undefined) updates.servicesCarousel = Array.isArray(servicesCarousel) ? servicesCarousel : [];
+  if (allowedTopics    !== undefined) updates.allowedTopics    = Array.isArray(allowedTopics)    ? allowedTopics    : [];
   if (profileKey) {
     const existing = clientProfiles.get(profileKey);
-    existing.profile = { ...existing.profile, ...updatedProfile };
+    existing.profile = { ...existing.profile, ...updates };
     clientProfiles.set(profileKey, existing);
   } else {
-    clientProfiles.set(owner, { profile: updatedProfile, scannedAt: new Date().toISOString() });
+    clientProfiles.set(owner, { profile: { email: owner, ...updates }, scannedAt: new Date().toISOString() });
   }
   persistProfiles();
 
@@ -10806,15 +10809,175 @@ async function loadUnifiedConvs(filter) {
   } catch (e) { container.innerHTML = '<div class="empty">Failed to load conversations.</div>'; }
 }
 
-// ─── Train Aria (KB + Knowledge docs + Services + Scope) — Phase 2 stub ──
+// ─── Train Aria (KB + Knowledge docs + Services + Scope) ────────────────
 async function loadTrainAria() {
   const body = document.getElementById('body-train');
   body.innerHTML = '<div style="padding:8px 0;">' +
-    '<p style="font-size:13px;color:#9898b8;margin-bottom:14px;">Teach Aria your business — answers, documents, services, and what topics she should + shouldn\\'t handle.</p>' +
-    '<div id="train-knowledge" style="margin-bottom:24px;"><h4 style="font-size:13px;color:#fff;margin-bottom:10px;">📚 Knowledge Documents</h4><div class="empty" style="padding:14px 0">Coming next — upload PDFs or paste your service docs so Aria can cite them.</div></div>' +
-    '<div id="train-services" style="margin-bottom:24px;"><h4 style="font-size:13px;color:#fff;margin-bottom:10px;">🎠 Services Carousel</h4><div class="empty" style="padding:14px 0">Coming next — define the services Aria shows in a swipeable carousel when customers ask "what do you offer".</div></div>' +
-    '<div id="train-scope" style="margin-bottom:24px;"><h4 style="font-size:13px;color:#fff;margin-bottom:10px;">🚦 Topic Scope</h4><div class="empty" style="padding:14px 0">Coming next — tell Aria what topics she SHOULD answer (everything else gets a polite redirect).</div></div>' +
+    '<p style="font-size:13px;color:#9898b8;margin-bottom:18px;">Teach Aria your business — answers, documents, services, and what topics she should + shouldn\\'t handle.</p>' +
+    '<div id="train-knowledge" style="margin-bottom:28px;"></div>' +
+    '<div id="train-services" style="margin-bottom:28px;"></div>' +
+    '<div id="train-scope" style="margin-bottom:8px;"></div>' +
   '</div>';
+  await Promise.all([loadKnowledgeDocs(), loadServicesEditor(), loadScopeEditor()]);
+}
+
+async function loadKnowledgeDocs() {
+  const el = document.getElementById('train-knowledge');
+  try {
+    const d = await api('/api/dashboard/knowledge');
+    const rows = (d.docs || []).map((doc, i) => {
+      return '<div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:12px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;">' +
+        '<div style="min-width:0;flex:1;">' +
+          '<div style="font-size:13px;color:#fff;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH(doc.title) + '</div>' +
+          '<div style="font-size:11px;color:#8888aa;margin-top:2px;">' + (doc.charCount || 0).toLocaleString() + ' chars · uploaded ' + timeAgo(doc.uploadedAt) + '</div>' +
+        '</div>' +
+        '<button onclick="deleteKnowledgeDoc(' + i + ')" style="background:rgba(255,80,80,0.1);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit;flex-shrink:0;">Remove</button>' +
+      '</div>';
+    }).join('');
+    el.innerHTML =
+      '<h4 style="font-size:13px;color:#fff;margin-bottom:10px;">📚 Knowledge Documents <span style="font-size:11px;font-weight:400;color:#8888aa;">— Aria cites these for accurate answers (no hallucination)</span></h4>' +
+      (rows ? '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">' + rows + '</div>' : '<div class="empty" style="padding:14px 0">No documents yet. Paste your services, prices, FAQ, policies — anything Aria should know.</div>') +
+      '<div style="background:rgba(0,229,160,0.05);border:1px solid rgba(0,229,160,0.15);border-radius:10px;padding:14px;">' +
+        '<div class="form-group" style="margin-bottom:10px;"><label>Document title</label><input id="kd-title" type="text" placeholder="e.g. Service prices, Booking policy, Care instructions"></div>' +
+        '<div class="form-group" style="margin-bottom:12px;"><label>Content (paste any plain text — services, prices, FAQ, policies, etc.)</label><textarea id="kd-content" rows="6" placeholder="Hair colour: £85-150 depending on length. Cuts: £35. Open Tue-Sat 9am-6pm. Cancellation: 24hr notice required..."></textarea></div>' +
+        '<button class="btn-save" onclick="uploadKnowledgeDoc()">+ Add to Aria\\'s knowledge</button>' +
+      '</div>';
+  } catch (e) {
+    el.innerHTML = '<div class="empty">Failed to load knowledge docs.</div>';
+  }
+}
+
+async function uploadKnowledgeDoc() {
+  const title = document.getElementById('kd-title').value.trim();
+  const content = document.getElementById('kd-content').value.trim();
+  if (!title || !content) { toast('Title + content required'); return; }
+  try {
+    const r = await apiPost('/api/dashboard/knowledge', { title, content });
+    if (r.ok) { toast('Document added — Aria will cite it from now on'); loadKnowledgeDocs(); }
+    else toast(r.error || 'Upload failed');
+  } catch (e) { toast('Upload failed'); }
+}
+
+async function deleteKnowledgeDoc(idx) {
+  if (!confirm('Remove this document from Aria\\'s knowledge?')) return;
+  try {
+    const r = await fetch('/api/dashboard/knowledge/' + idx + '?' + Q, { method: 'DELETE' });
+    const d = await r.json();
+    if (d.ok) { toast('Removed'); loadKnowledgeDocs(); }
+  } catch (e) { toast('Remove failed'); }
+}
+
+async function loadServicesEditor() {
+  const el = document.getElementById('train-services');
+  try {
+    const d = await api('/api/dashboard/profile');
+    const services = (d.profile?.servicesCarousel) || [];
+    el.innerHTML =
+      '<h4 style="font-size:13px;color:#fff;margin-bottom:10px;">🎠 Services Carousel <span style="font-size:11px;font-weight:400;color:#8888aa;">— shown when customers ask "what do you offer"</span></h4>' +
+      '<div id="services-list" style="display:flex;flex-direction:column;gap:10px;margin-bottom:12px;"></div>' +
+      '<button class="btn-save" onclick="addServiceCard()" style="background:rgba(255,255,255,0.06);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);">+ Add service card</button>';
+    window._services = services.length ? services : [];
+    renderServicesList();
+  } catch (e) { el.innerHTML = '<div class="empty">Failed to load services.</div>'; }
+}
+
+function renderServicesList() {
+  const list = document.getElementById('services-list');
+  if (!list) return;
+  if (!window._services?.length) {
+    list.innerHTML = '<div class="empty" style="padding:14px 0">No services yet. Add 2-5 of your most-asked-for services with photos.</div>';
+    return;
+  }
+  list.innerHTML = window._services.map((s, i) =>
+    '<div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:14px;">' +
+      '<div style="display:flex;align-items:start;gap:12px;">' +
+        (s.image ? '<img src="' + escH(s.image) + '" style="width:60px;height:60px;border-radius:8px;object-fit:cover;flex-shrink:0;" onerror="this.style.display=\\'none\\'">' : '') +
+        '<div style="flex:1;display:grid;grid-template-columns:1fr 1fr;gap:8px;">' +
+          '<input placeholder="Title" value="' + escH(s.title || '') + '" oninput="window._services[' + i + '].title=this.value">' +
+          '<input placeholder="Subtitle (price, duration, etc)" value="' + escH(s.subtitle || '') + '" oninput="window._services[' + i + '].subtitle=this.value">' +
+          '<input placeholder="Image URL (optional)" value="' + escH(s.image || '') + '" oninput="window._services[' + i + '].image=this.value" style="grid-column:span 2">' +
+          '<input placeholder="Link URL (optional)" value="' + escH(s.link || '') + '" oninput="window._services[' + i + '].link=this.value">' +
+          '<input placeholder="Button text (e.g. Book now)" value="' + escH(s.btn_text || '') + '" oninput="window._services[' + i + '].btn_text=this.value">' +
+        '</div>' +
+        '<button onclick="removeService(' + i + ')" style="background:rgba(255,80,80,0.1);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit;flex-shrink:0;">×</button>' +
+      '</div>' +
+    '</div>').join('') +
+    '<button class="btn-save" onclick="saveServices()" style="margin-top:8px;">Save services</button>';
+}
+
+function addServiceCard() {
+  window._services = window._services || [];
+  if (window._services.length >= 10) { toast('Max 10 service cards'); return; }
+  window._services.push({ title: '', subtitle: '', image: '', link: '', btn_text: 'Learn more' });
+  renderServicesList();
+}
+
+function removeService(i) {
+  window._services.splice(i, 1);
+  renderServicesList();
+}
+
+async function saveServices() {
+  try {
+    const r = await apiPost('/api/dashboard/profile', { owner: OWNER, servicesCarousel: window._services });
+    if (r.ok) toast('Services saved — Aria will show these when asked');
+  } catch (e) { toast('Save failed'); }
+}
+
+async function loadScopeEditor() {
+  const el = document.getElementById('train-scope');
+  try {
+    const d = await api('/api/dashboard/profile');
+    const topics = d.profile?.allowedTopics || [];
+    window._scopeTopics = topics.slice();
+    el.innerHTML =
+      '<h4 style="font-size:13px;color:#fff;margin-bottom:10px;">🚦 Topic Scope <span style="font-size:11px;font-weight:400;color:#8888aa;">— what Aria should answer (everything else gets a polite redirect)</span></h4>' +
+      '<p style="font-size:12px;color:#8888aa;margin-bottom:10px;">Leave empty if Aria can answer anything. Otherwise add topics like "scaffolding hire", "hair colouring", "garden design".</p>' +
+      '<div id="scope-chips" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;min-height:32px;"></div>' +
+      '<div style="display:flex;gap:8px;">' +
+        '<input id="scope-input" placeholder="e.g. plumbing repairs" style="flex:1;" onkeydown="if(event.key===\\'Enter\\'){event.preventDefault();addScopeTopic()}">' +
+        '<button class="btn-save" onclick="addScopeTopic()" style="padding:10px 18px;">Add</button>' +
+      '</div>' +
+      '<button class="btn-save" onclick="saveScope()" style="margin-top:12px;">Save topics</button>';
+    renderScopeChips();
+  } catch (e) { el.innerHTML = '<div class="empty">Failed to load scope.</div>'; }
+}
+
+function renderScopeChips() {
+  const chips = document.getElementById('scope-chips');
+  if (!chips) return;
+  if (!window._scopeTopics?.length) {
+    chips.innerHTML = '<div style="font-size:12px;color:#6b6b8a;">No topics set — Aria will answer anything in scope of her general business prompt.</div>';
+    return;
+  }
+  chips.innerHTML = window._scopeTopics.map((t, i) =>
+    '<span style="background:rgba(0,229,160,0.1);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:20px;padding:5px 12px;font-size:12px;display:inline-flex;align-items:center;gap:6px;">' +
+      escH(t) +
+      '<button onclick="removeScopeTopic(' + i + ')" style="background:none;border:none;color:#00e5a0;cursor:pointer;font-size:14px;padding:0;line-height:1;">×</button>' +
+    '</span>').join('');
+}
+
+function addScopeTopic() {
+  const inp = document.getElementById('scope-input');
+  const t = inp.value.trim();
+  if (!t) return;
+  window._scopeTopics = window._scopeTopics || [];
+  if (window._scopeTopics.includes(t)) { toast('Already added'); return; }
+  window._scopeTopics.push(t);
+  inp.value = '';
+  renderScopeChips();
+}
+
+function removeScopeTopic(i) {
+  window._scopeTopics.splice(i, 1);
+  renderScopeChips();
+}
+
+async function saveScope() {
+  try {
+    const r = await apiPost('/api/dashboard/profile', { owner: OWNER, allowedTopics: window._scopeTopics });
+    if (r.ok) toast('Scope saved — Aria will stay on-topic');
+  } catch (e) { toast('Save failed'); }
 }
 
 let inboxPage = 1;
@@ -11475,10 +11638,26 @@ function findOwnerByWhatsAppPhoneId(phoneNumberId) {
 
 function getOwnerProfile(ownerEmail) {
   const arConfig = EMAIL_AUTO_REPLY_ENABLED.get(ownerEmail);
-  if (arConfig?.systemPrompt) return { systemPrompt: arConfig.systemPrompt, config: arConfig.config };
+  // Pull dashboard profile (clientProfiles) so allowedTopics + servicesCarousel
+  // saved via the Train Aria editors are visible to the channel pipeline.
+  let dashProfile = null;
   for (const [key, val] of clientProfiles) {
-    if (val.email === ownerEmail || key === ownerEmail) return val;
+    if (val?.profile?.email === ownerEmail || val?.email === ownerEmail || key === ownerEmail) {
+      dashProfile = val?.profile || val;
+      break;
+    }
   }
+  if (arConfig?.systemPrompt) {
+    return {
+      systemPrompt: arConfig.systemPrompt,
+      config: arConfig.config,
+      // Merge in dashboard-side fields so the channel handler sees them
+      allowedTopics: dashProfile?.allowedTopics,
+      servicesCarousel: dashProfile?.servicesCarousel,
+      profile: dashProfile,
+    };
+  }
+  if (dashProfile) return { profile: dashProfile, ...dashProfile };
   return null;
 }
 
@@ -11951,7 +12130,10 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
   // Build system prompt from client profile
   const profile = getOwnerProfile(ownerEmail);
   const systemPrompt = profile?.systemPrompt || `You are a helpful business assistant for ${ownerEmail}.`;
-  const allowedTopics = profile?.config?.allowedTopics || profile?.allowedTopics || null;
+  const allowedTopics = profile?.config?.allowedTopics
+    || profile?.allowedTopics
+    || profile?.profile?.allowedTopics
+    || null;
 
   // Budget gate — bail before spending tokens if today's cap is hit.
   // Owner gets one alert email per day per cap-hit. After cap, we stop
@@ -12168,7 +12350,9 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
 
   // Aria asked to show the services carousel and owner has services
   // defined in their profile — fire it as a follow-up message.
-  const ownerServices = profile?.config?.services;
+  const ownerServices = profile?.config?.services
+    || profile?.servicesCarousel
+    || profile?.profile?.servicesCarousel;
   if (reply.showServicesCarousel && Array.isArray(ownerServices) && ownerServices.length) {
     setTimeout(async () => {
       try {
