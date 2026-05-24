@@ -52,6 +52,7 @@ import { buildIcsEvent, parseBookingDateTime } from './lib/ics_builder.js';
 import { scheduleTask, cancelTask, listPending, bootstrapFromLedger, registerTaskHandler, startTickLoop } from './lib/outbound_scheduler.js';
 import { ltvScore, ltvTier } from './lib/customer_ltv.js';
 import { evaluateSchedule } from './lib/business_hours.js';
+import { dispatchWebhook, readWebhookLog, signPayload as signWebhookPayload } from './lib/webhook_dispatcher.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
@@ -9857,6 +9858,124 @@ app.get('/api/admin/usage', (req, res) => {
   res.json({ rows, totalUsedToday: rows.reduce((s, r) => s + r.usedToday, 0) });
 });
 
+// ─── Webhook events — central dispatcher used by every firing site ─────
+// Looks up owner's webhooks from profile.webhooks[], filters by event +
+// enabled, fires each via the dispatcher (which handles HMAC signing +
+// retry asynchronously). Fire-and-forget so the calling flow isn't
+// blocked by slow receivers.
+//
+// Valid event types:
+//   'new_lead'         — fires when a lead is scored (any score)
+//   'hot_lead'         — fires only when leadScore === 'hot'
+//   'new_booking'      — fires when a booking's slots all fill
+//   'handoff'          — fires when conversation paused for human takeover
+//   'angry_message'    — fires when sentiment classified as 'angry'
+//   'csat_negative'    — fires when customer rates a conv 👎
+//   'conversation_started' — fires on the first message in a conv
+async function fireWebhookEvent(ownerEmail, event, data) {
+  const profile = getOwnerProfile(ownerEmail);
+  const webhooks = profile?.profile?.webhooks || profile?.webhooks || profile?.config?.webhooks || [];
+  if (!webhooks.length) return;
+  for (const wh of webhooks) {
+    if (!wh.enabled || !wh.url) continue;
+    if (Array.isArray(wh.events) && wh.events.length && !wh.events.includes(event)) continue;
+    // Don't await — let retries happen async
+    dispatchWebhook(wh, event, { ...data, ownerEmail }).catch(e => {
+      console.warn(`[webhook] ${event} → ${wh.url}: ${e.message}`);
+    });
+  }
+}
+
+// GET /api/dashboard/webhooks — list owner's webhooks + recent deliveries
+app.get('/api/dashboard/webhooks', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const profile = getOwnerProfile(owner);
+  const webhooks = profile?.profile?.webhooks || [];
+  const urls = new Set(webhooks.map(w => w.url));
+  const recentDeliveries = readWebhookLog({ urls, limit: 30 });
+  res.json({
+    // Strip secrets from response (only show last 4 chars for ID)
+    webhooks: webhooks.map(w => ({
+      label: w.label, url: w.url, events: w.events || [],
+      enabled: w.enabled !== false,
+      secretHint: w.secret ? '••••' + String(w.secret).slice(-4) : null,
+    })),
+    recentDeliveries,
+  });
+});
+
+// POST /api/dashboard/webhooks — add/update a webhook
+app.post('/api/dashboard/webhooks', express.json({ limit: '32kb' }), (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { label, url, events, enabled = true, replaceIndex } = req.body || {};
+  if (!url || !/^https?:\/\//.test(url)) return res.status(400).json({ error: 'Valid http(s) URL required' });
+  // Find/create profile
+  let profileKey = null, profileEntry = null;
+  for (const [k, v] of clientProfiles) {
+    if (v?.profile?.email === owner) { profileKey = k; profileEntry = v; break; }
+  }
+  if (!profileEntry) {
+    profileEntry = { profile: { email: owner, webhooks: [] }, scannedAt: new Date().toISOString() };
+    clientProfiles.set(owner, profileEntry);
+  }
+  const webhooks = profileEntry.profile.webhooks || [];
+  const newEntry = {
+    label: String(label || 'Webhook').slice(0, 60),
+    url: String(url),
+    events: Array.isArray(events) ? events : ['new_lead', 'new_booking', 'handoff'],
+    enabled: !!enabled,
+    secret: crypto.randomBytes(24).toString('hex'),
+    createdAt: new Date().toISOString(),
+  };
+  if (typeof replaceIndex === 'number' && webhooks[replaceIndex]) {
+    // Preserve existing secret when updating
+    newEntry.secret = webhooks[replaceIndex].secret;
+    webhooks[replaceIndex] = newEntry;
+  } else {
+    if (webhooks.length >= 10) return res.status(400).json({ error: 'Max 10 webhooks per owner' });
+    webhooks.push(newEntry);
+  }
+  profileEntry.profile.webhooks = webhooks;
+  clientProfiles.set(profileKey || owner, profileEntry);
+  res.json({ ok: true, secret: newEntry.secret });
+});
+
+// DELETE /api/dashboard/webhooks/:index
+app.delete('/api/dashboard/webhooks/:index', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const idx = parseInt(req.params.index);
+  for (const [k, v] of clientProfiles) {
+    if (v?.profile?.email !== owner) continue;
+    const webhooks = v.profile.webhooks || [];
+    if (idx < 0 || idx >= webhooks.length) return res.status(404).json({ error: 'not found' });
+    webhooks.splice(idx, 1);
+    v.profile.webhooks = webhooks;
+    clientProfiles.set(k, v);
+    return res.json({ ok: true });
+  }
+  res.status(404).json({ error: 'profile not found' });
+});
+
+// POST /api/dashboard/webhooks/:index/test — fire a test event so owner
+// can verify their receiver accepts the payload
+app.post('/api/dashboard/webhooks/:index/test', async (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const idx = parseInt(req.params.index);
+  const profile = getOwnerProfile(owner);
+  const webhooks = profile?.profile?.webhooks || [];
+  const wh = webhooks[idx];
+  if (!wh) return res.status(404).json({ error: 'webhook not found' });
+  const result = await dispatchWebhook(wh, 'test', {
+    message: 'This is a test event from Aria. If you see this, your webhook is wired up correctly.',
+    ownerEmail: owner,
+  });
+  res.json(result);
+});
+
 // GET /api/dashboard/customers — list all known customers for the owner,
 // sorted by most-recent touch. Pulled from the in-memory customerIndex
 // which is rebuilt at startup from channel_leads.jsonl.
@@ -12484,8 +12603,106 @@ async function loadSettings() {
         <svg viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
         Gmail Settings
       </a>
+
+      <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">🔗 Webhooks <span style="font-size:11px;font-weight:400;color:#9898b8;">— pipe Aria events to Zapier, Slack, your CRM</span></h4>
+      <div id="webhooks-panel"><div class="empty" style="padding:14px 0;font-size:12px;">Loading…</div></div>
     \`;
+    loadWebhooks();
   } catch (e) { body.innerHTML = '<div class="empty">Failed to load settings.</div>'; }
+}
+
+// ─── Webhooks panel ─────────────────────────────────────────────────────
+async function loadWebhooks() {
+  const el = document.getElementById('webhooks-panel');
+  if (!el) return;
+  try {
+    const d = await api('/api/dashboard/webhooks');
+    const hooks = d.webhooks || [];
+    const recent = (d.recentDeliveries || []).slice(0, 8);
+
+    const EVENT_LABELS = {
+      new_lead: 'New lead', hot_lead: 'Hot lead', new_booking: 'Booking',
+      handoff: 'Handoff', angry_message: 'Angry', csat_negative: '👎 CSAT',
+      conversation_started: 'Conv started', test: 'Test',
+    };
+    const hookCards = hooks.map((wh, i) => {
+      const events = (wh.events || []).map(e => '<span style="background:rgba(157,150,255,0.1);color:#9d96ff;padding:2px 8px;border-radius:10px;font-size:10.5px;">' + (EVENT_LABELS[e] || e) + '</span>').join(' ');
+      return '<div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:12px 14px;margin-bottom:8px;">' +
+        '<div style="display:flex;align-items:start;gap:12px;">' +
+          '<div style="flex:1;min-width:0;">' +
+            '<div style="font-size:13px;color:#fff;font-weight:600;">' + escH(wh.label || 'Webhook') + ' ' + (wh.enabled ? '<span style="color:#00e5a0;font-size:10px;">●ON</span>' : '<span style="color:#6b6b8a;font-size:10px;">●OFF</span>') + '</div>' +
+            '<div style="font-size:11px;color:#8888aa;margin-top:2px;font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH(wh.url) + '</div>' +
+            (events ? '<div style="margin-top:6px;display:flex;gap:4px;flex-wrap:wrap;">' + events + '</div>' : '') +
+            (wh.secretHint ? '<div style="font-size:10.5px;color:#6b6b8a;margin-top:6px;font-family:monospace;">Secret: ' + wh.secretHint + '</div>' : '') +
+          '</div>' +
+          '<div style="display:flex;flex-direction:column;gap:4px;flex-shrink:0;">' +
+            '<button onclick="testWebhook(' + i + ')" style="background:rgba(0,229,160,0.1);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit;">Test</button>' +
+            '<button onclick="deleteWebhook(' + i + ')" style="background:rgba(255,80,80,0.1);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit;">Remove</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+
+    const recentRows = recent.length ? recent.map(r => {
+      const okColour = r.ok ? '#00e5a0' : '#ff6b6b';
+      return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:11.5px;">' +
+        '<span style="color:' + okColour + ';font-weight:600;min-width:36px;">' + (r.status || (r.ok ? 'OK' : 'ERR')) + '</span>' +
+        '<span style="color:#aaa;min-width:90px;">' + escH(r.event) + '</span>' +
+        '<span style="color:#8888aa;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:monospace;font-size:10.5px;">' + escH(r.url.replace(/^https?:\\/\\//, '')) + '</span>' +
+        '<span style="color:#6b6b8a;font-size:10.5px;">' + timeAgo(r.ts) + '</span>' +
+      '</div>';
+    }).join('') : '<div class="empty" style="padding:10px 0;font-size:11.5px;">No deliveries yet — events fire when leads, bookings, handoffs, or angry messages happen.</div>';
+
+    el.innerHTML =
+      (hookCards || '<div class="empty" style="padding:10px 0;font-size:12px;">No webhooks yet. Add one to pipe Aria events to Zapier, Slack, or your CRM.</div>') +
+      '<div style="background:rgba(157,150,255,0.05);border:1px solid rgba(157,150,255,0.2);border-radius:10px;padding:12px;margin-top:10px;">' +
+        '<div class="form-group" style="margin-bottom:8px;"><label>Label</label><input id="wh-label" placeholder="My Zapier webhook"></div>' +
+        '<div class="form-group" style="margin-bottom:8px;"><label>URL</label><input id="wh-url" placeholder="https://hooks.zapier.com/hooks/catch/..."></div>' +
+        '<div class="form-group" style="margin-bottom:10px;"><label>Fire on which events?</label>' +
+          '<div id="wh-events" style="display:flex;flex-wrap:wrap;gap:6px;">' +
+            ['new_lead','hot_lead','new_booking','handoff','angry_message','csat_negative'].map(e =>
+              '<label style="display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,0.04);padding:5px 10px;border-radius:14px;font-size:11.5px;color:#ccc;cursor:pointer;"><input type="checkbox" value="' + e + '" ' + (['new_lead','new_booking','handoff'].includes(e) ? 'checked' : '') + ' style="margin:0;">' + (EVENT_LABELS[e] || e) + '</label>'
+            ).join('') +
+          '</div>' +
+        '</div>' +
+        '<button class="btn-save" onclick="addWebhook()">+ Add webhook</button>' +
+      '</div>' +
+      '<h5 style="font-size:11px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin:18px 0 8px;">Recent deliveries</h5>' +
+      recentRows;
+  } catch (e) { el.innerHTML = '<div class="empty">Failed to load webhooks.</div>'; }
+}
+
+async function addWebhook() {
+  const label = document.getElementById('wh-label').value.trim();
+  const url = document.getElementById('wh-url').value.trim();
+  const events = Array.from(document.querySelectorAll('#wh-events input:checked')).map(c => c.value);
+  if (!url) { toast('URL required'); return; }
+  try {
+    const r = await apiPost('/api/dashboard/webhooks', { label, url, events });
+    if (r.ok) {
+      toast('Webhook added — secret: ' + r.secret.slice(0, 12) + '…');
+      loadWebhooks();
+    } else { toast(r.error || 'Failed'); }
+  } catch (e) { toast('Add failed'); }
+}
+
+async function deleteWebhook(idx) {
+  if (!confirm('Remove this webhook? Events will stop firing to it immediately.')) return;
+  try {
+    const r = await fetch('/api/dashboard/webhooks/' + idx + '?' + Q, { method: 'DELETE' });
+    const d = await r.json();
+    if (d.ok) { toast('Removed'); loadWebhooks(); }
+  } catch (e) { toast('Remove failed'); }
+}
+
+async function testWebhook(idx) {
+  toast('Firing test event…');
+  try {
+    const r = await apiPost('/api/dashboard/webhooks/' + idx + '/test', {});
+    if (r.ok) toast('✓ Test sent, status ' + r.status);
+    else toast('✗ ' + (r.reason || r.error || ('status ' + r.status)));
+    setTimeout(loadWebhooks, 500);
+  } catch (e) { toast('Test failed'); }
 }
 
 async function saveOutbound(key, value) {
@@ -13768,6 +13985,12 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
       // Brief thank-you, no new conv loop
       await sendChannelReply(channel, ownerChannels[channel], senderId, positive ? 'Thanks for the feedback! 🙏' : 'Thanks for letting us know — we\'ll do better next time.');
       console.log(`⭐ [${channel}] CSAT recorded: ${positive ? 'positive' : 'negative'} from ${senderName}`);
+      if (!positive) {
+        fireWebhookEvent(ownerEmail, 'csat_negative', {
+          channel, senderId, senderName,
+          rating: 'negative', raw: messageText.slice(0, 200),
+        });
+      }
       return;
     }
   }
@@ -13973,6 +14196,11 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
         </div>`,
       });
       console.log(`🤝 [${channel}] Handed off ${senderName} → ${ownerEmail}: ${reply.handoffReason}`);
+      fireWebhookEvent(ownerEmail, 'handoff', {
+        channel, senderId, senderName,
+        reason: reply.handoffReason || 'human requested',
+        summary,
+      });
     } catch (e) { console.warn('Handoff summary failed:', e.message); }
   }
 
@@ -14090,6 +14318,29 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     });
     console.log(`📱 [${channel}] Lead scored: ${leadScore} / ${category} (conv=${convLen})`);
 
+    // Fire webhook event(s) — new_lead always, hot_lead only when score=hot
+    fireWebhookEvent(ownerEmail, 'new_lead', {
+      channel, senderId, senderName,
+      leadScore, category,
+      sentiment: reply.sentiment, urgency: reply.urgency,
+      contact: reply.contact || {},
+      messagePreview: messageText.slice(0, 300),
+    });
+    if (leadScore === 'hot') {
+      fireWebhookEvent(ownerEmail, 'hot_lead', {
+        channel, senderId, senderName,
+        category,
+        contact: reply.contact || {},
+        messagePreview: messageText.slice(0, 300),
+      });
+    }
+    if (reply.sentiment === 'angry') {
+      fireWebhookEvent(ownerEmail, 'angry_message', {
+        channel, senderId, senderName,
+        messagePreview: messageText.slice(0, 300),
+      });
+    }
+
     // Auto-schedule personalised follow-up email for HOT leads with email captured.
     // Fires 3 minutes later so the conversation has a chance to continue naturally
     // first. Owner-opt-outable via profile.config.outbound.leadFollowup = false.
@@ -14175,6 +14426,11 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
       conversationState.set(memKey, st);
       persistConversationState();
       console.log(`📅 [${channel}] Booking ready + saved for ${senderName}: ${merged.name} / ${merged.datetime}`);
+      // Fire webhook event so connected CRMs / Zapier / Slack know about it
+      fireWebhookEvent(ownerEmail, 'new_booking', {
+        channel, senderId, senderName,
+        booking: merged,
+      });
       // FIRE the confirmation flow — ICS email to owner + customer + channel reply
       // Done in a setImmediate so the current message handler returns fast.
       setImmediate(async () => {
