@@ -54,6 +54,7 @@ import { ltvScore, ltvTier } from './lib/customer_ltv.js';
 import { evaluateSchedule } from './lib/business_hours.js';
 import { dispatchWebhook, readWebhookLog, signPayload as signWebhookPayload } from './lib/webhook_dispatcher.js';
 import { extractImageRefs, resolveImageRefsToBlocks } from './lib/image_intake.js';
+import { extractAudioRefs, transcribeAudioRef } from './lib/audio_intake.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
@@ -13373,26 +13374,52 @@ async function processMetaWebhook(payload) {
       for (const change of entry.changes) {
         if (change.field === 'messages' && change.value?.messages) {
           for (const msg of change.value.messages) {
-            // Accept text OR image-shaped inbound. Caption travels on
-            // msg.image.caption when an image carries text; pure-image
-            // messages get a synthetic "(sent a photo)" so downstream
-            // logic still has *something* to anchor on.
+            // Accept text / image / audio inbound. Voice notes go through
+            // Whisper to a transcript and then ride the normal text path.
             const isText  = msg.type === 'text';
             const isImage = msg.type === 'image';
-            if (!isText && !isImage) continue;
+            const isAudio = msg.type === 'audio';
+            if (!isText && !isImage && !isAudio) continue;
 
             const phoneNumberId = change.value.metadata?.phone_number_id;
             const senderId      = msg.from;
             const senderName    = change.value.contacts?.[0]?.profile?.name || senderId;
-            const messageText   = isText
-              ? (msg.text?.body || '')
-              : (msg.image?.caption || '(sent a photo)');
             const messageId     = msg.id;
             const imageRefs     = extractImageRefs({ channel: 'whatsapp', msg });
+            const audioRefs     = extractAudioRefs({ channel: 'whatsapp', msg });
+
+            // Transcribe voice notes BEFORE entering the channel handler so the
+            // transcript becomes messageText and every downstream feature
+            // (RAG / slot fill / booking detection / sentiment) works as if
+            // they typed it. Need the WA access token to fetch token-gated media.
+            let messageText;
+            let voiceMeta = null;
+            if (isText) {
+              messageText = msg.text?.body || '';
+            } else if (isImage) {
+              messageText = msg.image?.caption || '(sent a photo)';
+            } else {
+              messageText = '(sent a voice note)';
+              if (audioRefs.length > 0) {
+                try {
+                  const wa = findOwnerByWhatsAppPhoneId(phoneNumberId);
+                  const accessToken = wa?.config?.accessToken || process.env.WA_ACCESS_TOKEN;
+                  const { transcript, provider, bytes } = await transcribeAudioRef(audioRefs[0], accessToken);
+                  messageText = transcript;
+                  voiceMeta = { provider, bytes, durationApprox: null };
+                  console.log(`🎙️  [voice] transcribed ${bytes}B WA voice note via ${provider}: "${transcript.slice(0, 100)}"`);
+                } catch (e) {
+                  console.warn(`[voice] WA transcription failed: ${e.message}`);
+                  // Fallback messageText stays "(sent a voice note)" — Aria will
+                  // still answer something reasonable (e.g. "Got your voice
+                  // note — could you also type a quick line so I can help?").
+                }
+              }
+            }
 
             await handleIncomingChannelMessage({
               channel: 'whatsapp', recipientId: phoneNumberId,
-              senderId, senderName, messageText, messageId, imageRefs,
+              senderId, senderName, messageText, messageId, imageRefs, voiceMeta,
             });
           }
         }
@@ -13402,28 +13429,48 @@ async function processMetaWebhook(payload) {
     // Instagram & Facebook Messenger messages
     if (entry.messaging) {
       for (const event of entry.messaging) {
-        // Allow text OR image-only attachment messages. IG stories / quick
-        // replies still arrive without text — gate on "any meaningful content".
-        const hasText        = !!event.message?.text;
-        const hasImageAtt    = (event.message?.attachments || []).some(a => a.type === 'image');
-        if (!hasText && !hasImageAtt) continue;
+        // Allow text / image / audio. Anything else (file/video/sticker) skipped.
+        const hasText     = !!event.message?.text;
+        const hasImageAtt = (event.message?.attachments || []).some(a => a.type === 'image');
+        const hasAudioAtt = (event.message?.attachments || []).some(a => a.type === 'audio');
+        if (!hasText && !hasImageAtt && !hasAudioAtt) continue;
 
         const recipientId = event.recipient?.id;
         const senderId    = event.sender?.id;
-        const messageText = hasText
-          ? event.message.text
-          : '(sent a photo)';
         const messageId   = event.message.mid;
 
         const channel = findChannelByRecipientId(recipientId);
         if (!channel) continue;
 
         const imageRefs = extractImageRefs({ channel: channel.type, event });
+        const audioRefs = extractAudioRefs({ channel: channel.type, event });
+
+        // Transcribe FB/IG voice notes. CDN URLs are publicly fetchable
+        // so no access token needed for the audio download itself.
+        let messageText;
+        let voiceMeta = null;
+        if (hasText) {
+          messageText = event.message.text;
+        } else if (hasImageAtt) {
+          messageText = '(sent a photo)';
+        } else {
+          messageText = '(sent a voice note)';
+          if (audioRefs.length > 0) {
+            try {
+              const { transcript, provider, bytes } = await transcribeAudioRef(audioRefs[0], null);
+              messageText = transcript;
+              voiceMeta = { provider, bytes, durationApprox: null };
+              console.log(`🎙️  [voice] transcribed ${bytes}B ${channel.type} voice note via ${provider}: "${transcript.slice(0, 100)}"`);
+            } catch (e) {
+              console.warn(`[voice] ${channel.type} transcription failed: ${e.message}`);
+            }
+          }
+        }
 
         await handleIncomingChannelMessage({
           channel: channel.type, recipientId,
           senderId, senderName: senderId,
-          messageText, messageId, imageRefs,
+          messageText, messageId, imageRefs, voiceMeta,
         });
       }
     }
@@ -13988,7 +14035,7 @@ function trackChannelReply(ownerEmail, channel) {
   persistChannelStats();
 }
 
-async function handleIncomingChannelMessage({ channel, recipientId, senderId, senderName, messageText, messageId, imageRefs = [] }) {
+async function handleIncomingChannelMessage({ channel, recipientId, senderId, senderName, messageText, messageId, imageRefs = [], voiceMeta = null }) {
   // Dedup
   if (processedMetaMessages.has(messageId)) return;
   processedMetaMessages.add(messageId);
@@ -14182,8 +14229,15 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     ? (channelConfig?.accessToken || process.env.WA_ACCESS_TOKEN)
     : null;
 
+  // Voice-note hint: when transcription was used, tell Claude so it can
+  // acknowledge naturally ("Got your voice note...") rather than treating
+  // it as if the customer had typed it out.
+  const voiceContext = voiceMeta
+    ? `\n\nNOTE: this message arrived as a VOICE NOTE which Aria transcribed. The text above is the transcript. Feel free to start your reply with a brief natural acknowledgement (e.g. "Got your voice note —") before answering. Don't ask them to type it out, the transcript is what they meant.`
+    : '';
+
   const reply = await generateChannelReply(
-    systemPrompt + kbContext + ragContext + convContext + slotContext + returningContext + channelInstructions,
+    systemPrompt + kbContext + ragContext + convContext + slotContext + returningContext + channelInstructions + voiceContext,
     senderName, messageText,
     { allowedTopics, imageRefs, waAccessToken: waAccessTokenForMedia, ownerEmail, channel }
   );
