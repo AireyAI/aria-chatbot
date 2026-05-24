@@ -53,6 +53,7 @@ import { scheduleTask, cancelTask, listPending, bootstrapFromLedger, registerTas
 import { ltvScore, ltvTier } from './lib/customer_ltv.js';
 import { evaluateSchedule } from './lib/business_hours.js';
 import { dispatchWebhook, readWebhookLog, signPayload as signWebhookPayload } from './lib/webhook_dispatcher.js';
+import { extractImageRefs, resolveImageRefsToBlocks } from './lib/image_intake.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
@@ -13372,15 +13373,26 @@ async function processMetaWebhook(payload) {
       for (const change of entry.changes) {
         if (change.field === 'messages' && change.value?.messages) {
           for (const msg of change.value.messages) {
-            if (msg.type !== 'text') continue;
+            // Accept text OR image-shaped inbound. Caption travels on
+            // msg.image.caption when an image carries text; pure-image
+            // messages get a synthetic "(sent a photo)" so downstream
+            // logic still has *something* to anchor on.
+            const isText  = msg.type === 'text';
+            const isImage = msg.type === 'image';
+            if (!isText && !isImage) continue;
+
             const phoneNumberId = change.value.metadata?.phone_number_id;
-            const senderId = msg.from;
-            const senderName = change.value.contacts?.[0]?.profile?.name || senderId;
-            const messageText = msg.text?.body || '';
-            const messageId = msg.id;
+            const senderId      = msg.from;
+            const senderName    = change.value.contacts?.[0]?.profile?.name || senderId;
+            const messageText   = isText
+              ? (msg.text?.body || '')
+              : (msg.image?.caption || '(sent a photo)');
+            const messageId     = msg.id;
+            const imageRefs     = extractImageRefs({ channel: 'whatsapp', msg });
+
             await handleIncomingChannelMessage({
               channel: 'whatsapp', recipientId: phoneNumberId,
-              senderId, senderName, messageText, messageId,
+              senderId, senderName, messageText, messageId, imageRefs,
             });
           }
         }
@@ -13390,19 +13402,28 @@ async function processMetaWebhook(payload) {
     // Instagram & Facebook Messenger messages
     if (entry.messaging) {
       for (const event of entry.messaging) {
-        if (!event.message?.text) continue;
+        // Allow text OR image-only attachment messages. IG stories / quick
+        // replies still arrive without text — gate on "any meaningful content".
+        const hasText        = !!event.message?.text;
+        const hasImageAtt    = (event.message?.attachments || []).some(a => a.type === 'image');
+        if (!hasText && !hasImageAtt) continue;
+
         const recipientId = event.recipient?.id;
-        const senderId = event.sender?.id;
-        const messageText = event.message.text;
-        const messageId = event.message.mid;
+        const senderId    = event.sender?.id;
+        const messageText = hasText
+          ? event.message.text
+          : '(sent a photo)';
+        const messageId   = event.message.mid;
 
         const channel = findChannelByRecipientId(recipientId);
         if (!channel) continue;
 
+        const imageRefs = extractImageRefs({ channel: channel.type, event });
+
         await handleIncomingChannelMessage({
           channel: channel.type, recipientId,
           senderId, senderName: senderId,
-          messageText, messageId,
+          messageText, messageId, imageRefs,
         });
       }
     }
@@ -13436,14 +13457,38 @@ async function callClaudeWithFallback(payload) {
 }
 
 async function generateChannelReply(systemPrompt, senderName, messageText, opts = {}) {
-  const { allowedTopics } = opts;
+  const { allowedTopics, imageRefs = [], waAccessToken, ownerEmail, channel } = opts;
   const scopeRule = allowedTopics?.length
     ? `\n- SCOPE: this business only handles ${allowedTopics.join(', ')}. If the message is clearly OFF these topics (e.g. asking for legal/medical advice, asking about a different industry), set outOfScope=true and politely redirect in your text reply (say what you can help with, suggest they contact the relevant expert elsewhere). Common related questions still count as in-scope.`
     : '';
-  try {
-    const r = await callClaudeWithFallback({
-      max_tokens: 600,
-      messages: [{ role: 'user', content: `You received this message from ${senderName}:
+
+  // Resolve incoming images (if any) into Anthropic content blocks.
+  // Silent fallback policy: if image load fails we keep going with text only
+  // — see image_intake.js for rationale. Errors get logged for admin visibility.
+  let imageBlocks = [];
+  if (imageRefs.length > 0) {
+    try {
+      const { blocks, errors } = await resolveImageRefsToBlocks(imageRefs, waAccessToken);
+      imageBlocks = blocks;
+      if (errors.length) {
+        console.warn(`[vision] ${errors.length}/${imageRefs.length} image(s) failed to load for ${ownerEmail || 'unknown'} on ${channel || '?'}: ${errors.map(e => e.error).join('; ')}`);
+      }
+      if (blocks.length) {
+        console.log(`👁️  [vision] resolved ${blocks.length} image(s) for Claude on ${channel || '?'} for ${ownerEmail || 'unknown'}`);
+      }
+    } catch (e) {
+      console.warn('[vision] image resolution threw:', e.message);
+    }
+  }
+
+  const visionRule = imageBlocks.length > 0
+    ? `\n- IMAGES: the customer attached ${imageBlocks.length} image(s) above. LOOK at them and incorporate what you see into your reply — describe relevant details (e.g. "I can see the leak under your sink", "that's a lovely Beagle"), then answer their question or guide them to next steps. Never say "I can't see images" — you can.`
+    : '';
+
+  // Build content array. When images are present we use the multimodal shape
+  // (array of blocks); when not, we keep the original string form for zero-
+  // overhead text-only path.
+  const textBlock = `You received this message from ${senderName}:
 
 "${messageText}"
 
@@ -13476,7 +13521,19 @@ Rules:
 - needsHuman: true ONLY when the user explicitly asks for a human/manager OR you genuinely cannot help (refund disputes, complex billing, complaints about specific staff). Set handoffReason concisely. Don't escalate easy stuff.
 - suggestedReplies: 2-3 SHORT (≤20 chars each) tappable button options that match likely next actions for this customer. Examples: ["Get a quote", "Book a call", "See examples"]. Leave [] if no obvious next step (e.g. complaint, off-topic, post-handoff). Never include "Talk to a human" if you've already set needsHuman=true.
 - language: detect the customer's language (ISO-639-1 code: "en", "es", "fr", "de", etc.) and WRITE YOUR REPLY TEXT IN THE SAME LANGUAGE. If they switch mid-conversation, follow them. Default to English when unclear.
-- showServicesCarousel: true ONLY when the customer asks "what do you do/offer", "what services", "show me your products", "what can I get from you" etc. Keep your text reply short ("Here's what we offer:") because a swipeable card carousel will be sent right after. false otherwise.${scopeRule}` }],
+- showServicesCarousel: true ONLY when the customer asks "what do you do/offer", "what services", "show me your products", "what can I get from you" etc. Keep your text reply short ("Here's what we offer:") because a swipeable card carousel will be sent right after. false otherwise.${scopeRule}${visionRule}`;
+
+    // Multimodal: image blocks come FIRST (Anthropic recommends image-before-text
+    // ordering for best comprehension), text block last. Pure-text path keeps
+    // the simpler string content shape.
+    const userContent = imageBlocks.length > 0
+      ? [...imageBlocks, { type: 'text', text: textBlock }]
+      : textBlock;
+
+  try {
+    const r = await callClaudeWithFallback({
+      max_tokens: 600,
+      messages: [{ role: 'user', content: userContent }],
       system: systemPrompt,
     });
     const text = r.content[0]?.text || '';
@@ -13931,7 +13988,7 @@ function trackChannelReply(ownerEmail, channel) {
   persistChannelStats();
 }
 
-async function handleIncomingChannelMessage({ channel, recipientId, senderId, senderName, messageText, messageId }) {
+async function handleIncomingChannelMessage({ channel, recipientId, senderId, senderName, messageText, messageId, imageRefs = [] }) {
   // Dedup
   if (processedMetaMessages.has(messageId)) return;
   processedMetaMessages.add(messageId);
@@ -14118,11 +14175,17 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
   // Show "typing…" so the customer knows Aria is composing (institutional UX)
   sendTypingIndicator(channel, ownerChannels[channel], senderId, true);
 
-  // Generate reply (with scope guardrail + slot + returning + RAG context)
+  // Generate reply (with scope guardrail + slot + returning + RAG context + images)
+  // For WhatsApp images we need the WA access token to resolve media_id →
+  // base64 server-side. FB/IG images are publicly-fetchable Meta CDN URLs.
+  const waAccessTokenForMedia = channel === 'whatsapp'
+    ? (channelConfig?.accessToken || process.env.WA_ACCESS_TOKEN)
+    : null;
+
   const reply = await generateChannelReply(
     systemPrompt + kbContext + ragContext + convContext + slotContext + returningContext + channelInstructions,
     senderName, messageText,
-    { allowedTopics }
+    { allowedTopics, imageRefs, waAccessToken: waAccessTokenForMedia, ownerEmail, channel }
   );
 
   // Stop typing whether we got a reply or not
