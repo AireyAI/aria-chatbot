@@ -9853,6 +9853,90 @@ app.get('/api/admin/usage', (req, res) => {
   res.json({ rows, totalUsedToday: rows.reduce((s, r) => s + r.usedToday, 0) });
 });
 
+// GET /api/dashboard/activity — unified feed of recent events for the
+// dashboard's Activity panel. Aggregates from multiple sources (channel
+// leads, bookings, escalations, CSAT) and returns last N events sorted
+// newest-first. One endpoint = one render in the UI.
+app.get('/api/dashboard/activity', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const limit = Math.min(50, parseInt(req.query.limit) || 20);
+  const events = [];
+
+  // Recent channel leads (last ~200 lines of ledger, filtered to owner)
+  try {
+    if (existsSync(CHANNEL_LEADS_FILE)) {
+      const lines = readFileSync(CHANNEL_LEADS_FILE, 'utf8').split('\n').filter(Boolean).slice(-500);
+      for (const l of lines) {
+        try {
+          const e = JSON.parse(l);
+          if (e.ownerEmail !== owner) continue;
+          events.push({
+            type: 'lead',
+            ts: e.ts,
+            channel: e.channel,
+            label: `${e.leadScore?.toUpperCase()} lead from ${e.senderName || e.senderId}`,
+            detail: e.messagePreview?.slice(0, 100),
+            score: e.leadScore,
+            category: e.category,
+          });
+        } catch {}
+      }
+    }
+  } catch {}
+
+  // Bookings — filter to owner
+  for (const b of bookings.slice(-100)) {
+    if (b.ownerEmail !== owner) continue;
+    events.push({
+      type: 'booking',
+      ts: b.ts || b.date,
+      channel: b.channel || 'email',
+      label: `Booking: ${b.name || 'anon'}`,
+      detail: b.datetime || b.notes || '',
+    });
+  }
+
+  // Escalations / paused conversations
+  for (const [memKey, st] of conversationState) {
+    if (!memKey.startsWith(owner + '::')) continue;
+    if (st.paused && st.escalatedAt) {
+      const [, ch, senderId] = memKey.split('::');
+      events.push({
+        type: 'handoff',
+        ts: st.escalatedAt,
+        channel: ch,
+        label: `Handed off to you — ${senderId}`,
+        detail: st.reason || 'human requested',
+      });
+    }
+  }
+
+  // Recent CSAT ratings
+  try {
+    if (existsSync(CSAT_FILE)) {
+      const lines = readFileSync(CSAT_FILE, 'utf8').split('\n').filter(Boolean).slice(-200);
+      for (const l of lines) {
+        try {
+          const e = JSON.parse(l);
+          if (e.ownerEmail !== owner) continue;
+          events.push({
+            type: 'csat',
+            ts: e.ts,
+            channel: e.channel,
+            label: `${e.rating === 'positive' ? '👍' : '👎'} rating from ${e.senderName || e.senderId}`,
+            detail: e.raw?.slice(0, 80),
+            rating: e.rating,
+          });
+        } catch {}
+      }
+    }
+  } catch {}
+
+  events.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+  res.json({ events: events.slice(0, limit) });
+});
+
 // GET /api/dashboard/escalations — list paused (handed-off) conversations
 app.get('/api/dashboard/escalations', (req, res) => {
   const owner = requireDashboardAuth(req, res);
@@ -10185,6 +10269,43 @@ a{color:#00e5a0;text-decoration:none;}
 .topbar .logo em{font-style:normal;color:#00e5a0;}
 .topbar .right{display:flex;align-items:center;gap:12px;}
 .email-badge{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:4px 12px;font-size:12px;color:#ccc;font-weight:500;}
+/* Hero status */
+.hero{background:linear-gradient(135deg,#161630 0%,#1a1a40 100%);border:1px solid rgba(255,255,255,0.08);border-radius:18px;padding:24px;margin-bottom:18px;display:grid;grid-template-columns:auto 1fr auto;gap:24px;align-items:center;}
+.hero-status{display:flex;align-items:center;gap:14px;}
+.hero-dot{width:14px;height:14px;border-radius:50%;background:#00e5a0;box-shadow:0 0 12px rgba(0,229,160,0.6);animation:pulse 2.5s ease-in-out infinite;}
+.hero-dot.off{background:#ff6b6b;box-shadow:0 0 12px rgba(255,80,80,0.5);animation:none;}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+.hero-title{font-size:18px;font-weight:700;color:#fff;line-height:1.2;}
+.hero-sub{font-size:12px;color:#9898b8;margin-top:3px;}
+.hero-metrics{display:flex;gap:28px;}
+.hero-metric{text-align:center;}
+.hero-metric .v{font-size:24px;font-weight:800;color:#00e5a0;line-height:1;}
+.hero-metric .l{font-size:10.5px;color:#8888aa;margin-top:4px;text-transform:uppercase;letter-spacing:0.6px;}
+.hero-actions{display:flex;flex-direction:column;gap:6px;align-items:flex-end;}
+.hero-toggle-row{display:flex;align-items:center;gap:8px;font-size:12px;color:#ccc;}
+/* Channel chip strip */
+.channel-strip{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px;}
+.channel-chip{display:flex;align-items:center;gap:8px;background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:24px;padding:8px 14px;font-size:13px;color:#ccc;cursor:pointer;transition:all 0.15s;}
+.channel-chip:hover{border-color:rgba(255,255,255,0.2);}
+.channel-chip .chip-dot{width:8px;height:8px;border-radius:50%;background:#6b6b8a;}
+.channel-chip.on .chip-dot{background:#00e5a0;box-shadow:0 0 8px rgba(0,229,160,0.5);}
+.channel-chip.off .chip-dot{background:#ff6b6b;}
+.channel-chip.disconnected{opacity:0.45;}
+/* Activity feed */
+.activity-feed{background:#161630;border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:18px;margin-bottom:18px;}
+.activity-feed h3{font-size:13px;color:#9898b8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:14px;font-weight:600;}
+.activity-row{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:13px;}
+.activity-row:last-child{border-bottom:none;}
+.activity-icon{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0;}
+.activity-icon.lead{background:rgba(0,229,160,0.12);}
+.activity-icon.booking{background:rgba(56,189,248,0.12);}
+.activity-icon.handoff{background:rgba(251,191,36,0.12);}
+.activity-icon.csat{background:rgba(155,89,182,0.12);}
+.activity-meta{flex:1;min-width:0;}
+.activity-label{color:#eee;font-weight:500;}
+.activity-detail{color:#8888aa;font-size:11.5px;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.activity-time{font-size:11px;color:#6b6b8a;flex-shrink:0;}
+.activity-channel{font-size:10px;background:rgba(255,255,255,0.06);color:#9898b8;padding:1px 7px;border-radius:10px;text-transform:capitalize;}
 .btn-logout{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 14px;font-size:12px;color:#ff6b6b;cursor:pointer;font-family:inherit;font-weight:500;}
 .btn-logout:hover{background:rgba(255,80,80,0.1);}
 .container{max-width:960px;margin:0 auto;padding:24px 16px 60px;}
@@ -10262,28 +10383,59 @@ tr:last-child td{border-bottom:none;}
 </div>
 
 <div class="container">
-  <!-- Stats Row -->
+
+  <!-- Escalations banner (only when present) -->
   <div id="escalations-banner" style="display:none;"></div>
+
+  <!-- HERO STATUS BAR -->
+  <div class="hero" id="hero-status">
+    <div class="hero-status">
+      <div class="hero-dot" id="hero-dot"></div>
+      <div>
+        <div class="hero-title" id="hero-title">Aria is loading…</div>
+        <div class="hero-sub" id="hero-sub">—</div>
+      </div>
+    </div>
+    <div class="hero-metrics" id="hero-metrics">
+      <div class="hero-metric"><div class="v">—</div><div class="l">Today</div></div>
+    </div>
+    <div class="hero-actions" id="hero-actions"></div>
+  </div>
+
+  <!-- CHANNEL CHIPS (always visible, one row, on/off per channel) -->
+  <div class="channel-strip" id="channel-strip">
+    <div style="font-size:12px;color:#6b6b8a;">Loading channels…</div>
+  </div>
+
+  <!-- ACTIVITY FEED -->
+  <div class="activity-feed">
+    <h3>🕐 Recent Activity</h3>
+    <div id="activity-list"><div class="empty" style="padding:14px 0">Loading…</div></div>
+  </div>
+
+  <!-- STATS GRID (compact, secondary) -->
   <div class="stats-row" id="stats-row">
     <div class="stat-card"><div class="value">—</div><div class="label">Loading...</div></div>
   </div>
 
-  <!-- Gmail Settings Card -->
-  <div class="gmail-card">
-    <p>Manage your email auto-replies, connection, and advanced settings</p>
-    <a class="gmail-link" href="/connect/gmail?owner=\${encodeURIComponent(OWNER)}&s=\${encodeURIComponent(TOKEN)}">
-      <svg viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
-      Gmail Settings
-    </a>
-  </div>
+  <!-- DRILL-DOWN SECTIONS -->
 
-  <!-- Inbox Log -->
-  <div class="section" id="sec-inbox">
-    <div class="section-header" onclick="toggleSection('inbox')">
-      <h3>&#x1F4E7; Inbox Log</h3>
+  <!-- Conversations — merged inbox log + channel messages -->
+  <div class="section" id="sec-conversations">
+    <div class="section-header" onclick="toggleSection('conversations')">
+      <h3>&#x1F4AC; Conversations</h3>
       <span class="arrow">&#x25B6;</span>
     </div>
-    <div class="section-body" id="body-inbox"><div class="empty">Loading...</div></div>
+    <div class="section-body" id="body-conversations">
+      <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
+        <button onclick="loadUnifiedConvs('all')" class="conv-filter active" data-filter="all" style="background:rgba(0,229,160,0.15);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">All</button>
+        <button onclick="loadUnifiedConvs('email')" class="conv-filter" data-filter="email" style="background:rgba(255,255,255,0.06);color:#ccc;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">📧 Email</button>
+        <button onclick="loadUnifiedConvs('facebook')" class="conv-filter" data-filter="facebook" style="background:rgba(255,255,255,0.06);color:#ccc;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">📘 Messenger</button>
+        <button onclick="loadUnifiedConvs('instagram')" class="conv-filter" data-filter="instagram" style="background:rgba(255,255,255,0.06);color:#ccc;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">📷 Instagram</button>
+        <button onclick="loadUnifiedConvs('whatsapp')" class="conv-filter" data-filter="whatsapp" style="background:rgba(255,255,255,0.06);color:#ccc;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">💬 WhatsApp</button>
+      </div>
+      <div id="conversations-list"><div class="empty">Loading...</div></div>
+    </div>
   </div>
 
   <!-- Leads -->
@@ -10304,32 +10456,24 @@ tr:last-child td{border-bottom:none;}
     <div class="section-body" id="body-bookings"><div class="empty">Loading...</div></div>
   </div>
 
-  <!-- Business Profile -->
-  <div class="section" id="sec-profile">
-    <div class="section-header" onclick="toggleSection('profile')">
-      <h3>&#x1F3E2; Business Profile</h3>
+  <!-- Train Aria (new — KB + Knowledge docs + Services + Scope) -->
+  <div class="section" id="sec-train">
+    <div class="section-header" onclick="toggleSection('train')">
+      <h3>&#x1F9E0; Train Aria</h3>
       <span class="arrow">&#x25B6;</span>
     </div>
-    <div class="section-body" id="body-profile"><div class="empty">Loading...</div></div>
+    <div class="section-body" id="body-train"><div class="empty">Loading...</div></div>
   </div>
 
-  <!-- Settings -->
-  <div class="section" id="sec-settings">
-    <div class="section-header" onclick="toggleSection('settings')">
-      <h3>&#x2699;&#xFE0F; Settings</h3>
-      <span class="arrow">&#x25B6;</span>
-    </div>
-    <div class="section-body" id="body-settings"><div class="empty">Loading...</div></div>
-  </div>
-
+  <!-- Channels (now a deeper drill-down — chips up top handle quick toggle) -->
   <div class="section" id="sec-channels">
     <div class="section-header" onclick="toggleSection('channels')">
-      <h3>&#x1F4F1; Channels</h3>
+      <h3>&#x1F517; Manage Channels</h3>
       <span class="arrow">&#x25B6;</span>
     </div>
     <div class="section-body" id="body-channels">
-      <div style="padding:16px 20px;">
-        <p style="font-size:13px;color:#9898b8;margin-bottom:16px;">Connect your social accounts so Aria can auto-reply to messages.</p>
+      <div style="padding:8px 0;">
+        <p style="font-size:13px;color:#9898b8;margin-bottom:16px;">Connect more social accounts or reconnect existing ones.</p>
 
         <a href="/connect/meta?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}" id="meta-connect-btn" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:13px;background:#1877F2;color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;margin-bottom:10px;">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg>
@@ -10341,28 +10485,35 @@ tr:last-child td{border-bottom:none;}
           <span>Connect Instagram (DMs)</span>
         </a>
 
+        <a class="gmail-link" href="/connect/gmail?owner=\${encodeURIComponent(OWNER)}&s=\${encodeURIComponent(TOKEN)}" style="margin-top:0;margin-bottom:20px;">
+          <svg viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+          Connect Gmail (Inbox + Auto-reply)
+        </a>
+
         <div id="channel-cards" style="display:flex;flex-direction:column;gap:12px;"></div>
       </div>
     </div>
   </div>
-</div>
 
-  <!-- Channel Messages -->
-  <div class="section" id="sec-messages">
-    <div class="section-header" onclick="toggleSection('messages')">
-      <h3>&#x1F4AC; Messages</h3>
+  <!-- Business Profile -->
+  <div class="section" id="sec-profile">
+    <div class="section-header" onclick="toggleSection('profile')">
+      <h3>&#x1F3E2; Business Profile</h3>
       <span class="arrow">&#x25B6;</span>
     </div>
-    <div class="section-body" id="body-messages">
-      <div style="display:flex;gap:8px;margin-bottom:12px;">
-        <button onclick="loadMessages(1,'all')" class="msg-filter active" style="background:rgba(0,229,160,0.15);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">All</button>
-        <button onclick="loadMessages(1,'whatsapp')" class="msg-filter" style="background:rgba(255,255,255,0.06);color:#ccc;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">WhatsApp</button>
-        <button onclick="loadMessages(1,'instagram')" class="msg-filter" style="background:rgba(255,255,255,0.06);color:#ccc;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">Instagram</button>
-        <button onclick="loadMessages(1,'facebook')" class="msg-filter" style="background:rgba(255,255,255,0.06);color:#ccc;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">Messenger</button>
-      </div>
-      <div id="messages-list"><div class="empty">Loading...</div></div>
-    </div>
+    <div class="section-body" id="body-profile"><div class="empty">Loading...</div></div>
   </div>
+
+  <!-- Settings (small at bottom) -->
+  <div class="section" id="sec-settings">
+    <div class="section-header" onclick="toggleSection('settings')">
+      <h3>&#x2699;&#xFE0F; Settings</h3>
+      <span class="arrow">&#x25B6;</span>
+    </div>
+    <div class="section-body" id="body-settings"><div class="empty">Loading...</div></div>
+  </div>
+
+</div>
 
 <div class="toast" id="toast"></div>
 
@@ -10404,7 +10555,7 @@ function timeAgo(dateStr) {
 
 function escH(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
-// Load stats immediately
+// Load stats + hero + chips + activity immediately
 async function loadStats() {
   try {
     const [d, ch] = await Promise.all([
@@ -10412,38 +10563,102 @@ async function loadStats() {
       api('/api/dashboard/channel-stats'),
     ]);
     const chTotal = ch.stats?.total || 0;
-    const connected = ['whatsapp','instagram','facebook'].filter(c => ch.channels?.[c]?.accessToken).length;
+    const channels = ch.channels || {};
     const csat = d.csat || { total: 0, scorePct: null };
+
+    // ─── HERO STATUS ───────────────────────────────────────────────────
+    // Aria's overall status: ON if any auto-reply channel is enabled, OFF otherwise
+    const anyChannelOn = ['facebook','instagram','whatsapp'].some(c => channels[c]?.enabled);
+    const anyChannelConnected = ['facebook','instagram','whatsapp'].some(c => channels[c]?.accessToken);
+    const isLive = d.autoReplyEnabled || anyChannelOn;
+    const lastActivity = chTotal ? (channels.facebook?.lastReply || channels.instagram?.lastReply || channels.whatsapp?.lastReply) : null;
+    const heroDot = document.getElementById('hero-dot');
+    heroDot.classList.toggle('off', !isLive);
+    document.getElementById('hero-title').textContent = isLive ? 'Aria is working for you' : 'Aria is paused';
+    document.getElementById('hero-sub').textContent = lastActivity
+      ? 'Last reply ' + timeAgo(lastActivity)
+      : (anyChannelConnected ? 'Waiting for the first message…' : 'No channels connected yet — scroll down to connect one');
+    document.getElementById('hero-metrics').innerHTML =
+      '<div class="hero-metric"><div class="v">' + chTotal + '</div><div class="l">Replies</div></div>' +
+      '<div class="hero-metric"><div class="v">' + d.leads.total + '</div><div class="l">Leads</div></div>' +
+      '<div class="hero-metric"><div class="v">' + d.bookings.total + '</div><div class="l">Bookings</div></div>' +
+      (csat.scorePct != null ? '<div class="hero-metric"><div class="v" style="color:' + (csat.scorePct >= 80 ? '#00e5a0' : csat.scorePct >= 50 ? '#fbbf24' : '#ff6b6b') + '">' + csat.scorePct + '%</div><div class="l">CSAT</div></div>' : '');
+    // Hero actions: master pause/resume (visual only — channel-toggle is per-channel via chips)
+    document.getElementById('hero-actions').innerHTML =
+      '<div style="font-size:11px;color:#6b6b8a;">' + d.emailsReplied.week + ' emails / ' + d.bookings.week + ' bookings this week</div>';
+
+    // ─── CHANNEL CHIPS ─────────────────────────────────────────────────
+    const channelDefs = [
+      { key: 'facebook', name: 'Messenger', icon: '📘' },
+      { key: 'instagram', name: 'Instagram', icon: '📷' },
+      { key: 'whatsapp', name: 'WhatsApp', icon: '💬' },
+      { key: 'email', name: 'Email', icon: '📧' },
+    ];
+    const stripEl = document.getElementById('channel-strip');
+    stripEl.innerHTML = channelDefs.map(def => {
+      let connected, enabled, label;
+      if (def.key === 'email') {
+        connected = d.gmailConnected;
+        enabled = d.autoReplyEnabled;
+        label = connected ? (enabled ? 'On' : 'Paused') : 'Not connected';
+      } else {
+        const ch = channels[def.key];
+        connected = !!ch?.accessToken;
+        enabled = !!ch?.enabled;
+        label = connected ? (enabled ? 'On' : 'Paused') : 'Not connected';
+      }
+      const cls = connected ? (enabled ? 'on' : 'off') : 'disconnected';
+      const action = connected
+        ? (def.key === 'email' ? 'toggleSetting("autoReplyEnabled",' + !enabled + ')' : 'toggleChannel("' + def.key + '",' + !enabled + ')')
+        : 'toggleSection("channels")';
+      return '<div class="channel-chip ' + cls + '" onclick=\\'' + action + '\\'>' +
+        '<div class="chip-dot"></div>' +
+        '<span>' + def.icon + ' ' + def.name + '</span>' +
+        '<span style="font-size:11px;color:#8888aa;">' + label + '</span>' +
+      '</div>';
+    }).join('');
+
+    // ─── ACTIVITY FEED ─────────────────────────────────────────────────
+    try {
+      const act = await api('/api/dashboard/activity?limit=12');
+      const list = document.getElementById('activity-list');
+      if (!act.events?.length) {
+        list.innerHTML = '<div class="empty" style="padding:14px 0">Nothing here yet — once Aria starts handling messages, recent activity will show up here.</div>';
+      } else {
+        const iconFor = (t) => ({ lead: '🎯', booking: '📅', handoff: '🤝', csat: '⭐' }[t] || '•');
+        list.innerHTML = act.events.map(e => {
+          return '<div class="activity-row">' +
+            '<div class="activity-icon ' + e.type + '">' + iconFor(e.type) + '</div>' +
+            '<div class="activity-meta">' +
+              '<div class="activity-label">' + escH(e.label || '') + '</div>' +
+              (e.detail ? '<div class="activity-detail">' + escH(e.detail) + '</div>' : '') +
+            '</div>' +
+            (e.channel ? '<div class="activity-channel">' + escH(e.channel) + '</div>' : '') +
+            '<div class="activity-time">' + timeAgo(e.ts) + '</div>' +
+          '</div>';
+        }).join('');
+      }
+    } catch {}
+
+    // ─── COMPACT STATS GRID (secondary, breakdowns) ────────────────────
     document.getElementById('stats-row').innerHTML = \`
       <div class="stat-card">
-        <div class="value">\${d.emailsReplied.total}</div>
-        <div class="label">Emails Replied</div>
-        <div class="sub">\${d.emailsReplied.week} this week</div>
+        <div class="value" style="color:#ff6b6b">\${d.leads.hot}</div>
+        <div class="label">Hot Leads</div>
+        <div class="sub">last 30 days</div>
       </div>
       <div class="stat-card">
-        <div class="value">\${chTotal}</div>
-        <div class="label">Messages Replied</div>
-        <div class="sub">across \${connected} channel\${connected !== 1 ? 's' : ''}</div>
+        <div class="value" style="color:#fbbf24">\${d.leads.warm}</div>
+        <div class="label">Warm Leads</div>
+        <div class="sub">last 30 days</div>
       </div>
       <div class="stat-card">
-        <div class="value">\${d.leads.total}</div>
-        <div class="label">Leads</div>
-        <div class="sub">\${d.leads.hot} hot, \${d.leads.warm} warm</div>
+        <div class="value">\${d.bookings.week}</div>
+        <div class="label">Bookings This Week</div>
       </div>
       <div class="stat-card">
-        <div class="value">\${d.bookings.total}</div>
-        <div class="label">Bookings</div>
-        <div class="sub">\${d.bookings.week} this week</div>
-      </div>
-      <div class="stat-card">
-        <div class="value" style="color:\${csat.scorePct == null ? '#6b6b8a' : csat.scorePct >= 80 ? '#00e5a0' : csat.scorePct >= 50 ? '#fbbf24' : '#ff6b6b'}">\${csat.scorePct == null ? '—' : csat.scorePct + '%'}</div>
-        <div class="label">CSAT</div>
-        <div class="sub">\${csat.total} ratings, 90d</div>
-      </div>
-      <div class="stat-card \${d.autoReplyEnabled ? 'status-on' : 'status-off'}">
-        <div class="value">\${d.autoReplyEnabled ? 'ON' : 'OFF'}</div>
-        <div class="label">Auto-Reply</div>
-        <div class="sub">\${d.gmailConnected ? '<span class="badge-on">Gmail connected</span>' : '<span class="badge-off">Gmail not connected</span>'}</div>
+        <div class="value">\${d.emailsReplied.week}</div>
+        <div class="label">Emails This Week</div>
       </div>
     \`;
     // Escalations banner — if any conv is paused waiting for owner takeover
@@ -10479,12 +10694,12 @@ if (!localStorage.getItem('_aria_tutorial_done')) {
   overlay.id = 'tutorial-overlay';
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;';
   const steps = [
-    { title: 'Welcome to your Aria Dashboard! 👋', text: 'This is your control centre. Everything Aria does — emails replied, leads captured, bookings made — shows up here.' },
-    { title: 'Status Cards 📊', text: 'At the top you can see your key stats at a glance. Emails replied, leads captured, bookings made, and whether auto-reply is on or off.' },
-    { title: 'Inbox Log 📧', text: 'Click "Inbox Log" to see every email Aria has replied to. You can see what she said, check it was right, and filter by date.' },
-    { title: 'Settings ⚙️', text: 'Toggle auto-reply on/off, enable approval mode (review before sending), and manage follow-ups. You are in control.' },
-    { title: 'Channels 📡', text: 'Connect WhatsApp, Instagram, SMS, and Facebook so Aria can manage all your messages from one place.' },
-    { title: 'You\\'re all set! 🎉', text: 'Aria is working for you 24/7. Any questions? Just reply to any email from Aria and Kyle will help you out.' },
+    { title: 'Welcome to Aria 👋', text: 'Aria is your 24/7 AI receptionist. She replies to messages and emails in your voice — across Facebook, Instagram, WhatsApp, and Gmail.' },
+    { title: 'The green dot 🟢', text: 'At the top of the dashboard, a green pulsing dot means Aria is live and replying. Red means she is paused — flip channel chips to control her.' },
+    { title: 'Channels — tap to pause 📡', text: 'The chips under the hero show every channel. Tap one to pause/resume Aria on just that channel. Need to add a new one? Open the "Manage Channels" section.' },
+    { title: 'Activity feed 🕐', text: 'The Recent Activity feed shows what Aria has been up to — new leads, bookings, handoffs, and customer ratings. Hot leads are 🎯, bookings are 📅, takeovers are 🤝.' },
+    { title: 'Train Aria 🧠', text: 'Open the "Train Aria" section to upload knowledge documents, set up a services carousel, and tell Aria what topics she should + should not handle.' },
+    { title: 'You\\'re set 🎉', text: 'Aria is ready. If anything ever needs your attention, you\\'ll see a banner at the top of the dashboard AND get an email.' },
   ];
   let stepIdx = 0;
   function showTutorialStep() {
@@ -10516,12 +10731,90 @@ function toggleSection(name) {
 }
 
 async function loadSection(name) {
-  if (name === 'inbox') await loadInbox(1);
-  else if (name === 'leads') await loadLeads();
+  if (name === 'leads') await loadLeads();
   else if (name === 'bookings') await loadBookings();
   else if (name === 'profile') await loadProfile();
   else if (name === 'settings') await loadSettings();
-  else if (name === 'messages') await loadMessages(1, 'all');
+  else if (name === 'conversations') await loadUnifiedConvs('all');
+  else if (name === 'train') await loadTrainAria();
+}
+
+// Quick-toggle helper used by channel chips for email auto-reply
+async function toggleSetting(key, value) {
+  try {
+    const body = { owner: OWNER };
+    body[key] = value;
+    const r = await apiPost('/api/dashboard/settings', body);
+    if (r.ok) { toast(value ? 'Auto-reply ON' : 'Auto-reply paused'); loadStats(); }
+  } catch (e) { toast('Failed to toggle'); }
+}
+
+// ─── Unified Conversations ─────────────────────────────────────────────
+let convFilter = 'all';
+async function loadUnifiedConvs(filter) {
+  convFilter = filter || 'all';
+  // Update filter button styles
+  document.querySelectorAll('.conv-filter').forEach(btn => {
+    const isActive = btn.dataset.filter === convFilter;
+    btn.classList.toggle('active', isActive);
+    btn.style.background = isActive ? 'rgba(0,229,160,0.15)' : 'rgba(255,255,255,0.06)';
+    btn.style.color = isActive ? '#00e5a0' : '#ccc';
+    btn.style.borderColor = isActive ? 'rgba(0,229,160,0.3)' : 'rgba(255,255,255,0.1)';
+  });
+  const container = document.getElementById('conversations-list');
+  try {
+    const items = [];
+    // Channel messages (FB/IG/WA)
+    if (convFilter === 'all' || convFilter === 'facebook' || convFilter === 'instagram' || convFilter === 'whatsapp') {
+      const chFilter = convFilter === 'all' ? 'all' : convFilter;
+      const d = await api('/api/dashboard/messages?channel=' + chFilter + '&page=1');
+      for (const m of (d.items || [])) {
+        items.push({
+          channel: m.channel, from: m.senderName || m.senderId,
+          msg: m.message, reply: m.reply, ts: m.timestamp,
+        });
+      }
+    }
+    // Email inbox
+    if (convFilter === 'all' || convFilter === 'email') {
+      const d = await api('/api/dashboard/inbox-log?page=1');
+      for (const r of (d.items || [])) {
+        items.push({
+          channel: 'email', from: r.senderEmail, msg: r.subject,
+          reply: r.replyPreview, ts: r.sentAt,
+        });
+      }
+    }
+    items.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+    if (!items.length) {
+      container.innerHTML = '<div class="empty">No conversations yet on this channel.</div>';
+      return;
+    }
+    const icons = { email: '📧', facebook: '📘', instagram: '📷', whatsapp: '💬' };
+    let html = '<table><thead><tr><th></th><th>From</th><th>Message</th><th>Aria\\'s reply</th><th>When</th></tr></thead><tbody>';
+    for (const it of items.slice(0, 50)) {
+      html += '<tr>' +
+        '<td style="width:24px">' + (icons[it.channel] || '') + '</td>' +
+        '<td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH(it.from || '—') + '</td>' +
+        '<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH((it.msg || '').substring(0, 100)) + '</td>' +
+        '<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH((it.reply || '').substring(0, 100)) + '</td>' +
+        '<td style="width:80px;font-size:11.5px;color:#8888aa">' + timeAgo(it.ts) + '</td>' +
+      '</tr>';
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  } catch (e) { container.innerHTML = '<div class="empty">Failed to load conversations.</div>'; }
+}
+
+// ─── Train Aria (KB + Knowledge docs + Services + Scope) — Phase 2 stub ──
+async function loadTrainAria() {
+  const body = document.getElementById('body-train');
+  body.innerHTML = '<div style="padding:8px 0;">' +
+    '<p style="font-size:13px;color:#9898b8;margin-bottom:14px;">Teach Aria your business — answers, documents, services, and what topics she should + shouldn\\'t handle.</p>' +
+    '<div id="train-knowledge" style="margin-bottom:24px;"><h4 style="font-size:13px;color:#fff;margin-bottom:10px;">📚 Knowledge Documents</h4><div class="empty" style="padding:14px 0">Coming next — upload PDFs or paste your service docs so Aria can cite them.</div></div>' +
+    '<div id="train-services" style="margin-bottom:24px;"><h4 style="font-size:13px;color:#fff;margin-bottom:10px;">🎠 Services Carousel</h4><div class="empty" style="padding:14px 0">Coming next — define the services Aria shows in a swipeable carousel when customers ask "what do you offer".</div></div>' +
+    '<div id="train-scope" style="margin-bottom:24px;"><h4 style="font-size:13px;color:#fff;margin-bottom:10px;">🚦 Topic Scope</h4><div class="empty" style="padding:14px 0">Coming next — tell Aria what topics she SHOULD answer (everything else gets a polite redirect).</div></div>' +
+  '</div>';
 }
 
 let inboxPage = 1;
