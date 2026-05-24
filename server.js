@@ -686,7 +686,10 @@ const channelMessages = new Map();      // ownerEmail → [{ id, channel, sender
 const channelStats = new Map();         // ownerEmail → { whatsapp: { replied, week, lastReply }, instagram: {...}, facebook: {...}, total }
 const metaTokens = new Map();           // ownerEmail → { userToken, userTokenExpiry, pages: [{ pageId, pageName, accessToken, igUserId, igUsername, wabaId, waPhoneNumberId, waDisplayPhone }] }
 const channelApprovals = new Map();     // approvalId → { ownerEmail, channel, senderId, senderName, draftReply, createdAt }
+const pendingQuotes = new Map();        // quoteId → { ownerEmail, channel, senderId, senderName, draft, originalQuestion, createdAt }
 const processedMetaMessages = new Set(); // dedup — message IDs already handled
+const QUOTES_LEDGER_FILE = resolve('data/quotes.jsonl');
+const PENDING_QUOTES_FILE = resolve('data/pending_quotes.json');
 
 function persistChannelMessages() {
   try {
@@ -722,6 +725,29 @@ function persistChannelApprovals() {
     for (const [k, v] of channelApprovals) obj[k] = v;
     writeFileSync(CHANNEL_APPROVALS_FILE, JSON.stringify(obj, null, 2));
   } catch (e) { console.warn('Failed to persist channel approvals:', e.message); }
+}
+
+function loadPendingQuotes() {
+  try {
+    if (existsSync(PENDING_QUOTES_FILE)) {
+      const saved = JSON.parse(readFileSync(PENDING_QUOTES_FILE, 'utf8'));
+      for (const [k, v] of Object.entries(saved)) pendingQuotes.set(k, v);
+    }
+  } catch (e) { console.warn('Failed to load pending quotes:', e.message); }
+}
+function persistPendingQuotes() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [k, v] of pendingQuotes) obj[k] = v;
+    writeFileSync(PENDING_QUOTES_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist pending quotes:', e.message); }
+}
+function appendQuoteLedger(entry) {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    appendFileSync(QUOTES_LEDGER_FILE, JSON.stringify(entry) + '\n');
+  } catch (e) { console.warn('[quote] ledger append failed:', e.message); }
 }
 
 function loadInvites() {
@@ -2222,6 +2248,9 @@ function save(name, data, delay = 500) {
       for (const [k, v] of Object.entries(saved)) channelApprovals.set(k, v);
     }
   } catch (e) { console.warn('Failed to load channel approvals:', e.message); }
+
+  // Pending quotes (owner approval queue for AI-drafted price quotes)
+  loadPendingQuotes();
 
   console.log(`📂 Loaded: ${savedFaqs.length} FAQs, ${savedBookings.length} bookings, ${savedProducts.length} products, ${savedDsOrders.length} dropship orders, ${usage.messages} msgs this month`);
 })();
@@ -13955,7 +13984,15 @@ Respond with valid JSON only:
   "suggestedReplies": ["Btn 1", "Btn 2", "Btn 3"] or [],
   "language": "en" | "es" | "fr" | "de" | "it" | "pt" | "nl" | "pl" | "ar" | "zh" | "ja" | "ko" | other ISO-639-1 code,
   "showServicesCarousel": true | false,
-  "bookingReminderResponse": "confirmed" | "reschedule" | "cancel" | null
+  "bookingReminderResponse": "confirmed" | "reschedule" | "cancel" | null,
+  "quoteIntent": true | false,
+  "quoteDraft": null or {
+    "lineItems": [{ "label": "what it covers", "price": 120, "qty": 1, "notes": "optional context" }],
+    "subtotal": 120,
+    "currency": "£" or "$" or "€",
+    "validityDays": 30,
+    "caveat": "Subject to on-site assessment. Final price may vary based on access, materials, scope changes."
+  }
 }
 
 Rules:
@@ -13973,7 +14010,9 @@ Rules:
 - suggestedReplies: 2-3 SHORT (≤20 chars each) tappable button options that match likely next actions for this customer. Examples: ["Get a quote", "Book a call", "See examples"]. Leave [] if no obvious next step (e.g. complaint, off-topic, post-handoff). Never include "Talk to a human" if you've already set needsHuman=true.
 - language: detect the customer's language (ISO-639-1 code: "en", "es", "fr", "de", etc.) and WRITE YOUR REPLY TEXT IN THE SAME LANGUAGE. If they switch mid-conversation, follow them. Default to English when unclear.
 - showServicesCarousel: true ONLY when the customer asks "what do you do/offer", "what services", "show me your products", "what can I get from you" etc. Keep your text reply short ("Here's what we offer:") because a swipeable card carousel will be sent right after. false otherwise.
-- bookingReminderResponse: ONLY set this if the conversation context mentions a recent booking reminder Aria sent (look for "REMINDER PENDING" note in the system prompt). Classify the customer's response: "confirmed" (yes / yep / sounds good / see you then / 👍), "reschedule" (need to move / different time / not that day / can we do another), "cancel" (need to cancel / can't make it / something came up). Set to null otherwise (no pending reminder, or this message isn't a response to one).${scopeRule}${visionRule}`;
+- bookingReminderResponse: ONLY set this if the conversation context mentions a recent booking reminder Aria sent (look for "REMINDER PENDING" note in the system prompt). Classify the customer's response: "confirmed" (yes / yep / sounds good / see you then / 👍), "reschedule" (need to move / different time / not that day / can we do another), "cancel" (need to cancel / can't make it / something came up). Set to null otherwise (no pending reminder, or this message isn't a response to one).
+- quoteIntent: true when the customer is asking for a price/quote/cost/estimate ("how much for…", "what would it cost", "can I get a quote", "ballpark for…", "do you do estimates", "price on a 3-bed re-roof"). false otherwise.
+- quoteDraft: when quoteIntent is true AND you have enough info in the system prompt's SERVICES/KB context to estimate, fill this. lineItems = breakdown (use 1-5 items, label them clearly like "Standard service call-out" / "Per square metre"). subtotal = sum of items. currency = pick from "£", "$", "€" based on business location (UK = £, US = $, EU = €; default £). validityDays = 30 unless the prompt says otherwise. caveat = honest hedging line ("Subject to on-site assessment", "Final price depends on access/materials/scope", "Indicative only — call/text to confirm"). If you DON'T have enough info to quote, set quoteDraft to null and ask 1-2 clarifying questions in your text reply instead (size, scope, location). If quoteDraft IS set, your text reply should be SHORT like: "Let me put a quick quote together for you — one moment, I'll get it over shortly 📋" — because the actual itemised quote will be sent after owner approval.${scopeRule}${visionRule}`;
 
     // Multimodal: image blocks come FIRST (Anthropic recommends image-before-text
     // ordering for best comprehension), text block last. Pure-text path keeps
@@ -14007,6 +14046,25 @@ Rules:
       parsed.bookingReminderResponse = ['confirmed', 'reschedule', 'cancel'].includes(parsed.bookingReminderResponse)
         ? parsed.bookingReminderResponse
         : null;
+      parsed.quoteIntent = !!parsed.quoteIntent;
+      // Validate quoteDraft shape — bail to null if anything looks broken
+      if (parsed.quoteDraft && Array.isArray(parsed.quoteDraft.lineItems) && parsed.quoteDraft.lineItems.length > 0) {
+        parsed.quoteDraft.lineItems = parsed.quoteDraft.lineItems
+          .filter(li => li && typeof li.label === 'string' && li.label.trim())
+          .map(li => ({
+            label: String(li.label).slice(0, 120),
+            price: Number(li.price) || 0,
+            qty:   Number(li.qty) > 0 ? Number(li.qty) : 1,
+            notes: li.notes ? String(li.notes).slice(0, 200) : null,
+          }))
+          .slice(0, 8);
+        parsed.quoteDraft.subtotal     = Number(parsed.quoteDraft.subtotal) || parsed.quoteDraft.lineItems.reduce((s, li) => s + li.price * li.qty, 0);
+        parsed.quoteDraft.currency     = ['£','$','€'].includes(parsed.quoteDraft.currency) ? parsed.quoteDraft.currency : '£';
+        parsed.quoteDraft.validityDays = Math.max(1, Math.min(365, Number(parsed.quoteDraft.validityDays) || 30));
+        parsed.quoteDraft.caveat       = String(parsed.quoteDraft.caveat || '').slice(0, 300);
+      } else {
+        parsed.quoteDraft = null;
+      }
       parsed._tokensUsed = (r.usage?.input_tokens || 0) + (r.usage?.output_tokens || 0);
       return parsed;
     } catch {
@@ -14758,6 +14816,91 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     }
   }
 
+  // ─── Quote drafting (two-stage approval) ──────────────────────────────
+  // When Claude detected quote intent AND drafted line items, store as a
+  // pendingQuote + email owner with [Approve][Edit][Reject] buttons.
+  // Customer just gets Aria's "let me put a quote together" reply — the
+  // itemised quote arrives after owner approves.
+  if (reply.quoteIntent && reply.quoteDraft) {
+    const ownerCfg = profile?.profile?.quoteAutoDraft || profile?.config?.quoteAutoDraft || {};
+    const maxAmt   = Number(ownerCfg.maxAmount) > 0 ? Number(ownerCfg.maxAmount) : 5000;
+    if (ownerCfg.enabled === false) {
+      // Owner opted out — just send Aria's normal reply, no draft.
+      console.log(`💷 [quote] skipped — owner disabled auto-draft (${ownerEmail})`);
+    } else if (reply.quoteDraft.subtotal > maxAmt) {
+      // Above owner's auto-draft cap — escalate instead of drafting
+      console.log(`💷 [quote] subtotal ${reply.quoteDraft.subtotal} > max ${maxAmt}, escalating to human for ${ownerEmail}`);
+      try {
+        await smartSend({
+          ownerEmail, to: ownerEmail,
+          subject: `💷 Quote request above auto-cap — ${senderName} (${reply.quoteDraft.currency}${reply.quoteDraft.subtotal})`,
+          html: `<div style="font-family:-apple-system,sans-serif;max-width:520px;padding:20px;">
+            <p><b>${senderName}</b> asked: <i>"${messageText.slice(0, 200)}"</i></p>
+            <p>Aria drafted a quote at <b>${reply.quoteDraft.currency}${reply.quoteDraft.subtotal}</b>, above your auto-cap of ${reply.quoteDraft.currency}${maxAmt}.</p>
+            <p>Reply directly to the customer on ${channel} so you can scope properly.</p>
+          </div>`,
+        });
+      } catch {}
+    } else {
+      // Normal flow — create pending quote + email owner
+      const quoteId = generateSessionToken();
+      pendingQuotes.set(quoteId, {
+        ownerEmail, channel, senderId, senderName,
+        originalQuestion: messageText.slice(0, 500),
+        draft: reply.quoteDraft,
+        createdAt: Date.now(),
+        contact: null, // set from reply.contact if present
+      });
+      pendingQuotes.get(quoteId).contact = reply.contact?.email || reply.contact?.phone || null;
+      persistPendingQuotes();
+      appendQuoteLedger({
+        ts: new Date().toISOString(), event: 'drafted',
+        quoteId, ownerEmail, channel, senderId, senderName,
+        subtotal: reply.quoteDraft.subtotal, currency: reply.quoteDraft.currency,
+      });
+
+      // Build approval email
+      const serverUrl = process.env.GOOGLE_REDIRECT_URI?.replace('/auth/gmail/callback', '') || `http://localhost:${process.env.PORT || 3000}`;
+      const itemRows = reply.quoteDraft.lineItems.map(li =>
+        `<tr><td style="padding:6px 8px;border-bottom:1px solid #eee;">${escapeHtml(li.label)}${li.notes ? `<br><span style="font-size:11px;color:#888;">${escapeHtml(li.notes)}</span>` : ''}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">${li.qty > 1 ? li.qty + ' × ' : ''}${reply.quoteDraft.currency}${li.price.toFixed(2)}</td></tr>`
+      ).join('');
+
+      try {
+        await smartSend({
+          ownerEmail, to: ownerEmail,
+          subject: `💷 Aria drafted a quote for ${senderName} — ${reply.quoteDraft.currency}${reply.quoteDraft.subtotal}`,
+          html: `<div style="font-family:-apple-system,sans-serif;max-width:560px;margin:0 auto;padding:20px;">
+            <h2 style="color:#1a1a2e;margin-bottom:4px;">New quote request</h2>
+            <div style="background:#f8f8fc;border-radius:10px;padding:14px;margin:14px 0;font-size:13.5px;color:#555;">
+              <b>${senderName}</b> asked (via ${channel}):<br>
+              <i>"${escapeHtml(messageText.slice(0, 300))}"</i>
+            </div>
+            <div style="background:#fff;border:1px solid #e0e0eb;border-radius:10px;padding:16px;margin:14px 0;">
+              <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;">Aria's draft quote</div>
+              <table style="width:100%;border-collapse:collapse;font-size:13.5px;color:#222;">
+                ${itemRows}
+                <tr><td style="padding:10px 8px;font-weight:700;">Total</td><td style="padding:10px 8px;text-align:right;font-weight:700;color:#0d6e3f;">${reply.quoteDraft.currency}${reply.quoteDraft.subtotal.toFixed(2)}</td></tr>
+              </table>
+              ${reply.quoteDraft.caveat ? `<p style="font-size:11.5px;color:#888;margin-top:10px;font-style:italic;">${escapeHtml(reply.quoteDraft.caveat)}</p>` : ''}
+              <p style="font-size:11.5px;color:#888;margin-top:4px;">Valid for ${reply.quoteDraft.validityDays} days.</p>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:18px;">
+              <a href="${serverUrl}/api/quotes/approve?id=${quoteId}" style="display:inline-block;padding:11px 18px;background:#00e5a0;color:#0d0d1f;border-radius:8px;text-decoration:none;font-weight:600;font-size:13px;">✓ Send to customer</a>
+              <a href="${serverUrl}/api/quotes/edit?id=${quoteId}" style="display:inline-block;padding:11px 18px;background:#9d96ff;color:#fff;border-radius:8px;text-decoration:none;font-weight:600;font-size:13px;">✎ Edit first</a>
+              <a href="${serverUrl}/api/quotes/reject?id=${quoteId}" style="display:inline-block;padding:11px 18px;background:#ff6b6b;color:#fff;border-radius:8px;text-decoration:none;font-weight:600;font-size:13px;">✗ Reject</a>
+            </div>
+            <p style="font-size:11px;color:#aaa;margin-top:18px;">If you ignore this, the customer just gets Aria's holding message. Reject = nothing sent.</p>
+          </div>`,
+        });
+        console.log(`💷 [quote] drafted ${reply.quoteDraft.currency}${reply.quoteDraft.subtotal} for ${senderName} (${ownerEmail}) — awaiting owner approval [${quoteId.slice(0, 8)}]`);
+        fireWebhookEvent(ownerEmail, 'quote_drafted', {
+          quoteId, channel, senderId, senderName,
+          subtotal: reply.quoteDraft.subtotal, currency: reply.quoteDraft.currency,
+        });
+      } catch (e) { console.warn('[quote] owner approval email failed:', e.message); }
+    }
+  }
+
   // Save incoming to conversation memory + summarise on overflow.
   // Sliding-window pattern: most recent CONV_MAX_RAW entries kept verbatim,
   // older entries compressed into a single summary entry that persists.
@@ -15180,6 +15323,158 @@ app.get('/api/channel/reject', (req, res) => {
   res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;">
     <h2 style="color:#ff6b6b;">✗ Reply discarded</h2>
     <p style="color:#9898b8;">You can close this tab.</p>
+  </body></html>`);
+});
+
+// ─── Quote approval endpoints ───────────────────────────────────────────
+// Three endpoints mirror the channel-approval pattern but for AI-drafted
+// price quotes. Owner clicks email button → quote is formatted + sent to
+// customer via the original channel (with optional email copy if we have
+// their address).
+
+function renderQuoteMessageText(draft, businessName) {
+  const lines = draft.lineItems.map(li =>
+    `• ${li.label}${li.qty > 1 ? ` (×${li.qty})` : ''} — ${draft.currency}${(li.price * li.qty).toFixed(2)}`
+  ).join('\n');
+  return `Here's a quote from ${businessName}:\n\n${lines}\n\nTotal: ${draft.currency}${draft.subtotal.toFixed(2)}\n\n${draft.caveat ? draft.caveat + '\n\n' : ''}Valid for ${draft.validityDays} days. Let me know if you'd like to go ahead and I'll book you in 👇`;
+}
+
+// SEND — accept the draft as-is, fire to customer on their original channel
+app.get('/api/quotes/approve', async (req, res) => {
+  const { id } = req.query;
+  const pending = pendingQuotes.get(id);
+  if (!pending) {
+    return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><h2>Quote expired or already handled</h2><p style="color:#9898b8;">You can close this tab.</p></body></html>');
+  }
+  const { ownerEmail, channel, senderId, senderName, draft } = pending;
+  const ownerChannels = channelConfigs.get(ownerEmail);
+  const channelConfig = ownerChannels?.[channel];
+  if (!channelConfig) {
+    return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><h2>Channel no longer connected</h2></body></html>');
+  }
+  const profile = getOwnerProfile(ownerEmail);
+  const businessName = profile?.profile?.businessName || profile?.businessName || 'us';
+  const messageText = renderQuoteMessageText(draft, businessName);
+
+  let sent = false;
+  try {
+    sent = await sendChannelReply(channel, channelConfig, senderId, messageText, ['Book me in', 'Got questions', 'Not right now']);
+  } catch (e) { console.warn('[quote-approve] channel send failed:', e.message); }
+
+  if (sent) {
+    // Log to channelMessages so dashboard reflects the sent quote
+    const msgs = channelMessages.get(ownerEmail) || [];
+    msgs.push({
+      id: crypto.randomUUID(), channel, senderId, senderName,
+      message: pending.originalQuestion, reply: messageText,
+      timestamp: new Date().toISOString(),
+      status: 'quote-sent',
+      meta: { quoteSubtotal: draft.subtotal, quoteCurrency: draft.currency },
+    });
+    channelMessages.set(ownerEmail, msgs);
+    persistChannelMessages();
+  }
+
+  appendQuoteLedger({
+    ts: new Date().toISOString(), event: 'sent',
+    quoteId: id, ownerEmail, channel, senderId, senderName,
+    subtotal: draft.subtotal, currency: draft.currency,
+    items: draft.lineItems.length,
+  });
+  fireWebhookEvent(ownerEmail, 'quote_sent', {
+    quoteId: id, channel, senderId, senderName,
+    subtotal: draft.subtotal, currency: draft.currency,
+  });
+
+  pendingQuotes.delete(id);
+  persistPendingQuotes();
+  res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;">
+    <h2 style="color:#00e5a0;">✓ Quote sent to ${escapeHtml(senderName)}</h2>
+    <p style="color:#9898b8;">Total: ${draft.currency}${draft.subtotal.toFixed(2)}. You can close this tab.</p>
+  </body></html>`);
+});
+
+// EDIT — render a simple form pre-populated with the draft, owner edits + submits
+app.get('/api/quotes/edit', (req, res) => {
+  const { id } = req.query;
+  const pending = pendingQuotes.get(id);
+  if (!pending) {
+    return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><h2>Quote expired or already handled</h2></body></html>');
+  }
+  const { senderName, draft } = pending;
+  const itemRows = draft.lineItems.map((li, i) => `
+    <div style="display:flex;gap:8px;margin-bottom:8px;">
+      <input name="label_${i}" value="${escapeHtml(li.label)}" placeholder="Line item" style="flex:2;padding:8px;border:1px solid #444;background:#1a1a2e;color:#eee;border-radius:6px;">
+      <input name="qty_${i}" type="number" min="1" value="${li.qty}" style="width:60px;padding:8px;border:1px solid #444;background:#1a1a2e;color:#eee;border-radius:6px;">
+      <input name="price_${i}" type="number" step="0.01" min="0" value="${li.price.toFixed(2)}" style="width:100px;padding:8px;border:1px solid #444;background:#1a1a2e;color:#eee;border-radius:6px;">
+    </div>`).join('');
+
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Edit quote</title></head>
+  <body style="font-family:-apple-system,sans-serif;background:#0d0d1f;color:#eee;padding:30px;max-width:600px;margin:0 auto;">
+    <h2 style="color:#9d96ff;">Edit quote for ${escapeHtml(senderName)}</h2>
+    <form method="POST" action="/api/quotes/edit?id=${id}">
+      <div style="margin-bottom:14px;font-size:12px;color:#8888aa;">Line items (label · qty · ${escapeHtml(draft.currency)} unit price)</div>
+      ${itemRows}
+      <label style="display:block;margin:14px 0 4px;font-size:12px;color:#9898b8;">Caveat / disclaimer</label>
+      <textarea name="caveat" rows="2" style="width:100%;padding:8px;border:1px solid #444;background:#1a1a2e;color:#eee;border-radius:6px;font-family:inherit;">${escapeHtml(draft.caveat)}</textarea>
+      <label style="display:block;margin:14px 0 4px;font-size:12px;color:#9898b8;">Valid for (days)</label>
+      <input name="validityDays" type="number" min="1" max="365" value="${draft.validityDays}" style="width:100px;padding:8px;border:1px solid #444;background:#1a1a2e;color:#eee;border-radius:6px;">
+      <div style="margin-top:24px;display:flex;gap:8px;">
+        <button type="submit" style="background:#00e5a0;color:#0d0d1f;border:none;border-radius:8px;padding:11px 18px;font-weight:600;cursor:pointer;font-family:inherit;font-size:13px;">✓ Send edited quote</button>
+        <a href="/api/quotes/reject?id=${id}" style="background:#ff6b6b;color:#fff;border:none;border-radius:8px;padding:11px 18px;font-weight:600;text-decoration:none;font-family:inherit;font-size:13px;display:inline-block;">✗ Reject</a>
+      </div>
+    </form>
+  </body></html>`);
+});
+
+app.post('/api/quotes/edit', express.urlencoded({ extended: true, limit: '32kb' }), async (req, res) => {
+  const { id } = req.query;
+  const pending = pendingQuotes.get(id);
+  if (!pending) {
+    return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><h2>Quote expired</h2></body></html>');
+  }
+  // Rebuild line items from form fields
+  const newItems = [];
+  for (let i = 0; i < 8; i++) {
+    const label = (req.body[`label_${i}`] || '').trim();
+    if (!label) continue;
+    newItems.push({
+      label,
+      qty:   Math.max(1, Number(req.body[`qty_${i}`]) || 1),
+      price: Math.max(0, Number(req.body[`price_${i}`]) || 0),
+      notes: null,
+    });
+  }
+  if (newItems.length === 0) {
+    return res.send('<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;"><h2>Need at least one line item</h2><a href="/api/quotes/edit?id=' + id + '" style="color:#00e5a0;">Back to edit</a></body></html>');
+  }
+  pending.draft.lineItems    = newItems;
+  pending.draft.subtotal     = newItems.reduce((s, li) => s + li.price * li.qty, 0);
+  pending.draft.caveat       = String(req.body.caveat || pending.draft.caveat).slice(0, 300);
+  pending.draft.validityDays = Math.max(1, Math.min(365, Number(req.body.validityDays) || 30));
+  pendingQuotes.set(id, pending);
+  persistPendingQuotes();
+
+  // Redirect through approve to actually send (DRY — single send path)
+  res.redirect(`/api/quotes/approve?id=${id}`);
+});
+
+app.get('/api/quotes/reject', (req, res) => {
+  const { id } = req.query;
+  const pending = pendingQuotes.get(id);
+  if (pending) {
+    appendQuoteLedger({
+      ts: new Date().toISOString(), event: 'rejected',
+      quoteId: id, ownerEmail: pending.ownerEmail, channel: pending.channel,
+      senderId: pending.senderId, senderName: pending.senderName,
+      subtotal: pending.draft.subtotal, currency: pending.draft.currency,
+    });
+  }
+  pendingQuotes.delete(id);
+  persistPendingQuotes();
+  res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;">
+    <h2 style="color:#ff6b6b;">✗ Quote rejected</h2>
+    <p style="color:#9898b8;">Nothing sent. Customer is waiting for you to reply on the channel directly.</p>
   </body></html>`);
 });
 
