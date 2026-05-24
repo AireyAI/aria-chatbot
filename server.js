@@ -9937,6 +9937,136 @@ app.get('/api/dashboard/activity', (req, res) => {
   res.json({ events: events.slice(0, limit) });
 });
 
+// POST /api/dashboard/ai-train — one-shot wizard. Takes a website URL
+// and/or short business description, scrapes the site (if URL given),
+// and asks Claude to draft a knowledge document + service-carousel cards
+// + topic-scope chips. Returns the drafts for owner review BEFORE saving.
+//
+// Per Engineering Rule 12: nothing gets persisted here. The owner reviews
+// each draft + clicks Accept per item via the existing knowledge/services/
+// scope endpoints. This endpoint is read-only judgment.
+app.post('/api/dashboard/ai-train', express.json({ limit: '256kb' }), async (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { websiteUrl, description } = req.body || {};
+  if (!websiteUrl && !description) {
+    return res.status(400).json({ error: 'Provide either websiteUrl or description' });
+  }
+
+  // Fetch + strip the website if URL given. Cap at 30k chars so prompt stays sane.
+  let siteText = '';
+  if (websiteUrl) {
+    try {
+      const u = new URL(websiteUrl.startsWith('http') ? websiteUrl : 'https://' + websiteUrl);
+      const r = await fetch(u.toString(), { headers: { 'User-Agent': 'AriaBot/1.0 (+https://aireyai.co.uk)' }, signal: AbortSignal.timeout(8000) });
+      if (r.ok) {
+        const html = await r.text();
+        // Strip script + style, then tags, then collapse whitespace
+        siteText = html
+          .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/&nbsp;/g, ' ')
+          .replace(/&[a-z]+;/gi, ' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 30000);
+      }
+    } catch (e) {
+      console.warn('[ai-train] site fetch failed:', e.message);
+    }
+  }
+
+  const userInput = [
+    description ? `BUSINESS DESCRIPTION (from owner): ${description}` : '',
+    siteText ? `WEBSITE CONTENT (extracted):\n${siteText}` : '',
+  ].filter(Boolean).join('\n\n');
+
+  if (!userInput) {
+    return res.status(400).json({ error: 'No usable input — website unreachable and no description given' });
+  }
+
+  try {
+    const r = await callClaudeWithFallback({
+      max_tokens: 2000,
+      messages: [{ role: 'user', content: `You're helping a small business set up their AI customer-service assistant (Aria). Read the input below and draft three things Aria can use to handle messages from their customers.
+
+INPUT:
+${userInput}
+
+Reply with valid JSON only (no preamble, no markdown):
+{
+  "knowledgeDoc": {
+    "title": "Short title (e.g. 'Services + Prices')",
+    "content": "Plain-text doc summarising what this business does, services they offer, prices/ranges where mentioned, hours, location, key policies. 200-800 words. Aria will cite this for accurate answers — don't invent details that aren't in the input. Use bullet structure where helpful."
+  },
+  "services": [
+    { "title": "Service name", "subtitle": "Price/duration/key detail", "image": "", "link": "", "btn_text": "Book now" }
+  ],
+  "allowedTopics": ["topic 1", "topic 2", "topic 3"]
+}
+
+Rules:
+- knowledgeDoc.content: factual ONLY. If a price/hour/location isn't in the input, don't make one up. Leave gaps for the owner to fill.
+- services: 2-5 cards covering the most-asked-for services. Use REAL prices from input if given, else use "Contact for pricing" in subtitle. Leave image + link empty for owner to fill.
+- allowedTopics: 3-8 short topic phrases that this business actually handles. E.g. ["scaffolding hire", "scaffolding quotes", "site access"]. Used to politely refuse off-topic questions.
+- If input is very thin (e.g. just "a hair salon"), generate plausible defaults but mark obvious placeholders with [PLACEHOLDER: ...] so the owner sees them.` }],
+    });
+    const text = r.content[0]?.text || '';
+    let parsed;
+    try {
+      parsed = JSON.parse(text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim());
+    } catch (e) {
+      return res.status(500).json({ error: 'AI returned invalid JSON', raw: text.slice(0, 500) });
+    }
+    res.json({
+      knowledgeDoc: parsed.knowledgeDoc || null,
+      services: Array.isArray(parsed.services) ? parsed.services.slice(0, 10) : [],
+      allowedTopics: Array.isArray(parsed.allowedTopics) ? parsed.allowedTopics.filter(t => typeof t === 'string').slice(0, 12) : [],
+      siteCharsExtracted: siteText.length,
+    });
+  } catch (e) {
+    console.error('[ai-train] Claude failed:', e);
+    res.status(500).json({ error: 'AI draft failed: ' + e.message });
+  }
+});
+
+// POST /api/dashboard/ai-improve — takes existing draft text + an "instruction"
+// (rewrite, expand, shorten, add prices, etc) and returns improved version.
+// Used by per-field "✨ Improve with AI" buttons.
+app.post('/api/dashboard/ai-improve', express.json({ limit: '256kb' }), async (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { current, instruction, kind } = req.body || {};
+  if (!current && !instruction) return res.status(400).json({ error: 'current or instruction required' });
+  const kindHint = kind === 'knowledge' ? 'a knowledge document Aria will cite for customer answers'
+    : kind === 'service' ? 'a service-card description shown to customers in a carousel'
+    : 'a piece of content for an AI customer-service bot';
+  try {
+    const r = await callClaudeWithFallback({
+      max_tokens: 800,
+      messages: [{ role: 'user', content: `Improve the following text. It's ${kindHint}.
+
+CURRENT TEXT:
+"""${current || '(blank)'}"""
+
+INSTRUCTION FROM OWNER:
+"${instruction || 'Polish for clarity + warmth. Keep it concise.'}"
+
+Rules:
+- Don't invent factual details (prices, hours, services) that aren't in the current text.
+- Keep the same overall meaning unless instruction says otherwise.
+- Plain text only, no markdown formatting, no preamble.
+
+Reply with ONLY the improved text, nothing else.` }],
+    });
+    const improved = (r.content[0]?.text || '').trim();
+    res.json({ improved });
+  } catch (e) {
+    res.status(500).json({ error: 'Improve failed: ' + e.message });
+  }
+});
+
 // GET /api/dashboard/conversation/:memKey — full thread for one sender
 // (drill-down from the Conversations table). Pulls from conversationMemory
 // for raw history + adds metadata (paused state, last lead score, etc.).
@@ -10965,11 +11095,116 @@ async function loadTrainAria() {
   const body = document.getElementById('body-train');
   body.innerHTML = '<div style="padding:8px 0;">' +
     '<p style="font-size:13px;color:#9898b8;margin-bottom:18px;">Teach Aria your business — answers, documents, services, and what topics she should + shouldn\\'t handle.</p>' +
+    '<div id="train-quick" style="margin-bottom:28px;"></div>' +
     '<div id="train-knowledge" style="margin-bottom:28px;"></div>' +
     '<div id="train-services" style="margin-bottom:28px;"></div>' +
     '<div id="train-scope" style="margin-bottom:8px;"></div>' +
   '</div>';
+  renderQuickTrainCard();
   await Promise.all([loadKnowledgeDocs(), loadServicesEditor(), loadScopeEditor()]);
+}
+
+// ─── Quick Train wizard — one-line input → full draft via Claude ─────────
+function renderQuickTrainCard() {
+  const el = document.getElementById('train-quick');
+  el.innerHTML =
+    '<div style="background:linear-gradient(135deg,rgba(108,99,255,0.12),rgba(108,99,255,0.03));border:1px dashed rgba(108,99,255,0.4);border-radius:14px;padding:20px;">' +
+      '<h4 style="font-size:14px;color:#fff;margin-bottom:6px;display:flex;align-items:center;gap:8px;">✨ Quick Train <span style="font-size:11px;font-weight:400;color:#9898b8;">— let Aria draft everything for you</span></h4>' +
+      '<p style="font-size:12.5px;color:#9898b8;margin-bottom:14px;line-height:1.6;">Paste your website URL or describe your business in a sentence. Aria will read it and draft your knowledge doc, services carousel, and topic scope — you just review + accept.</p>' +
+      '<div class="form-group" style="margin-bottom:10px;"><label>Your website URL (optional)</label><input id="qt-url" type="text" placeholder="https://your-business.co.uk"></div>' +
+      '<div class="form-group" style="margin-bottom:12px;"><label>Or describe your business in 1-3 sentences</label><textarea id="qt-desc" rows="3" placeholder="e.g. I run How High Scaffolding in Carlisle. We do domestic and commercial scaffolding, all NASC-compliant. Free quotes within 24 hours."></textarea></div>' +
+      '<button class="cta-btn" onclick="runQuickTrain()" id="qt-btn">✨ Generate draft</button>' +
+      '<div id="qt-result" style="margin-top:16px;"></div>' +
+    '</div>';
+}
+
+async function runQuickTrain() {
+  const url = document.getElementById('qt-url').value.trim();
+  const desc = document.getElementById('qt-desc').value.trim();
+  if (!url && !desc) { toast('Enter a URL or description'); return; }
+  const btn = document.getElementById('qt-btn');
+  const result = document.getElementById('qt-result');
+  btn.disabled = true;
+  btn.textContent = '⏳ Aria is reading…';
+  result.innerHTML = '';
+  try {
+    const r = await apiPost('/api/dashboard/ai-train', { websiteUrl: url, description: desc });
+    if (r.error) { toast(r.error); btn.disabled = false; btn.textContent = '✨ Generate draft'; return; }
+    window._qtDraft = r;
+    renderQuickTrainResult(r);
+  } catch (e) { toast('Draft failed: ' + e.message); btn.disabled = false; btn.textContent = '✨ Generate draft'; }
+}
+
+function renderQuickTrainResult(r) {
+  const el = document.getElementById('qt-result');
+  const btn = document.getElementById('qt-btn');
+  btn.disabled = false;
+  btn.textContent = '✨ Re-generate draft';
+  const kd = r.knowledgeDoc;
+  const services = r.services || [];
+  const topics = r.allowedTopics || [];
+  el.innerHTML =
+    '<div style="background:rgba(0,229,160,0.05);border:1px solid rgba(0,229,160,0.3);border-radius:12px;padding:16px;margin-top:14px;">' +
+      '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">' +
+        '<b style="color:#00e5a0;font-size:13px;">📝 Aria\\'s draft — review + accept what you want</b>' +
+        '<button onclick="acceptAllQt()" style="background:#00e5a0;color:#0d0d1f;border:none;border-radius:8px;padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;">+ Accept ALL</button>' +
+      '</div>' +
+      (kd ? '<div style="background:rgba(255,255,255,0.03);border-radius:10px;padding:12px;margin-bottom:12px;">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">' +
+          '<b style="color:#fff;font-size:12.5px;">📚 ' + escH(kd.title || 'Knowledge document') + '</b>' +
+          '<button onclick="acceptQtDoc()" style="background:rgba(0,229,160,0.15);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:6px;padding:3px 12px;font-size:11px;cursor:pointer;font-family:inherit;">+ Accept</button>' +
+        '</div>' +
+        '<div style="font-size:12px;color:#bbb;white-space:pre-wrap;max-height:160px;overflow-y:auto;line-height:1.6;">' + escH(kd.content || '') + '</div>' +
+      '</div>' : '') +
+      (services.length ? '<div style="background:rgba(255,255,255,0.03);border-radius:10px;padding:12px;margin-bottom:12px;">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">' +
+          '<b style="color:#fff;font-size:12.5px;">🎠 Services (' + services.length + ')</b>' +
+          '<button onclick="acceptQtServices()" style="background:rgba(0,229,160,0.15);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:6px;padding:3px 12px;font-size:11px;cursor:pointer;font-family:inherit;">+ Accept all</button>' +
+        '</div>' +
+        services.map(s => '<div style="font-size:12px;color:#bbb;padding:4px 0;"><b>' + escH(s.title) + '</b> · ' + escH(s.subtitle || '') + '</div>').join('') +
+      '</div>' : '') +
+      (topics.length ? '<div style="background:rgba(255,255,255,0.03);border-radius:10px;padding:12px;">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">' +
+          '<b style="color:#fff;font-size:12.5px;">🚦 Topic Scope (' + topics.length + ')</b>' +
+          '<button onclick="acceptQtTopics()" style="background:rgba(0,229,160,0.15);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:6px;padding:3px 12px;font-size:11px;cursor:pointer;font-family:inherit;">+ Accept all</button>' +
+        '</div>' +
+        '<div style="display:flex;flex-wrap:wrap;gap:5px;">' +
+          topics.map(t => '<span style="background:rgba(255,255,255,0.06);color:#ccc;padding:3px 10px;border-radius:12px;font-size:11.5px;">' + escH(t) + '</span>').join('') +
+        '</div>' +
+      '</div>' : '') +
+    '</div>';
+}
+
+async function acceptQtDoc() {
+  const kd = window._qtDraft?.knowledgeDoc;
+  if (!kd) return;
+  const r = await apiPost('/api/dashboard/knowledge', { title: kd.title, content: kd.content });
+  if (r.ok) { toast('Knowledge doc added'); loadKnowledgeDocs(); }
+}
+async function acceptQtServices() {
+  const services = window._qtDraft?.services;
+  if (!services?.length) return;
+  // Merge with any existing
+  const existing = window._services || [];
+  window._services = existing.concat(services).slice(0, 10);
+  const r = await apiPost('/api/dashboard/profile', { owner: OWNER, servicesCarousel: window._services });
+  if (r.ok) { toast('Services added'); loadServicesEditor(); }
+}
+async function acceptQtTopics() {
+  const topics = window._qtDraft?.allowedTopics;
+  if (!topics?.length) return;
+  const existing = window._scopeTopics || [];
+  const merged = [...new Set([...existing, ...topics])];
+  const r = await apiPost('/api/dashboard/profile', { owner: OWNER, allowedTopics: merged });
+  if (r.ok) { toast('Topics added'); loadScopeEditor(); }
+}
+async function acceptAllQt() {
+  if (!window._qtDraft) return;
+  toast('Accepting all 3 — one moment…');
+  await acceptQtDoc();
+  await acceptQtServices();
+  await acceptQtTopics();
+  document.getElementById('qt-result').innerHTML = '<div style="text-align:center;color:#00e5a0;padding:16px;font-size:13px;">✓ All accepted. Aria is now trained on your business.</div>';
 }
 
 async function loadKnowledgeDocs() {
@@ -10990,7 +11225,13 @@ async function loadKnowledgeDocs() {
       (rows ? '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">' + rows + '</div>' : '<div class="empty" style="padding:14px 0">No documents yet. Paste your services, prices, FAQ, policies — anything Aria should know.</div>') +
       '<div style="background:rgba(0,229,160,0.05);border:1px solid rgba(0,229,160,0.15);border-radius:10px;padding:14px;">' +
         '<div class="form-group" style="margin-bottom:10px;"><label>Document title</label><input id="kd-title" type="text" placeholder="e.g. Service prices, Booking policy, Care instructions"></div>' +
-        '<div class="form-group" style="margin-bottom:12px;"><label>Content (paste any plain text — services, prices, FAQ, policies, etc.)</label><textarea id="kd-content" rows="6" placeholder="Hair colour: £85-150 depending on length. Cuts: £35. Open Tue-Sat 9am-6pm. Cancellation: 24hr notice required..."></textarea></div>' +
+        '<div class="form-group" style="margin-bottom:12px;">' +
+          '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;">' +
+            '<label style="margin-bottom:0;">Content (paste any plain text — services, prices, FAQ, policies, etc.)</label>' +
+            '<button onclick="improveKnowledge()" style="background:rgba(108,99,255,0.15);color:#9d96ff;border:1px solid rgba(108,99,255,0.3);border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit;" title="Polish + structure this text with AI">✨ Improve with AI</button>' +
+          '</div>' +
+          '<textarea id="kd-content" rows="6" placeholder="Hair colour: £85-150 depending on length. Cuts: £35. Open Tue-Sat 9am-6pm. Cancellation: 24hr notice required..."></textarea>' +
+        '</div>' +
         '<button class="btn-save" onclick="uploadKnowledgeDoc()">+ Add to Aria\\'s knowledge</button>' +
       '</div>';
   } catch (e) {
@@ -11007,6 +11248,24 @@ async function uploadKnowledgeDoc() {
     if (r.ok) { toast('Document added — Aria will cite it from now on'); loadKnowledgeDocs(); }
     else toast(r.error || 'Upload failed');
   } catch (e) { toast('Upload failed'); }
+}
+
+// AI polish for the knowledge content textarea — owner writes a rough
+// draft, clicks ✨ Improve, gets it back structured + warmer.
+async function improveKnowledge() {
+  const ta = document.getElementById('kd-content');
+  const current = ta.value.trim();
+  if (!current) { toast('Write something first, then I can improve it'); return; }
+  const instruction = prompt('How should Aria improve this? (Examples: "polish for clarity", "add headers + structure", "make it warmer", "shorten by half")', 'Polish for clarity + add structure');
+  if (instruction === null) return; // cancelled
+  toast('⏳ Improving…');
+  try {
+    const r = await apiPost('/api/dashboard/ai-improve', { current, instruction, kind: 'knowledge' });
+    if (r.improved) {
+      ta.value = r.improved;
+      toast('✓ Improved — review before saving');
+    } else { toast(r.error || 'Improve failed'); }
+  } catch (e) { toast('Improve failed: ' + e.message); }
 }
 
 async function deleteKnowledgeDoc(idx) {
