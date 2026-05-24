@@ -11119,6 +11119,30 @@ Rules:
   }
 }
 
+// Compress old conversation entries into one summary line. Fires when raw
+// history exceeds CONV_MAX_RAW so we keep memory bounded yet retain context
+// across long conversations (institutional bots can recall conv from weeks
+// ago — without this we'd just truncate and forget).
+const CONV_MAX_RAW = 12;            // keep last N raw exchanges verbatim
+const CONV_SUMMARIZE_TRIGGER = 18;  // when total >= this, compress to fit
+async function summarizeOldHistory(oldEntries) {
+  try {
+    const r = await claude.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 200,
+      messages: [{ role: 'user', content: `Summarise this customer-service conversation snippet into ONE sentence (under 280 chars). Keep names, services discussed, prices mentioned, time-sensitive commitments. Drop pleasantries.
+
+${oldEntries.map(h => `[${h.role === 'sender' ? 'THEM' : 'US'}] ${h.preview}`).join('\n')}
+
+Reply with just the summary sentence, no preamble.` }],
+    });
+    return (r.content[0]?.text || '').trim().slice(0, 280);
+  } catch (e) {
+    console.warn('History summarise failed:', e.message);
+    return null;
+  }
+}
+
 // Second Claude call ONLY when escalating — summarises the conversation so
 // the owner gets actionable context instead of a wall of messages.
 async function generateHandoffSummary(senderName, conversationHistory, lastMessage, reason) {
@@ -11245,6 +11269,16 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
   const systemPrompt = profile?.systemPrompt || `You are a helpful business assistant for ${ownerEmail}.`;
   const allowedTopics = profile?.config?.allowedTopics || profile?.allowedTopics || null;
 
+  // Slot tracking — if a booking is in progress, surface which slots are
+  // still empty so Aria asks for ONE missing piece at a time instead of
+  // either re-asking everything or skipping the missing field.
+  const pendingBooking = convState?.pendingBooking || null;
+  const slotContext = pendingBooking
+    ? `\n\nBOOKING IN PROGRESS — we already collected: ${JSON.stringify(pendingBooking)}. Still need (in priority order): ${
+        ['name', 'contact', 'service', 'datetime'].filter(slot => !pendingBooking[slot]).join(', ') || 'nothing — confirm and close out'
+      }. Ask for the NEXT missing slot only, don't re-ask filled ones.`
+    : '';
+
   // Knowledge base
   const kbEntries = knowledgeBase.get(ownerEmail) || [];
   const kbContext = kbEntries.length
@@ -11254,8 +11288,12 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
   // Conversation memory (memKey already defined above for paused-state check)
   const history = conversationMemory.get(memKey) || [];
   const convContext = history.length
-    ? '\n\nPREVIOUS MESSAGES with this person (most recent last):\n' +
-      history.map(h => `[${h.role === 'sender' ? 'THEM' : 'US'}] ${h.preview}`).join('\n---\n')
+    ? '\n\nPREVIOUS CONVERSATION with this person (oldest → newest):\n' +
+      history.map(h => {
+        if (h.role === 'summary') return `[EARLIER — SUMMARY] ${h.preview}`;
+        if (h.role === 'sender')  return `[THEM] ${h.preview}`;
+        return `[US] ${h.preview}`;
+      }).join('\n---\n')
     : '';
 
   // Channel-specific instructions
@@ -11266,9 +11304,9 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
   };
   const channelInstructions = `\n\nYou are replying via ${channel}. ${channelLimits[channel]} Never mention you are AI — write as a team member.`;
 
-  // Generate reply (with optional scope guardrail)
+  // Generate reply (with optional scope guardrail + slot context)
   const reply = await generateChannelReply(
-    systemPrompt + kbContext + convContext + channelInstructions,
+    systemPrompt + kbContext + convContext + slotContext + channelInstructions,
     senderName, messageText,
     { allowedTopics }
   );
@@ -11278,9 +11316,22 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     return;
   }
 
-  // Save incoming to conversation memory
+  // Save incoming to conversation memory + summarise on overflow.
+  // Sliding-window pattern: most recent CONV_MAX_RAW entries kept verbatim,
+  // older entries compressed into a single summary entry that persists.
   history.push({ role: 'sender', preview: messageText.substring(0, 300), date: new Date().toISOString() });
-  if (history.length > 20) history.splice(0, history.length - 20);
+  if (history.length >= CONV_SUMMARIZE_TRIGGER) {
+    const overflow = history.length - CONV_MAX_RAW;
+    // Don't re-summarise an existing summary — preserve it + add to it.
+    const existingSummary = history[0]?.role === 'summary' ? history.shift() : null;
+    const toCompress = history.splice(0, overflow);
+    if (existingSummary) toCompress.unshift({ role: 'sender', preview: existingSummary.preview, date: existingSummary.date });
+    const summaryText = await summarizeOldHistory(toCompress);
+    if (summaryText) {
+      history.unshift({ role: 'summary', preview: summaryText, date: new Date().toISOString() });
+      console.log(`📝 [${channel}] Summarised ${toCompress.length} old entries → ${summaryText.slice(0, 80)}...`);
+    }
+  }
   conversationMemory.set(memKey, history);
   persistConversationMemory();
 
@@ -11421,10 +11472,37 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     console.log(`📱 [${channel}] Lead scored: ${leadScore} / ${category} (conv=${convLen})`);
   } catch (e) { console.warn('[channel-lead] scoring failed:', e.message); }
 
-  // Detect booking
-  if (reply.booking) {
-    bookings.push({ ...reply.booking, channel, ownerEmail, ts: new Date().toISOString() });
-    save('bookings', bookings);
+  // Slot-filled booking pipeline. Merge any new booking fields into the
+  // running pendingBooking state. Only push to the real bookings[] when the
+  // CRITICAL slots are filled (name + contact + datetime) — otherwise keep
+  // collecting via subsequent messages.
+  if (reply.booking || reply.contact?.name || reply.contact?.email || reply.contact?.phone) {
+    const prev = (conversationState.get(memKey)?.pendingBooking) || {};
+    const merged = {
+      ...prev,
+      ...(reply.booking || {}),
+      name: reply.booking?.name || reply.contact?.name || prev.name || null,
+      contact: reply.contact?.email || reply.contact?.phone || prev.contact || null,
+      service: reply.booking?.notes || reply.booking?.service || prev.service || null,
+      datetime: reply.booking?.datetime || prev.datetime || null,
+    };
+    const ready = merged.name && merged.contact && merged.datetime;
+    if (ready) {
+      bookings.push({ ...merged, channel, ownerEmail, ts: new Date().toISOString() });
+      save('bookings', bookings);
+      // Clear pending now that it's a real booking.
+      const st = conversationState.get(memKey) || {};
+      delete st.pendingBooking;
+      conversationState.set(memKey, st);
+      persistConversationState();
+      console.log(`📅 [${channel}] Booking ready + saved for ${senderName}: ${merged.name} / ${merged.datetime}`);
+    } else {
+      const st = conversationState.get(memKey) || {};
+      st.pendingBooking = merged;
+      conversationState.set(memKey, st);
+      persistConversationState();
+      console.log(`📋 [${channel}] Booking slot update for ${senderName}: ${JSON.stringify(merged)}`);
+    }
   }
 
   console.log(`📱 [${channel}] Replied to ${senderName}: "${reply.text.substring(0, 60)}..."`);
