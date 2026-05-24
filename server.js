@@ -10136,6 +10136,7 @@ tr:last-child td{border-bottom:none;}
 
 <div class="container">
   <!-- Stats Row -->
+  <div id="escalations-banner" style="display:none;"></div>
   <div class="stats-row" id="stats-row">
     <div class="stat-card"><div class="value">—</div><div class="label">Loading...</div></div>
   </div>
@@ -10285,6 +10286,9 @@ async function loadStats() {
     ]);
     const chTotal = ch.stats?.total || 0;
     const connected = ['whatsapp','instagram','facebook'].filter(c => ch.channels?.[c]?.accessToken).length;
+    const csat = d.csat || { total: 0, scorePct: null };
+    const budget = d.budget || { usedToday: 0, capToday: 50000, pctUsed: 0, repliesToday: 0 };
+    const budgetColor = budget.pctUsed >= 90 ? '#ff6b6b' : budget.pctUsed >= 70 ? '#fbbf24' : '#00e5a0';
     document.getElementById('stats-row').innerHTML = \`
       <div class="stat-card">
         <div class="value">\${d.emailsReplied.total}</div>
@@ -10306,15 +10310,46 @@ async function loadStats() {
         <div class="label">Bookings</div>
         <div class="sub">\${d.bookings.week} this week</div>
       </div>
+      <div class="stat-card">
+        <div class="value" style="color:\${csat.scorePct == null ? '#6b6b8a' : csat.scorePct >= 80 ? '#00e5a0' : csat.scorePct >= 50 ? '#fbbf24' : '#ff6b6b'}">\${csat.scorePct == null ? '—' : csat.scorePct + '%'}</div>
+        <div class="label">CSAT</div>
+        <div class="sub">\${csat.total} ratings, 90d</div>
+      </div>
+      <div class="stat-card">
+        <div class="value" style="color:\${budgetColor}">\${budget.pctUsed}%</div>
+        <div class="label">Daily Budget</div>
+        <div class="sub">\${budget.repliesToday} replies today</div>
+      </div>
       <div class="stat-card \${d.autoReplyEnabled ? 'status-on' : 'status-off'}">
         <div class="value">\${d.autoReplyEnabled ? 'ON' : 'OFF'}</div>
         <div class="label">Auto-Reply</div>
         <div class="sub">\${d.gmailConnected ? '<span class="badge-on">Gmail connected</span>' : '<span class="badge-off">Gmail not connected</span>'}</div>
       </div>
     \`;
+    // Escalations banner — if any conv is paused waiting for owner takeover
+    try {
+      const esc = await api('/api/dashboard/escalations');
+      const escDiv = document.getElementById('escalations-banner');
+      if (escDiv) {
+        if (esc.items?.length) {
+          const rows = esc.items.slice(0, 5).map(e => '<li>' + escH(e.channel) + ' · ' + escH(e.senderId) + ' · <i>' + escH(e.reason || 'human requested') + '</i> <button onclick="resumeConv(\\'' + e.memKey + '\\')" style="margin-left:8px;background:#00e5a0;color:#0d0d1f;border:none;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;">Resume</button></li>').join('');
+          escDiv.innerHTML = '<div style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);border-radius:12px;padding:14px 18px;margin-bottom:20px;"><b style="color:#fbbf24;">🤝 ' + esc.items.length + ' conversation(s) handed to you</b><ul style="margin:8px 0 0 0;padding-left:18px;font-size:13px;color:#ccc;line-height:1.7;">' + rows + '</ul></div>';
+          escDiv.style.display = 'block';
+        } else {
+          escDiv.style.display = 'none';
+        }
+      }
+    } catch {}
   } catch (e) {
     document.getElementById('stats-row').innerHTML = '<div class="stat-card"><div class="value">!</div><div class="label">Failed to load stats</div></div>';
   }
+}
+async function resumeConv(memKey) {
+  if (!confirm('Hand this conversation back to Aria? She\\'ll start auto-replying again.')) return;
+  try {
+    const r = await apiPost('/api/dashboard/resume-conversation', { memKey });
+    if (r.ok) { toast('Conversation resumed'); loadStats(); }
+  } catch (e) { toast('Resume failed'); }
 }
 loadStats();
 
