@@ -55,6 +55,7 @@ import { evaluateSchedule } from './lib/business_hours.js';
 import { dispatchWebhook, readWebhookLog, signPayload as signWebhookPayload } from './lib/webhook_dispatcher.js';
 import { extractImageRefs, resolveImageRefsToBlocks } from './lib/image_intake.js';
 import { extractAudioRefs, transcribeAudioRef } from './lib/audio_intake.js';
+import { findBookingConflicts, describeConflictsForCustomer } from './lib/booking_conflicts.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
@@ -680,6 +681,7 @@ const CHANNEL_MESSAGES_FILE = resolve('data/channel-messages.json');
 const CHANNEL_STATS_FILE = resolve('data/channel-stats.json');
 const META_TOKENS_FILE = resolve('data/meta-tokens.json');
 const CHANNEL_APPROVALS_FILE = resolve('data/channel-approvals.json');
+const CHANNEL_LEADS_FILE = resolve('data/channel_leads.jsonl');   // hoisted from below — referenced by startup customer-index rebuild (TDZ fix)
 const channelMessages = new Map();      // ownerEmail → [{ id, channel, senderId, senderName, message, reply, timestamp, status }]
 const channelStats = new Map();         // ownerEmail → { whatsapp: { replied, week, lastReply }, instagram: {...}, facebook: {...}, total }
 const metaTokens = new Map();           // ownerEmail → { userToken, userTokenExpiry, pages: [{ pageId, pageName, accessToken, igUserId, igUsername, wabaId, waPhoneNumberId, waDisplayPhone }] }
@@ -13981,7 +13983,8 @@ const CLOSURE_RE = /\b(thanks|thank you|cheers|ta|perfect|great|brilliant|sorted
 // Append-only ledger of channel-sourced leads. One line per scored message
 // so we never lose history (Engineering Rule 13). Consumers derive current
 // state by reading recent entries.
-const CHANNEL_LEADS_FILE = resolve('data/channel_leads.jsonl');
+// (CHANNEL_LEADS_FILE constant lives near top of file alongside other *_FILE
+//  constants — was hoisted to fix a temporal-dead-zone error in startup.)
 function appendChannelLead(entry) {
   try {
     mkdirSync(resolve('data'), { recursive: true });
@@ -14534,7 +14537,50 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     };
     const ready = merged.name && merged.contact && merged.datetime;
     if (ready) {
-      const bookingRecord = { ...merged, channel, ownerEmail, ts: new Date().toISOString() };
+      // CONFLICT GATE — never confirm a slot that overlaps another booking for
+      // this owner. Without this, Aria happily says yes to 2pm even when 2pm
+      // is already taken — the single biggest production own-goal she could
+      // make. Owners only get one chance with a customer; double-booking
+      // erodes trust faster than any clever feature builds it.
+      const ownerBookings = bookings.filter(b => b.ownerEmail === ownerEmail);
+      const conflicts = findBookingConflicts({
+        newDatetime: merged.datetime,
+        durationMin: 60, // MVP default — extend per-owner via dashboard later
+        existing:    ownerBookings,
+        bufferMin:   0,  // SMB default: back-to-back is fine
+      });
+
+      if (conflicts.length > 0) {
+        // Keep the pending booking so the customer can propose another slot
+        // in their next message — we don't drop the captured name/contact.
+        const st = conversationState.get(memKey) || {};
+        st.pendingBooking = { ...merged, datetime: null }; // clear bad slot, keep rest
+        conversationState.set(memKey, st);
+        persistConversationState();
+
+        const conflictPhrase = describeConflictsForCustomer(conflicts) || 'that slot is taken';
+        const altReply = `Ah — ${conflictPhrase}. Could you suggest another time that works for you?`;
+        try {
+          await sendChannelReply(channel, channelConfig, senderId, altReply, ['Earlier same day', 'Later same day', 'Different day']);
+        } catch (e) { console.warn('[booking-conflict] alt reply send failed:', e.message); }
+
+        // Log to channel message history so dashboard reflects the deflection
+        const msgs = channelMessages.get(ownerEmail) || [];
+        msgs.push({
+          id: crypto.randomUUID(), channel, senderId, senderName,
+          message: messageText, reply: altReply,
+          timestamp: new Date().toISOString(),
+          status: 'conflict-blocked',
+        });
+        channelMessages.set(ownerEmail, msgs);
+        persistChannelMessages();
+
+        console.log(`⚠️  [booking-conflict] Blocked double-book for ${ownerEmail} at ${merged.datetime} (${conflicts.length} conflict(s))`);
+        // Done — return early so we don't push or fire confirmation
+        return;
+      }
+
+      const bookingRecord = { ...merged, channel, ownerEmail, ts: new Date().toISOString(), durationMin: 60 };
       bookings.push(bookingRecord);
       save('bookings', bookings);
       // Clear pending now that it's a real booking.
