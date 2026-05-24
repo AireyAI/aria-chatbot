@@ -9980,6 +9980,94 @@ app.post('/api/dashboard/webhooks/:index/test', async (req, res) => {
   res.json(result);
 });
 
+// ─── Review request settings ─────────────────────────────────────────────
+// Owners configure their Google Place review URL (or Trustpilot, Facebook
+// reviews, etc) + optional custom template. Aria auto-sends a follow-up
+// N hours after every confirmed appointment.
+//
+// GET returns current settings + recent send history from the ledger.
+// POST upserts the settings. Empty url = effectively disabled (handler
+// silently no-ops). enabled:false = explicit disable even with a url set.
+
+app.get('/api/dashboard/reviews/settings', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const profile = getOwnerProfile(owner);
+  const cfg = profile?.profile?.reviewRequest || profile?.config?.reviewRequest || {};
+
+  // Read last 30 review-request ledger entries for this owner
+  let recent = [];
+  try {
+    if (existsSync(REVIEW_REQUESTS_LEDGER)) {
+      const lines = readFileSync(REVIEW_REQUESTS_LEDGER, 'utf8').split('\n').filter(Boolean).slice(-200);
+      for (let i = lines.length - 1; i >= 0 && recent.length < 30; i--) {
+        try {
+          const e = JSON.parse(lines[i]);
+          if (e.ownerEmail === owner) recent.push(e);
+        } catch {}
+      }
+    }
+  } catch {}
+
+  res.json({
+    settings: {
+      enabled:    cfg.enabled !== false,
+      url:        cfg.url || '',
+      delayHours: Number(cfg.delayHours) > 0 ? Number(cfg.delayHours) : 24,
+      template:   cfg.template || '',
+      alwaysEmail: !!cfg.alwaysEmail,
+    },
+    recent,
+    defaultTemplate: 'Hi {customer}! Hope your {service} with {business} went well 🙏 If you have 30 seconds, a quick review really helps us out: {url}',
+  });
+});
+
+app.post('/api/dashboard/reviews/settings', express.json({ limit: '16kb' }), (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { enabled = true, url = '', delayHours = 24, template = '', alwaysEmail = false } = req.body || {};
+  if (url && !/^https?:\/\//.test(url)) return res.status(400).json({ error: 'Review URL must start with http:// or https://' });
+  const delayClamped = Math.max(1, Math.min(720, Number(delayHours) || 24)); // 1h–30d sanity
+
+  let profileKey = null, profileEntry = null;
+  for (const [k, v] of clientProfiles) {
+    if (v?.profile?.email === owner) { profileKey = k; profileEntry = v; break; }
+  }
+  if (!profileEntry) {
+    profileEntry = { profile: { email: owner }, scannedAt: new Date().toISOString() };
+    clientProfiles.set(owner, profileEntry);
+  }
+  profileEntry.profile.reviewRequest = {
+    enabled:    !!enabled,
+    url:        String(url).trim().slice(0, 500),
+    delayHours: delayClamped,
+    template:   String(template || '').slice(0, 800),
+    alwaysEmail: !!alwaysEmail,
+  };
+  clientProfiles.set(profileKey || owner, profileEntry);
+  res.json({ ok: true, settings: profileEntry.profile.reviewRequest });
+});
+
+// POST /api/dashboard/reviews/test — preview the rendered template
+// against a dummy booking so owner can see exactly what their customer
+// will receive. Does NOT actually send anything.
+app.post('/api/dashboard/reviews/test', express.json({ limit: '4kb' }), (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const profile = getOwnerProfile(owner);
+  const cfg = profile?.profile?.reviewRequest || profile?.config?.reviewRequest || {};
+  const businessName = profile?.profile?.businessName || 'us';
+  const tmpl = (cfg.template && typeof cfg.template === 'string')
+    ? cfg.template
+    : `Hi {customer}! Hope your {service} with {business} went well 🙏 If you have 30 seconds, a quick review really helps us out: {url}`;
+  const preview = tmpl
+    .replace(/\{customer\}/g, req.body?.customer || 'Sarah')
+    .replace(/\{business\}/g, businessName)
+    .replace(/\{service\}/g, req.body?.service || 'visit')
+    .replace(/\{url\}/g, cfg.url || '[review URL not set]');
+  res.json({ preview, ready: !!cfg.url && cfg.enabled !== false });
+});
+
 // GET /api/dashboard/customers — list all known customers for the owner,
 // sorted by most-recent touch. Pulled from the in-memory customerIndex
 // which is rebuilt at startup from channel_leads.jsonl.
@@ -13775,6 +13863,32 @@ async function confirmAndShipBooking(booking) {
         console.log(`⏰ [booking] Reminder scheduled for ${new Date(reminderAt).toISOString()}`);
       } catch (e) { console.warn('[booking] schedule reminder failed:', e.message); }
     }
+
+    // Schedule a review request — fires N hours AFTER the appointment.
+    // Owner opts in via dashboard config (reviewRequest.enabled + url). If
+    // not configured the handler no-ops cleanly, so always scheduling is safe.
+    const ownerReviewCfg = getOwnerProfile(ownerEmail)?.profile?.reviewRequest
+                        || getOwnerProfile(ownerEmail)?.config?.reviewRequest
+                        || {};
+    const reviewDelayH  = Number(ownerReviewCfg.delayHours) > 0 ? Number(ownerReviewCfg.delayHours) : 24;
+    const reviewAt      = parsedDate.getTime() + reviewDelayH * 60 * 60 * 1000;
+    if (reviewAt > Date.now() + 60_000) {
+      try {
+        scheduleTask({
+          type: 'review_request',
+          dueAt: reviewAt,
+          ownerEmail,
+          payload: {
+            channel, senderId, senderName,
+            customerName: bookingData.name || senderName,
+            customerEmail,
+            service:  bookingData.service,
+            datetime: bookingData.datetime,
+          },
+        });
+        console.log(`⭐ [booking] Review request scheduled for ${new Date(reviewAt).toISOString()}`);
+      } catch (e) { console.warn('[booking] schedule review request failed:', e.message); }
+    }
   }
 
   return { icsFilename, parsedDate };
@@ -14772,6 +14886,98 @@ registerTaskHandler('booking_reminder', async (task) => {
     } catch {}
   }
   console.log(`⏰ [outbound] booking_reminder sent to ${senderName} (${ownerEmail})`);
+  return true;
+});
+
+// Review request — fires N hours after a confirmed booking. Asks the
+// customer for a Google review (or whatever review URL the owner set).
+// Opt-in: if owner hasn't configured reviewRequest.enabled + url, handler
+// silently no-ops. Always-on by default once URL is set.
+//
+// Direct revenue lever: SMBs live or die by Google review count. A salon
+// going from 12 → 60 reviews can double click-through-rate on Maps. This
+// closes the loop on a chatbot that otherwise stops at "captured the lead".
+const REVIEW_REQUESTS_LEDGER = resolve('data/review_requests.jsonl');
+function appendReviewRequestLedger(entry) {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    appendFileSync(REVIEW_REQUESTS_LEDGER, JSON.stringify(entry) + '\n');
+  } catch (e) { console.warn('[review_request] ledger append failed:', e.message); }
+}
+
+registerTaskHandler('review_request', async (task) => {
+  const { ownerEmail, payload } = task;
+  const { channel, senderId, senderName, customerName, customerEmail, service, datetime } = payload;
+
+  const profile = getOwnerProfile(ownerEmail);
+  const cfg     = profile?.profile?.reviewRequest || profile?.config?.reviewRequest || {};
+
+  // Opt-in gates: must be enabled AND have a URL. Silent skip otherwise.
+  if (cfg.enabled === false) {
+    appendReviewRequestLedger({ ts: new Date().toISOString(), ownerEmail, senderId, status: 'skipped-disabled' });
+    return true;
+  }
+  if (!cfg.url) {
+    console.log(`⭐ [review_request] skipped — no review URL configured for ${ownerEmail}`);
+    appendReviewRequestLedger({ ts: new Date().toISOString(), ownerEmail, senderId, status: 'skipped-no-url' });
+    return true;
+  }
+
+  const businessName = profile?.profile?.businessName || profile?.businessName || 'us';
+  const greetingName = customerName || senderName || 'there';
+
+  // Default template — short, warm, no pressure. Owner can override per
+  // dashboard. Placeholders: {customer}, {business}, {service}, {url}.
+  const tmpl = (cfg.template && typeof cfg.template === 'string')
+    ? cfg.template
+    : `Hi {customer}! Hope your {service} with {business} went well 🙏 If you have 30 seconds, a quick review really helps us out: {url}`;
+
+  const msg = tmpl
+    .replace(/\{customer\}/g, greetingName)
+    .replace(/\{business\}/g, businessName)
+    .replace(/\{service\}/g, service || 'visit')
+    .replace(/\{url\}/g, cfg.url);
+
+  // Send via the original channel (where the booking was made).
+  let channelSent = false;
+  if (channel && senderId) {
+    const channelConfig = channelConfigs.get(ownerEmail)?.[channel];
+    if (channelConfig) {
+      try {
+        await sendChannelReply(channel, channelConfig, senderId, msg);
+        channelSent = true;
+      } catch (e) { console.warn(`[review_request] ${channel} send failed:`, e.message); }
+    }
+  }
+
+  // Backup: email the customer if we have their email AND channel send failed
+  // (or send both if owner has cfg.alwaysEmail = true). One-touch normally.
+  if (customerEmail && (!channelSent || cfg.alwaysEmail)) {
+    try {
+      await smartSend({
+        ownerEmail, to: customerEmail,
+        subject: `Quick favour — review for ${businessName}?`,
+        html: `<div style="font-family:-apple-system,sans-serif;max-width:520px;margin:0 auto;padding:24px;font-size:15px;line-height:1.6;color:#222;">
+          <p>${msg.replace(cfg.url, `<a href="${cfg.url}" style="color:#00a070;font-weight:600;">leave a review</a>`)}</p>
+          <p style="margin-top:18px;font-size:12px;color:#888;">Thanks for choosing ${businessName}.</p>
+        </div>`,
+      });
+    } catch (e) { console.warn('[review_request] email send failed:', e.message); }
+  }
+
+  appendReviewRequestLedger({
+    ts: new Date().toISOString(),
+    ownerEmail, senderId, senderName: greetingName, channel,
+    service, datetime, status: 'sent',
+  });
+
+  // Webhook so connected CRMs can track review-request fires
+  fireWebhookEvent(ownerEmail, 'review_request_sent', {
+    channel, senderId, senderName: greetingName,
+    customerEmail, service, datetime, reviewUrl: cfg.url,
+  });
+
+  console.log(`⭐ [outbound] review_request sent to ${greetingName} (${ownerEmail}) via ${channel}`);
   return true;
 });
 
