@@ -56,6 +56,7 @@ import { dispatchWebhook, readWebhookLog, signPayload as signWebhookPayload } fr
 import { extractImageRefs, resolveImageRefsToBlocks } from './lib/image_intake.js';
 import { extractAudioRefs, transcribeAudioRef } from './lib/audio_intake.js';
 import { findBookingConflicts, describeConflictsForCustomer } from './lib/booking_conflicts.js';
+import { canBatch as digestCanBatch, shouldFireDigest, renderDigestHtml } from './lib/digest.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
@@ -748,6 +749,109 @@ function appendQuoteLedger(entry) {
     mkdirSync(resolve('data'), { recursive: true });
     appendFileSync(QUOTES_LEDGER_FILE, JSON.stringify(entry) + '\n');
   } catch (e) { console.warn('[quote] ledger append failed:', e.message); }
+}
+
+// ─── Notification digest buffer ──────────────────────────────────────────
+// In-memory per-owner queue of informational notifications that get
+// folded into a single daily digest email. Persisted to disk so the
+// buffer survives restarts (otherwise a 4am restart could lose the
+// 4am-5pm worth of bookings to summarise).
+const NOTIFICATION_DIGEST_FILE  = resolve('data/notification_digest.json');
+const DIGEST_LAST_SENT_FILE     = resolve('data/digest_last_sent.json');
+const notificationDigestBuffer  = new Map(); // ownerEmail → [{ts, type, summary}]
+const digestLastSentDate        = new Map(); // ownerEmail → "YYYY-MM-DD" (idempotency)
+
+function loadDigestState() {
+  try {
+    if (existsSync(NOTIFICATION_DIGEST_FILE)) {
+      const saved = JSON.parse(readFileSync(NOTIFICATION_DIGEST_FILE, 'utf8'));
+      for (const [k, v] of Object.entries(saved)) notificationDigestBuffer.set(k, v);
+    }
+  } catch (e) { console.warn('[digest] load buffer failed:', e.message); }
+  try {
+    if (existsSync(DIGEST_LAST_SENT_FILE)) {
+      const saved = JSON.parse(readFileSync(DIGEST_LAST_SENT_FILE, 'utf8'));
+      for (const [k, v] of Object.entries(saved)) digestLastSentDate.set(k, v);
+    }
+  } catch (e) { console.warn('[digest] load last-sent failed:', e.message); }
+}
+function persistDigestState() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const buf = {}; for (const [k, v] of notificationDigestBuffer) buf[k] = v;
+    writeFileSync(NOTIFICATION_DIGEST_FILE, JSON.stringify(buf, null, 2));
+    const last = {}; for (const [k, v] of digestLastSentDate) last[k] = v;
+    writeFileSync(DIGEST_LAST_SENT_FILE, JSON.stringify(last, null, 2));
+  } catch (e) { console.warn('[digest] persist failed:', e.message); }
+}
+
+// notify() — wraps smartSend with the digest-vs-immediate decision.
+// Use this INSTEAD of smartSend for owner-bound notification emails.
+// urgency: 'immediate' (default for unknown event types) | 'digest'
+//   (only honoured if the type is in the canBatch whitelist).
+// type:    event-type string (e.g. 'new_lead', 'handoff', 'quote_drafted')
+//          used to (a) decide batchability, (b) group in the digest UI.
+// summary: short one-line text shown in the digest row. If urgency is
+//          immediate, summary is ignored (full html sent as-is).
+async function notify({ ownerEmail, type, subject, html, summary, urgency }) {
+  if (!ownerEmail) return;
+  const profile = getOwnerProfile(ownerEmail);
+  const cfg = profile?.profile?.notificationDigest || profile?.config?.notificationDigest || {};
+  const digestOn = !!cfg.enabled;
+
+  const shouldBatch = digestOn && urgency !== 'immediate' && digestCanBatch(type);
+
+  if (shouldBatch) {
+    const buf = notificationDigestBuffer.get(ownerEmail) || [];
+    buf.push({ ts: new Date().toISOString(), type, summary: String(summary || subject || type).slice(0, 280) });
+    // Cap per-owner buffer to last 500 entries (prevents runaway memory)
+    if (buf.length > 500) buf.splice(0, buf.length - 500);
+    notificationDigestBuffer.set(ownerEmail, buf);
+    persistDigestState();
+    return; // not sent now — will roll into the next digest fire
+  }
+
+  // Immediate path
+  try {
+    await smartSend({ ownerEmail, to: ownerEmail, subject, html });
+  } catch (e) { console.warn('[notify] send failed:', e.message); }
+}
+
+// Per-minute tick to flush due digests. Each owner fires exactly once
+// per local date — guarded by digestLastSentDate (resists clock skew,
+// double-tick within the same minute, and replay-on-restart).
+async function tickDigests() {
+  for (const [ownerEmail, entries] of notificationDigestBuffer) {
+    if (!entries || entries.length === 0) continue;
+    const profile = getOwnerProfile(ownerEmail);
+    const cfg = profile?.profile?.notificationDigest || profile?.config?.notificationDigest || {};
+    if (!cfg.enabled) continue;
+    if (!shouldFireDigest(cfg)) continue;
+
+    const todayLocal = (() => {
+      try {
+        return new Intl.DateTimeFormat('en-CA', { timeZone: cfg.timezone || 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+      } catch { return new Date().toISOString().slice(0, 10); }
+    })();
+    if (digestLastSentDate.get(ownerEmail) === todayLocal) continue;
+
+    // Send + clear
+    const businessName = profile?.profile?.businessName || profile?.businessName || 'your business';
+    const html = renderDigestHtml(entries, businessName);
+    if (html) {
+      try {
+        await smartSend({
+          ownerEmail, to: ownerEmail,
+          subject: `📋 Aria's daily digest — ${entries.length} event${entries.length === 1 ? '' : 's'}`,
+          html,
+        });
+        console.log(`📋 [digest] sent ${entries.length}-entry digest to ${ownerEmail}`);
+      } catch (e) { console.warn('[digest] send failed:', e.message); }
+    }
+    notificationDigestBuffer.set(ownerEmail, []);
+    digestLastSentDate.set(ownerEmail, todayLocal);
+    persistDigestState();
+  }
 }
 
 function loadInvites() {
@@ -2251,6 +2355,9 @@ function save(name, data, delay = 500) {
 
   // Pending quotes (owner approval queue for AI-drafted price quotes)
   loadPendingQuotes();
+
+  // Notification digest buffer (informational alerts batched into daily email)
+  loadDigestState();
 
   console.log(`📂 Loaded: ${savedFaqs.length} FAQs, ${savedBookings.length} bookings, ${savedProducts.length} products, ${savedDsOrders.length} dropship orders, ${usage.messages} msgs this month`);
 })();
@@ -10009,6 +10116,53 @@ app.post('/api/dashboard/webhooks/:index/test', async (req, res) => {
   res.json(result);
 });
 
+// ─── Notification digest settings ────────────────────────────────────────
+// Owners with high inbound volume can opt-in to batch informational
+// alerts (new lead, booking, review sent, conv recovery, etc) into a
+// single email at their local sendTime. Action-required alerts
+// (handoff, no-show, quote approval, angry message) always immediate.
+
+app.get('/api/dashboard/notifications/settings', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const profile = getOwnerProfile(owner);
+  const cfg = profile?.profile?.notificationDigest || profile?.config?.notificationDigest || {};
+  const buffered = (notificationDigestBuffer.get(owner) || []).length;
+  res.json({
+    settings: {
+      enabled:  !!cfg.enabled,
+      sendTime: cfg.sendTime || '17:00',
+      timezone: cfg.timezone || profile?.profile?.businessHours?.timezone || 'Europe/London',
+    },
+    queuedToday: buffered,
+    lastDigestSent: digestLastSentDate.get(owner) || null,
+  });
+});
+
+app.post('/api/dashboard/notifications/settings', express.json({ limit: '4kb' }), (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { enabled = false, sendTime = '17:00', timezone } = req.body || {};
+  // Validate sendTime format
+  if (!/^\d{1,2}:\d{2}$/.test(sendTime)) return res.status(400).json({ error: 'sendTime must be HH:MM' });
+
+  let profileKey = null, profileEntry = null;
+  for (const [k, v] of clientProfiles) {
+    if (v?.profile?.email === owner) { profileKey = k; profileEntry = v; break; }
+  }
+  if (!profileEntry) {
+    profileEntry = { profile: { email: owner }, scannedAt: new Date().toISOString() };
+    clientProfiles.set(owner, profileEntry);
+  }
+  profileEntry.profile.notificationDigest = {
+    enabled:  !!enabled,
+    sendTime: String(sendTime),
+    timezone: timezone || profileEntry.profile?.businessHours?.timezone || 'Europe/London',
+  };
+  clientProfiles.set(profileKey || owner, profileEntry);
+  res.json({ ok: true, settings: profileEntry.profile.notificationDigest });
+});
+
 // ─── Review request settings ─────────────────────────────────────────────
 // Owners configure their Google Place review URL (or Trustpilot, Facebook
 // reviews, etc) + optional custom template. Aria auto-sends a follow-up
@@ -12944,6 +13098,9 @@ async function loadSettings() {
         Gmail Settings
       </a>
 
+      <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">📋 Notification digest <span style="font-size:11px;font-weight:400;color:#9898b8;">— batch informational alerts into one daily email</span></h4>
+      <div id="digest-panel"><div class="empty" style="padding:14px 0;font-size:12px;">Loading…</div></div>
+
       <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">⭐ Review requests <span style="font-size:11px;font-weight:400;color:#9898b8;">— Aria auto-asks for a Google review 24h after each booking</span></h4>
       <div id="reviews-panel"><div class="empty" style="padding:14px 0;font-size:12px;">Loading…</div></div>
 
@@ -12952,6 +13109,7 @@ async function loadSettings() {
     \`;
     loadWebhooks();
     loadReviewSettings();
+    loadDigestSettings();
   } catch (e) { body.innerHTML = '<div class="empty">Failed to load settings.</div>'; }
 }
 
@@ -13047,6 +13205,53 @@ async function testWebhook(idx) {
     else toast('✗ ' + (r.reason || r.error || ('status ' + r.status)));
     setTimeout(loadWebhooks, 500);
   } catch (e) { toast('Test failed'); }
+}
+
+// ─── Notification digest settings panel ─────────────────────────────────
+async function loadDigestSettings() {
+  const el = document.getElementById('digest-panel');
+  if (!el) return;
+  try {
+    const d = await api('/api/dashboard/notifications/settings');
+    const s = d.settings || {};
+    const queued = d.queuedToday || 0;
+    const lastSent = d.lastDigestSent ? ' · last sent ' + d.lastDigestSent : '';
+
+    el.innerHTML =
+      '<div style="background:rgba(157,150,255,0.04);border:1px solid rgba(157,150,255,0.2);border-radius:10px;padding:14px;">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
+          '<div style="font-size:12px;color:#fff;font-weight:600;">Batch informational alerts <span style="color:#8888aa;font-weight:400;font-size:11px;">· ' + queued + ' queued today' + lastSent + '</span></div>' +
+          '<label class="toggle"><input type="checkbox" id="nd-enabled" ' + (s.enabled ? 'checked' : '') + '><span class="slider"></span></label>' +
+        '</div>' +
+        '<p style="font-size:11.5px;color:#9898b8;margin:0 0 12px;line-height:1.5;">When on, low-urgency events (new leads, bookings, review requests, conflict deflections) batch into one daily email. Urgent stuff (handoffs, angry messages, no-show predictions, quote approvals) still fire immediately.</p>' +
+        '<div style="display:flex;gap:10px;align-items:flex-end;">' +
+          '<div class="form-group" style="flex:0 0 120px;margin-bottom:0;">' +
+            '<label style="font-size:11px;">Send time</label>' +
+            '<input id="nd-sendTime" type="time" value="' + escH(s.sendTime || '17:00') + '" style="font-family:inherit;font-size:13px;">' +
+          '</div>' +
+          '<div class="form-group" style="flex:1;margin-bottom:0;">' +
+            '<label style="font-size:11px;">Timezone</label>' +
+            '<input id="nd-timezone" value="' + escH(s.timezone || 'Europe/London') + '" placeholder="Europe/London" style="font-family:monospace;font-size:12px;">' +
+          '</div>' +
+          '<button class="btn-save" onclick="saveDigestSettings()" style="flex:0 0 80px;">Save</button>' +
+        '</div>' +
+      '</div>';
+  } catch (e) { el.innerHTML = '<div class="empty">Failed to load digest settings.</div>'; }
+}
+
+async function saveDigestSettings() {
+  const body = {
+    enabled:  document.getElementById('nd-enabled').checked,
+    sendTime: document.getElementById('nd-sendTime').value || '17:00',
+    timezone: document.getElementById('nd-timezone').value.trim() || 'Europe/London',
+  };
+  try {
+    const r = await apiPost('/api/dashboard/notifications/settings', body);
+    if (r.ok) {
+      toast(body.enabled ? '✓ Digest mode on — informational alerts batch into ' + body.sendTime + ' email' : '✓ Digest off — all alerts fire immediately');
+      loadDigestSettings();
+    } else { toast(r.error || 'Failed'); }
+  } catch (e) { toast('Save failed'); }
 }
 
 // ─── Review-request settings panel ──────────────────────────────────────
@@ -15221,6 +15426,13 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
         persistChannelMessages();
 
         console.log(`⚠️  [booking-conflict] Blocked double-book for ${ownerEmail} at ${merged.datetime} (${conflicts.length} conflict(s))`);
+        // FYI to owner (batched into digest when digest mode is on)
+        await notify({
+          ownerEmail, type: 'booking_conflict_blocked',
+          subject: `⚠️ Aria averted a double-book`,
+          html: `<p>${senderName} tried to book ${merged.datetime} but you already have a booking at that time. Aria deflected + asked for an alternative slot.</p>`,
+          summary: `${senderName} → ${merged.datetime} (slot taken)`,
+        });
         // Done — return early so we don't push or fire confirmation
         return;
       }
@@ -15751,6 +15963,15 @@ registerTaskHandler('review_request', async (task) => {
     customerEmail, service, datetime, reviewUrl: cfg.url,
   });
 
+  // Digest-friendly FYI for the owner (batched when digest mode on,
+  // skipped when off — no spammy "review sent" email per-customer).
+  await notify({
+    ownerEmail, type: 'review_sent',
+    subject: `⭐ Review request sent — ${greetingName}`,
+    html: `<p>Aria asked ${greetingName} for a review on ${channel}.</p>`,
+    summary: `${greetingName} · ${channel}${service ? ' · ' + service : ''}`,
+  });
+
   console.log(`⭐ [outbound] review_request sent to ${greetingName} (${ownerEmail}) via ${channel}`);
   return true;
 });
@@ -15789,6 +16010,10 @@ registerTaskHandler('conv_recovery', async (task) => {
 const _pendingCount = bootstrapFromLedger();
 console.log(`📅 Outbound scheduler: ${_pendingCount} pending tasks loaded from ledger`);
 startTickLoop(60_000);
+
+// Notification-digest tick — runs every minute, flushes buffered
+// informational alerts for any owner whose local sendTime is "now".
+setInterval(() => { tickDigests().catch(e => console.error('[digest] tick failed:', e.message)); }, 60_000);
 
 // Daily 8am sentiment digest — sums yesterday's negative + angry interactions
 // from channel_leads.jsonl, emails owner a digest with examples. Only fires
