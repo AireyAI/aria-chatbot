@@ -9937,6 +9937,171 @@ app.get('/api/dashboard/activity', (req, res) => {
   res.json({ events: events.slice(0, limit) });
 });
 
+// GET /api/dashboard/channel-gaps — clustered list of unanswered customer
+// questions for the Train Aria section. Clusters by simple token-overlap
+// so "do you do dog grooming" and "are dogs welcome for grooming" merge.
+app.get('/api/dashboard/channel-gaps', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const items = [];
+  try {
+    if (existsSync(CHANNEL_GAPS_FILE)) {
+      const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000; // last 30 days
+      for (const line of readFileSync(CHANNEL_GAPS_FILE, 'utf8').split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const e = JSON.parse(line);
+          if (e.ownerEmail !== owner) continue;
+          if (new Date(e.ts).getTime() < cutoff) continue;
+          items.push(e);
+        } catch {}
+      }
+    }
+  } catch {}
+  // Cluster — token jaccard >= 0.4 = same gap
+  const tokenise = (s) => new Set(String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length > 3));
+  const clusters = [];
+  for (const it of items) {
+    const tks = tokenise(it.question);
+    let matched = null;
+    for (const c of clusters) {
+      const inter = [...c.tokens].filter(t => tks.has(t)).length;
+      const union = new Set([...c.tokens, ...tks]).size;
+      const jaccard = union ? inter / union : 0;
+      if (jaccard >= 0.4) { matched = c; break; }
+    }
+    if (matched) {
+      matched.examples.push(it);
+      matched.count++;
+      matched.lastSeen = it.ts > matched.lastSeen ? it.ts : matched.lastSeen;
+      for (const t of tks) matched.tokens.add(t);
+    } else {
+      clusters.push({ tokens: tks, examples: [it], count: 1, firstSeen: it.ts, lastSeen: it.ts });
+    }
+  }
+  // Sort by count desc — most-asked unanswered questions first
+  clusters.sort((a, b) => b.count - a.count);
+  res.json({
+    clusters: clusters.slice(0, 25).map(c => ({
+      count: c.count,
+      lastSeen: c.lastSeen,
+      examples: c.examples.slice(0, 3).map(e => ({ question: e.question, channel: e.channel, ariaReply: e.ariaReply, reason: e.reason })),
+      sampleQuestion: c.examples[0].question,
+    })),
+    totalGaps: items.length,
+  });
+});
+
+// POST /api/dashboard/gap-to-kb — owner picks one gap cluster, Claude
+// drafts a knowledge document that would have prevented the fallback.
+app.post('/api/dashboard/gap-to-kb', express.json({ limit: '32kb' }), async (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { questions } = req.body || {};
+  if (!Array.isArray(questions) || !questions.length) {
+    return res.status(400).json({ error: 'questions array required' });
+  }
+  const profile = getOwnerProfile(owner);
+  const businessHint = profile?.profile?.businessName
+    ? `\nBUSINESS: ${profile.profile.businessName}${profile.profile.services ? ` — services: ${profile.profile.services}` : ''}`
+    : '';
+  try {
+    const r = await callClaudeWithFallback({
+      max_tokens: 800,
+      messages: [{ role: 'user', content: `Draft a knowledge document for an AI customer-service bot. Customers have asked these questions but the bot didn't have a confident answer — what should we tell the bot so it CAN answer next time?${businessHint}
+
+UNANSWERED QUESTIONS:
+${questions.map((q, i) => `${i + 1}. "${q}"`).join('\n')}
+
+Reply with valid JSON only:
+{
+  "title": "Short title (e.g. 'Dog grooming services + policy')",
+  "content": "200-500 word knowledge doc the bot will cite. Address the questions above. Be honest about what you DON'T know — leave [PLACEHOLDER: ...] markers for facts the owner needs to fill (e.g. [PLACEHOLDER: price for full groom]). Use bullet structure where helpful.",
+  "needsOwnerInput": ["short list of placeholders the owner must fill before this doc is useful"]
+}` }],
+    });
+    const text = r.content[0]?.text || '';
+    try {
+      const parsed = JSON.parse(text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim());
+      res.json({
+        draft: {
+          title: parsed.title || 'Knowledge update',
+          content: parsed.content || '',
+          needsOwnerInput: Array.isArray(parsed.needsOwnerInput) ? parsed.needsOwnerInput : [],
+        },
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'AI returned invalid JSON', raw: text.slice(0, 500) });
+    }
+  } catch (e) {
+    res.status(500).json({ error: 'Draft failed: ' + e.message });
+  }
+});
+
+// POST /api/dashboard/test-aria — sandbox endpoint that runs an owner's
+// test question through the SAME pipeline as a live channel message,
+// minus the actual send. Returns Aria's full response + classification
+// + which knowledge chunks she cited. Lets owner validate training.
+app.post('/api/dashboard/test-aria', express.json({ limit: '32kb' }), async (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { message, simulateChannel = 'instagram' } = req.body || {};
+  if (!message) return res.status(400).json({ error: 'message required' });
+
+  const profile = getOwnerProfile(owner);
+  const systemPrompt = profile?.systemPrompt || `You are a helpful business assistant for ${owner}.`;
+  const allowedTopics = profile?.config?.allowedTopics || profile?.allowedTopics || profile?.profile?.allowedTopics || null;
+
+  // FAQ KB
+  const kbEntries = knowledgeBase.get(owner) || [];
+  const kbContext = kbEntries.length
+    ? '\n\nFREQUENTLY ASKED QUESTIONS:\n' + kbEntries.map(e => `Q: ${e.question}\nA: ${e.answer}`).join('\n\n')
+    : '';
+
+  // RAG over uploaded docs
+  const ownerDocs = knowledgeDocs.get(owner) || [];
+  const ragChunks = ownerDocs.length ? retrieveRelevantChunks(message, ownerDocs, { topK: 3 }) : [];
+  const ragContext = ragChunks.length
+    ? '\n\nRELEVANT DOCUMENT EXCERPTS (cite these for accuracy — DO NOT make up details not in them):\n' +
+      ragChunks.map(c => `[from "${c.title}"] ${c.content}`).join('\n\n')
+    : '';
+
+  const channelLimits = {
+    whatsapp: 'Keep replies under 300 words. Use short paragraphs. No HTML.',
+    instagram: 'Keep replies under 200 words. Casual, friendly tone. No HTML.',
+    facebook: 'Keep replies under 300 words. Friendly and professional. No HTML.',
+  };
+  const channelInstructions = `\n\nYou are replying via ${simulateChannel}. ${channelLimits[simulateChannel] || ''} Never mention you are AI — write as a team member.`;
+
+  try {
+    const reply = await generateChannelReply(
+      systemPrompt + kbContext + ragContext + channelInstructions,
+      'Test User', message,
+      { allowedTopics }
+    );
+    if (!reply) return res.status(500).json({ error: 'Reply generation failed' });
+    res.json({
+      reply: {
+        text: reply.text,
+        suggestedReplies: reply.suggestedReplies || [],
+        sentiment: reply.sentiment,
+        urgency: reply.urgency,
+        language: reply.language,
+        outOfScope: reply.outOfScope,
+        needsHuman: reply.needsHuman,
+        handoffReason: reply.handoffReason,
+        booking: reply.booking,
+        contact: reply.contact,
+        showServicesCarousel: reply.showServicesCarousel,
+      },
+      citedChunks: ragChunks.map(c => ({ title: c.title, preview: c.content.slice(0, 200), score: c.score })),
+      tokensUsed: reply._tokensUsed || 0,
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Test failed: ' + e.message });
+  }
+});
+
 // POST /api/dashboard/ai-train — one-shot wizard. Takes a website URL
 // and/or short business description, scrapes the site (if URL given),
 // and asks Claude to draft a knowledge document + service-carousel cards
@@ -11095,13 +11260,142 @@ async function loadTrainAria() {
   const body = document.getElementById('body-train');
   body.innerHTML = '<div style="padding:8px 0;">' +
     '<p style="font-size:13px;color:#9898b8;margin-bottom:18px;">Teach Aria your business — answers, documents, services, and what topics she should + shouldn\\'t handle.</p>' +
+    '<div id="train-test" style="margin-bottom:28px;"></div>' +
+    '<div id="train-gaps" style="margin-bottom:28px;"></div>' +
     '<div id="train-quick" style="margin-bottom:28px;"></div>' +
     '<div id="train-knowledge" style="margin-bottom:28px;"></div>' +
     '<div id="train-services" style="margin-bottom:28px;"></div>' +
     '<div id="train-scope" style="margin-bottom:8px;"></div>' +
   '</div>';
+  renderTestAriaCard();
   renderQuickTrainCard();
-  await Promise.all([loadKnowledgeDocs(), loadServicesEditor(), loadScopeEditor()]);
+  await Promise.all([loadKnowledgeDocs(), loadServicesEditor(), loadScopeEditor(), loadKnowledgeGaps()]);
+}
+
+// ─── Test Aria sandbox ────────────────────────────────────────────────────
+function renderTestAriaCard() {
+  const el = document.getElementById('train-test');
+  el.innerHTML =
+    '<div style="background:rgba(0,229,160,0.04);border:1px solid rgba(0,229,160,0.2);border-radius:14px;padding:18px;">' +
+      '<h4 style="font-size:14px;color:#fff;margin-bottom:6px;display:flex;align-items:center;gap:8px;">🧪 Test Aria <span style="font-size:11px;font-weight:400;color:#9898b8;">— ask her anything, see how she\\'d reply</span></h4>' +
+      '<p style="font-size:12.5px;color:#9898b8;margin-bottom:12px;line-height:1.6;">Type a question a real customer might ask. Aria will reply using your current knowledge + scope settings. Test things before real customers hit them.</p>' +
+      '<div style="display:flex;gap:8px;margin-bottom:12px;">' +
+        '<input id="ta-q" placeholder="e.g. Do you do same-day bookings?" style="flex:1;" onkeydown="if(event.key===\\'Enter\\')testAria()">' +
+        '<button class="cta-btn" onclick="testAria()" id="ta-btn">Ask Aria</button>' +
+      '</div>' +
+      '<div id="ta-result"></div>' +
+    '</div>';
+}
+
+async function testAria() {
+  const q = document.getElementById('ta-q').value.trim();
+  if (!q) { toast('Type a question first'); return; }
+  const btn = document.getElementById('ta-btn');
+  const result = document.getElementById('ta-result');
+  btn.disabled = true;
+  btn.textContent = '⏳';
+  result.innerHTML = '';
+  try {
+    const r = await apiPost('/api/dashboard/test-aria', { message: q });
+    if (r.error) { toast(r.error); btn.disabled = false; btn.textContent = 'Ask Aria'; return; }
+    const reply = r.reply;
+    const badges = [];
+    if (reply.sentiment) badges.push('Sentiment: <b>' + reply.sentiment + '</b>');
+    if (reply.urgency)   badges.push('Urgency: <b>' + reply.urgency + '</b>');
+    if (reply.language && reply.language !== 'en') badges.push('Language: <b>' + reply.language + '</b>');
+    if (reply.outOfScope) badges.push('<span style="color:#ff6b6b">⚠️ OUT OF SCOPE</span>');
+    if (reply.needsHuman) badges.push('<span style="color:#fbbf24">🤝 NEEDS HUMAN</span>');
+    if (reply.booking)    badges.push('<span style="color:#00e5a0">📅 BOOKING DETECTED</span>');
+    if (reply.showServicesCarousel) badges.push('<span style="color:#9d96ff">🎠 SHOWS CAROUSEL</span>');
+    result.innerHTML =
+      '<div style="background:rgba(255,255,255,0.03);border-radius:10px;padding:14px;">' +
+        '<div style="font-size:11.5px;color:#8888aa;margin-bottom:6px;">Aria\\'s reply:</div>' +
+        '<div style="color:#eee;font-size:13.5px;line-height:1.6;white-space:pre-wrap;margin-bottom:10px;">' + escH(reply.text) + '</div>' +
+        (reply.suggestedReplies?.length ? '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">' + reply.suggestedReplies.map(s => '<span style="background:rgba(0,229,160,0.1);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:20px;padding:4px 12px;font-size:11.5px;">' + escH(s) + '</span>').join('') + '</div>' : '') +
+        (badges.length ? '<div style="font-size:11px;color:#8888aa;margin-top:8px;">' + badges.join(' · ') + '</div>' : '') +
+        (r.citedChunks?.length ? '<div style="margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.06);"><div style="font-size:11px;color:#8888aa;margin-bottom:6px;">📚 Cited from your knowledge:</div>' + r.citedChunks.map(c => '<div style="font-size:11.5px;color:#aaa;margin:3px 0;"><b>' + escH(c.title) + '</b>: ' + escH(c.preview) + '…</div>').join('') + '</div>' : '') +
+      '</div>';
+    btn.disabled = false;
+    btn.textContent = 'Ask Aria';
+  } catch (e) { toast('Test failed: ' + e.message); btn.disabled = false; btn.textContent = 'Ask Aria'; }
+}
+
+// ─── Knowledge Gaps panel ────────────────────────────────────────────────
+async function loadKnowledgeGaps() {
+  const el = document.getElementById('train-gaps');
+  try {
+    const d = await api('/api/dashboard/channel-gaps');
+    if (!d.clusters?.length) {
+      el.innerHTML =
+        '<div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:16px;">' +
+          '<h4 style="font-size:14px;color:#fff;margin-bottom:4px;">🕳️ Knowledge Gaps</h4>' +
+          '<p style="font-size:12px;color:#8888aa;">No gaps in the last 30 days — Aria is answering everything customers ask. Nice.</p>' +
+        '</div>';
+      return;
+    }
+    el.innerHTML =
+      '<div style="background:rgba(251,191,36,0.04);border:1px solid rgba(251,191,36,0.25);border-radius:14px;padding:18px;">' +
+        '<h4 style="font-size:14px;color:#fff;margin-bottom:6px;display:flex;align-items:center;gap:8px;">🕳️ Knowledge Gaps <span style="background:rgba(251,191,36,0.2);color:#fbbf24;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;">' + d.clusters.length + '</span></h4>' +
+        '<p style="font-size:12.5px;color:#9898b8;margin-bottom:14px;line-height:1.6;">Customers asked these questions but Aria fell back to vague answers. Click any to have her draft a knowledge entry that\\'ll fix it.</p>' +
+        '<div style="display:flex;flex-direction:column;gap:8px;">' +
+          d.clusters.map((c, i) => '<div style="background:rgba(255,255,255,0.04);border-radius:10px;padding:12px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;">' +
+            '<div style="flex:1;min-width:0;">' +
+              '<div style="font-size:13px;color:#eee;overflow:hidden;text-overflow:ellipsis;">' + escH(c.sampleQuestion) + '</div>' +
+              '<div style="font-size:11px;color:#8888aa;margin-top:3px;">' + c.count + ' time' + (c.count > 1 ? 's' : '') + ' · last asked ' + timeAgo(c.lastSeen) + '</div>' +
+            '</div>' +
+            '<button onclick="draftGapKb(' + i + ')" style="background:rgba(251,191,36,0.15);color:#fbbf24;border:1px solid rgba(251,191,36,0.3);border-radius:6px;padding:4px 12px;font-size:11.5px;cursor:pointer;font-family:inherit;flex-shrink:0;">✨ Draft answer</button>' +
+          '</div>').join('') +
+        '</div>' +
+        '<div id="gap-draft" style="margin-top:14px;"></div>' +
+      '</div>';
+    window._gaps = d.clusters;
+  } catch (e) {
+    el.innerHTML = '<div class="empty">Failed to load knowledge gaps.</div>';
+  }
+}
+
+async function draftGapKb(idx) {
+  const cluster = window._gaps?.[idx];
+  if (!cluster) return;
+  const draftEl = document.getElementById('gap-draft');
+  draftEl.innerHTML = '<div style="background:rgba(255,255,255,0.03);padding:14px;border-radius:10px;color:#8888aa;font-size:13px;">⏳ Aria is drafting a knowledge entry from these questions…</div>';
+  try {
+    const questions = cluster.examples.map(e => e.question);
+    const r = await apiPost('/api/dashboard/gap-to-kb', { questions });
+    if (r.error) { draftEl.innerHTML = '<div style="color:#ff6b6b">' + r.error + '</div>'; return; }
+    const draft = r.draft;
+    const placeholderWarning = draft.needsOwnerInput?.length
+      ? '<div style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);border-radius:8px;padding:10px;margin-bottom:10px;font-size:12px;color:#fbbf24;"><b>⚠️ You need to fill in these placeholders before it\\'s useful:</b><br>' + draft.needsOwnerInput.map(p => '· ' + escH(p)).join('<br>') + '</div>'
+      : '';
+    draftEl.innerHTML =
+      '<div style="background:rgba(0,229,160,0.05);border:1px solid rgba(0,229,160,0.3);border-radius:12px;padding:14px;">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">' +
+          '<b style="color:#00e5a0;font-size:13px;">📝 Aria\\'s draft</b>' +
+          '<div style="display:flex;gap:8px;">' +
+            '<button onclick="document.getElementById(\\'gap-draft\\').innerHTML=\\'\\'" style="background:rgba(255,255,255,0.06);color:#8888aa;border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:4px 12px;font-size:11px;cursor:pointer;font-family:inherit;">Discard</button>' +
+            '<button onclick="acceptGapDraft()" style="background:#00e5a0;color:#0d0d1f;border:none;border-radius:6px;padding:4px 14px;font-size:11.5px;font-weight:600;cursor:pointer;font-family:inherit;">+ Add to knowledge</button>' +
+          '</div>' +
+        '</div>' +
+        placeholderWarning +
+        '<div class="form-group" style="margin-bottom:10px;"><label>Title</label><input id="gap-title" value="' + escH(draft.title) + '"></div>' +
+        '<div class="form-group"><label>Content (edit before accepting)</label><textarea id="gap-content" rows="8">' + escH(draft.content) + '</textarea></div>' +
+      '</div>';
+    window._gapDraft = draft;
+  } catch (e) { draftEl.innerHTML = '<div style="color:#ff6b6b">Draft failed: ' + e.message + '</div>'; }
+}
+
+async function acceptGapDraft() {
+  const title = document.getElementById('gap-title').value.trim();
+  const content = document.getElementById('gap-content').value.trim();
+  if (!title || !content) { toast('Title + content required'); return; }
+  try {
+    const r = await apiPost('/api/dashboard/knowledge', { title, content });
+    if (r.ok) {
+      toast('✓ Added — Aria will use this next time customers ask');
+      document.getElementById('gap-draft').innerHTML = '';
+      loadKnowledgeDocs();
+    } else toast(r.error || 'Save failed');
+  } catch (e) { toast('Save failed'); }
 }
 
 // ─── Quick Train wizard — one-line input → full draft via Claude ─────────
@@ -12412,6 +12706,23 @@ function recordTokenUsage(ownerEmail, tokensUsed) {
   }
 }
 
+// Channel knowledge-gap ledger. Distinct from the existing widget /api/gap
+// system — those came from the chat-widget on websites. This one tracks
+// FB/IG/WA conversations where Aria fell back to vague answers, so owners
+// can fix the underlying knowledge.
+const CHANNEL_GAPS_FILE = resolve('data/channel_gaps.jsonl');
+function appendChannelGap(entry) {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    appendFileSync(CHANNEL_GAPS_FILE, JSON.stringify(entry) + '\n');
+  } catch (e) { console.warn('[channel-gap] append failed:', e.message); }
+}
+
+// Heuristic: Aria's reply signals a knowledge gap when it leans on these
+// fallback phrases. Tuned for the warm-but-uncertain answers that mean
+// "I should have known this but didn't".
+const GAP_FALLBACK_RE = /\b(i\s?[''']?(?:ll|will)\s+(?:have|get|let)\s+(?:the\s+team|someone)|let me check|i[''']?m not sure|i don[''']?t (?:have|know)|the team will|i[''']?ll pass this on|let me get back|will need to confirm|don[''']?t have that (?:info|detail)|can[''']?t answer that|outside my (?:scope|knowledge))\b/i;
+
 // CSAT ledger — append-only, one line per rating event.
 const CSAT_FILE = resolve('data/csat.jsonl');
 function appendCsat(entry) {
@@ -12828,6 +13139,23 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     });
     console.log(`📱 [${channel}] Lead scored: ${leadScore} / ${category} (conv=${convLen})`);
   } catch (e) { console.warn('[channel-lead] scoring failed:', e.message); }
+
+  // Knowledge gap detection — if Aria's reply fell back to vague language
+  // OR she explicitly said outOfScope, log the question so the owner can
+  // train her on it later. Clusters of similar gaps trigger auto-draft.
+  try {
+    const fellBack = GAP_FALLBACK_RE.test(reply.text || '');
+    if (fellBack || reply.outOfScope) {
+      appendChannelGap({
+        ts: new Date().toISOString(),
+        ownerEmail, channel, senderId,
+        question: messageText.slice(0, 500),
+        ariaReply: (reply.text || '').slice(0, 300),
+        reason: reply.outOfScope ? 'out-of-scope' : 'low-confidence-fallback',
+      });
+      console.log(`🕳️ [${channel}] Gap logged: "${messageText.slice(0, 60)}..."`);
+    }
+  } catch (e) { console.warn('[channel-gap] log failed:', e.message); }
 
   // CSAT trigger — when the customer's CURRENT message contains closure
   // language and we have at least 2 exchanges deep + haven't asked CSAT
