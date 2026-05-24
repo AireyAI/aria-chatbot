@@ -48,6 +48,7 @@ import { routeChat }                    from './lib/lead_router.js';
 import { decideLeadAction, policyAddendum } from './lib/lead_policy.js';
 import { scoreChannelLead, categorizeChannelMessage } from './lib/channel_lead_scorer.js';
 import { retrieveRelevantChunks } from './lib/rag_retriever.js';
+import { buildIcsEvent, parseBookingDateTime } from './lib/ics_builder.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
@@ -10354,6 +10355,31 @@ app.get('/api/dashboard/bookings', (req, res) => {
   res.json({ bookings: ownerBookings });
 });
 
+// GET /api/dashboard/booking-ics/:filename — owner downloads the .ics for a
+// past booking. Auth gated + filename sandboxed to prevent path traversal.
+app.get('/api/dashboard/booking-ics/:filename', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const filename = String(req.params.filename || '');
+  // Hard sandbox: only allow our own filename pattern
+  if (!/^booking-[A-Za-z0-9_\-@.]+\.ics$/.test(filename)) {
+    return res.status(400).send('invalid filename');
+  }
+  const path = join(BOOKING_ICS_DIR, filename);
+  try {
+    if (!existsSync(path)) return res.status(404).send('not found');
+    // Verify this booking belongs to this owner (filename contains owner email)
+    if (!filename.includes(owner.replace(/[^a-zA-Z0-9]/g, ''))) {
+      return res.status(403).send('not your booking');
+    }
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(readFileSync(path));
+  } catch (e) {
+    res.status(500).send('read failed: ' + e.message);
+  }
+});
+
 // GET /api/dashboard/profile
 app.get('/api/dashboard/profile', (req, res) => {
   const owner = requireDashboardAuth(req, res);
@@ -11729,14 +11755,29 @@ async function loadBookings() {
   try {
     const d = await api('/api/dashboard/bookings');
     if (!d.bookings.length) {
-      body.innerHTML = '<div class="cta-card"><h4>No bookings yet</h4><p>When customers DM asking to book/hire, Aria collects the details (name, contact, when) and saves it here. Customers can ask via any connected channel.</p></div>';
+      body.innerHTML = '<div class="cta-card"><h4>No bookings yet</h4><p>When customers DM asking to book/hire, Aria collects the details (name, contact, when) and saves it here — plus emails you a calendar invite and the customer a confirmation.</p></div>';
       return;
     }
-    let html = '<table><thead><tr><th>Date</th><th>Client</th><th>Service</th></tr></thead><tbody>';
+    const icons = { email: '📧', facebook: '📘', instagram: '📷', whatsapp: '💬' };
+    let html = '<div style="display:flex;flex-direction:column;gap:10px;">';
     for (const b of d.bookings) {
-      html += '<tr><td>' + escH(b.datetime || b.date || '—') + '</td><td>' + escH(b.name || '—') + '</td><td>' + escH(b.service || b.siteName || '—') + '</td></tr>';
+      const when = b.datetime || b.date || '—';
+      const channel = b.channel || 'email';
+      const icsBtn = b.icsFilename
+        ? '<a href="/api/dashboard/booking-ics/' + encodeURIComponent(b.icsFilename) + '?' + Q + '" download style="background:rgba(0,229,160,0.15);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:6px;padding:4px 10px;font-size:11px;text-decoration:none;flex-shrink:0;">📅 .ics</a>'
+        : '';
+      html += '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:12px 14px;display:flex;align-items:center;gap:12px;">' +
+        '<div style="font-size:18px;flex-shrink:0;">' + (icons[channel] || '📅') + '</div>' +
+        '<div style="flex:1;min-width:0;">' +
+          '<div style="font-size:13px;color:#fff;font-weight:600;">' + escH(b.name || '—') + (b.service ? ' <span style="color:#8888aa;font-weight:400;">— ' + escH(b.service) + '</span>' : '') + '</div>' +
+          '<div style="font-size:11.5px;color:#00e5a0;margin-top:2px;">📅 ' + escH(when) + '</div>' +
+          (b.contact ? '<div style="font-size:11.5px;color:#8888aa;margin-top:2px;">' + escH(b.contact) + '</div>' : '') +
+          (b.notes ? '<div style="font-size:11px;color:#6b6b8a;margin-top:4px;font-style:italic;">' + escH(b.notes) + '</div>' : '') +
+        '</div>' +
+        icsBtn +
+      '</div>';
     }
-    html += '</tbody></table>';
+    html += '</div>';
     body.innerHTML = html;
   } catch (e) { body.innerHTML = '<div class="empty">Failed to load bookings.</div>'; }
 }
@@ -12477,7 +12518,7 @@ Rules:
 - Offer to arrange a call or visit when appropriate
 - Sign off with the business name
 - Plain text only, no HTML tags
-- If a date/time/appointment is mentioned, extract into booking object
+- If a date/time/appointment is mentioned, extract into booking object. RESOLVE relative dates ("tomorrow", "next Tuesday at 2pm") into an ISO 8601 datetime in UTC if possible — e.g. "2026-05-28T14:00:00Z". If only a date is given (no time), default to 10:00 local. If ambiguous, set datetime to the user's original phrasing.
 - If sender shared their email or phone anywhere in this message OR conversation history, extract into contact object — otherwise leave fields null
 - sentiment: classify the sender's tone. "angry" = swearing, threats, all-caps frustration, repeated complaints. "negative" = frustrated but civil. "neutral" = transactional. "positive" = thankful/excited.
 - urgency: "high" = explicit deadline today/asap/emergency/urgent/now/leaking/broken; "medium" = "this week"/"soon"/quote-soon; "low" = browsing, future planning, no time pressure
@@ -12535,6 +12576,130 @@ Reply with just the summary sentence, no preamble.` }],
     console.warn('History summarise failed:', e.message);
     return null;
   }
+}
+
+// Ship a booking confirmation: ICS file by email to owner + customer
+// (when email captured), confirmation message back on the channel, and
+// the .ics goes into the file system so the dashboard can re-download it.
+const BOOKING_ICS_DIR = resolve('data/booking_ics');
+try { mkdirSync(BOOKING_ICS_DIR, { recursive: true }); } catch {}
+
+async function confirmAndShipBooking(booking) {
+  const {
+    ownerEmail, channel, channelConfig, senderId, senderName,
+    bookingData, // { name, contact (email or phone), service, datetime }
+  } = booking;
+
+  const profile = getOwnerProfile(ownerEmail);
+  const businessName = profile?.profile?.businessName || profile?.businessName || 'Your business';
+  const businessLocation = profile?.profile?.location || profile?.location || '';
+
+  const parsedDate = parseBookingDateTime(bookingData.datetime);
+  const customerEmail = bookingData.contact?.includes('@') ? bookingData.contact : null;
+
+  let icsContent = null;
+  let icsFilename = null;
+  if (parsedDate) {
+    try {
+      const uid = `${ownerEmail}-${Date.now()}-${(senderId || 'anon').replace(/[^a-zA-Z0-9]/g, '')}`;
+      icsContent = buildIcsEvent({
+        uid,
+        start: parsedDate,
+        summary: `${businessName} — ${bookingData.service || 'Booking'} (${bookingData.name || senderName || 'customer'})`,
+        description: [
+          `Customer: ${bookingData.name || senderName || 'Unknown'}`,
+          bookingData.contact ? `Contact: ${bookingData.contact}` : '',
+          bookingData.service ? `Service: ${bookingData.service}` : '',
+          bookingData.notes ? `\nNotes: ${bookingData.notes}` : '',
+          `\nBooked via Aria on ${channel}`,
+        ].filter(Boolean).join('\n'),
+        location: businessLocation,
+        organizerEmail: ownerEmail,
+        organizerName: businessName,
+        attendeeEmail: customerEmail,
+        attendeeName: bookingData.name || senderName,
+      });
+      icsFilename = `booking-${uid}.ics`;
+      try {
+        writeFileSync(join(BOOKING_ICS_DIR, icsFilename), icsContent);
+      } catch (e) { console.warn('[booking] save .ics failed:', e.message); }
+    } catch (e) {
+      console.warn('[booking] ICS build failed:', e.message);
+    }
+  }
+
+  // Email owner — always
+  const dateLabel = parsedDate
+    ? parsedDate.toLocaleString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })
+    : (bookingData.datetime || 'TBC');
+  try {
+    await smartSend({
+      ownerEmail, to: ownerEmail,
+      subject: `📅 New booking — ${bookingData.name || senderName} on ${dateLabel}`,
+      html: `<div style="font-family:-apple-system,sans-serif;max-width:560px;margin:0 auto;padding:20px;">
+        <div style="background:#0d0d1f;color:#fff;padding:18px;border-radius:12px;">
+          <h2 style="margin:0 0 6px;color:#00e5a0;">📅 New booking via Aria</h2>
+          <p style="margin:0;color:#9898b8;font-size:13px;">Via ${channel}</p>
+        </div>
+        <div style="background:#fff;color:#222;padding:20px;border-radius:12px;margin-top:14px;border:1px solid #eee;">
+          <p style="margin:0 0 6px;font-size:12px;color:#888;text-transform:uppercase;letter-spacing:0.5px;">Customer</p>
+          <p style="margin:0 0 14px;font-size:16px;font-weight:600;">${(bookingData.name || senderName || 'Unknown')}</p>
+          ${bookingData.contact ? `<p style="margin:0 0 6px;font-size:12px;color:#888;text-transform:uppercase;letter-spacing:0.5px;">Contact</p><p style="margin:0 0 14px;font-size:14px;">${bookingData.contact}</p>` : ''}
+          ${bookingData.service ? `<p style="margin:0 0 6px;font-size:12px;color:#888;text-transform:uppercase;letter-spacing:0.5px;">Service</p><p style="margin:0 0 14px;font-size:14px;">${bookingData.service}</p>` : ''}
+          <p style="margin:0 0 6px;font-size:12px;color:#888;text-transform:uppercase;letter-spacing:0.5px;">When</p>
+          <p style="margin:0 0 14px;font-size:14px;font-weight:600;color:#0d6e3f;">${dateLabel}</p>
+          ${bookingData.notes ? `<p style="margin:0 0 6px;font-size:12px;color:#888;text-transform:uppercase;letter-spacing:0.5px;">Notes</p><p style="margin:0;font-size:13.5px;color:#555;">${bookingData.notes}</p>` : ''}
+        </div>
+        ${icsContent ? '<p style="margin:14px 0 0;font-size:12px;color:#666;text-align:center;">📎 Calendar invite (.ics) attached — open to add to your calendar app.</p>' : '<p style="margin:14px 0 0;font-size:12px;color:#cc8800;text-align:center;">⚠️ Date could not be parsed automatically — please add to your calendar manually.</p>'}
+      </div>`,
+      attachments: icsContent ? [{
+        filename: 'booking.ics',
+        content: icsContent,
+        contentType: 'text/calendar; charset=utf-8; method=REQUEST',
+      }] : undefined,
+    });
+  } catch (e) { console.warn('[booking] owner email failed:', e.message); }
+
+  // Email customer — if we captured their email
+  if (customerEmail && icsContent) {
+    try {
+      await smartSend({
+        ownerEmail, to: customerEmail,
+        subject: `Your booking with ${businessName} — ${dateLabel}`,
+        html: `<div style="font-family:-apple-system,sans-serif;max-width:560px;margin:0 auto;padding:20px;">
+          <div style="background:#00e5a0;color:#0d0d1f;padding:18px;border-radius:12px;text-align:center;">
+            <h2 style="margin:0;">✓ Booking Confirmed</h2>
+          </div>
+          <div style="background:#fff;color:#222;padding:20px;border-radius:12px;margin-top:14px;border:1px solid #eee;">
+            <p style="margin:0 0 14px;">Hi ${bookingData.name || 'there'},</p>
+            <p style="margin:0 0 14px;">Thanks for booking with <b>${businessName}</b>. Your appointment is confirmed:</p>
+            ${bookingData.service ? `<p style="margin:0 0 8px;"><b>Service:</b> ${bookingData.service}</p>` : ''}
+            <p style="margin:0 0 8px;"><b>When:</b> ${dateLabel}</p>
+            ${businessLocation ? `<p style="margin:0 0 14px;"><b>Where:</b> ${businessLocation}</p>` : ''}
+            <p style="margin:14px 0 0;font-size:13px;color:#666;">📎 Calendar invite attached — tap to add to your calendar.</p>
+            <p style="margin:14px 0 0;font-size:12px;color:#888;">Need to change or cancel? Just reply to this email or message us on ${channel}.</p>
+          </div>
+        </div>`,
+        attachments: [{
+          filename: 'booking.ics',
+          content: icsContent,
+          contentType: 'text/calendar; charset=utf-8; method=REQUEST',
+        }],
+      });
+    } catch (e) { console.warn('[booking] customer email failed:', e.message); }
+  }
+
+  // Confirm to customer on the channel
+  if (channelConfig && senderId) {
+    const confirmText = customerEmail
+      ? `✅ All booked in for ${dateLabel}. Confirmation + calendar invite sent to ${customerEmail}.`
+      : `✅ All booked in for ${dateLabel}. We'll be in touch closer to the time.`;
+    try {
+      await sendChannelReply(channel, channelConfig, senderId, confirmText);
+    } catch (e) { console.warn('[booking] channel confirm failed:', e.message); }
+  }
+
+  return { icsFilename, parsedDate };
 }
 
 // Second Claude call ONLY when escalating — summarises the conversation so
@@ -13195,7 +13360,8 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     };
     const ready = merged.name && merged.contact && merged.datetime;
     if (ready) {
-      bookings.push({ ...merged, channel, ownerEmail, ts: new Date().toISOString() });
+      const bookingRecord = { ...merged, channel, ownerEmail, ts: new Date().toISOString() };
+      bookings.push(bookingRecord);
       save('bookings', bookings);
       // Clear pending now that it's a real booking.
       const st = conversationState.get(memKey) || {};
@@ -13203,6 +13369,21 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
       conversationState.set(memKey, st);
       persistConversationState();
       console.log(`📅 [${channel}] Booking ready + saved for ${senderName}: ${merged.name} / ${merged.datetime}`);
+      // FIRE the confirmation flow — ICS email to owner + customer + channel reply
+      // Done in a setImmediate so the current message handler returns fast.
+      setImmediate(async () => {
+        try {
+          const confirmation = await confirmAndShipBooking({
+            ownerEmail, channel, channelConfig, senderId, senderName,
+            bookingData: merged,
+          });
+          // Stash ics filename on the booking record so dashboard can re-download
+          if (confirmation.icsFilename) {
+            bookingRecord.icsFilename = confirmation.icsFilename;
+            save('bookings', bookings);
+          }
+        } catch (e) { console.warn('[booking] confirmation flow failed:', e.message); }
+      });
     } else {
       const st = conversationState.get(memKey) || {};
       st.pendingBooking = merged;
