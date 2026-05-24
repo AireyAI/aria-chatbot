@@ -9855,6 +9855,113 @@ app.get('/api/admin/usage', (req, res) => {
   res.json({ rows, totalUsedToday: rows.reduce((s, r) => s + r.usedToday, 0) });
 });
 
+// GET /api/dashboard/analytics — 7-day rollup of conversation volume,
+// sentiment, leads, CSAT, top categories. Reads directly from the JSONL
+// ledgers (no separate aggregation layer needed at current scale; cache
+// later if a client crosses ~10k convs/week).
+app.get('/api/dashboard/analytics', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const buckets = 7;
+  const cutoff = now - buckets * DAY_MS;
+
+  // dayIndex helper: 0 = today, 6 = 7 days ago
+  const dayIndex = (ts) => {
+    const age = now - new Date(ts).getTime();
+    return Math.min(buckets - 1, Math.max(0, Math.floor(age / DAY_MS)));
+  };
+  const emptyBuckets = () => Array(buckets).fill(0);
+
+  // 1. Conversation VOLUME per channel — derived from channelMessages map.
+  const volumeByChannel = { facebook: emptyBuckets(), instagram: emptyBuckets(), whatsapp: emptyBuckets(), email: emptyBuckets() };
+  const channelMsgs = channelMessages.get(owner) || [];
+  for (const m of channelMsgs) {
+    if (!m.timestamp || new Date(m.timestamp).getTime() < cutoff) continue;
+    const ch = m.channel;
+    if (volumeByChannel[ch]) volumeByChannel[ch][buckets - 1 - dayIndex(m.timestamp)]++;
+  }
+  // Email volume — derived from EMAIL_REPLY_STATS.history
+  const stats = EMAIL_REPLY_STATS.get(owner) || { history: [] };
+  for (const h of (stats.history || [])) {
+    if (!h.time || new Date(h.time).getTime() < cutoff) continue;
+    volumeByChannel.email[buckets - 1 - dayIndex(h.time)]++;
+  }
+
+  // 2. SENTIMENT distribution + LEADS breakdown — derive from channel_leads.jsonl
+  const sentimentDist = { positive: 0, neutral: 0, negative: 0, angry: 0 };
+  const leadsBreakdown = { hot: 0, warm: 0, cold: 0 };
+  const categoryCounts = {};
+  try {
+    if (existsSync(CHANNEL_LEADS_FILE)) {
+      const lines = readFileSync(CHANNEL_LEADS_FILE, 'utf8').split('\n').filter(Boolean).slice(-1500);
+      for (const l of lines) {
+        try {
+          const e = JSON.parse(l);
+          if (e.ownerEmail !== owner) continue;
+          if (new Date(e.ts).getTime() < cutoff) continue;
+          if (e.leadScore && leadsBreakdown[e.leadScore] !== undefined) leadsBreakdown[e.leadScore]++;
+          if (e.category) categoryCounts[e.category] = (categoryCounts[e.category] || 0) + 1;
+          if (e.sentiment && sentimentDist[e.sentiment] !== undefined) sentimentDist[e.sentiment]++;
+        } catch {}
+      }
+    }
+  } catch {}
+
+  // 3. CSAT trend — per-day positive/total over 7 days
+  const csatPerDay = emptyBuckets().map(() => ({ pos: 0, tot: 0 }));
+  try {
+    if (existsSync(CSAT_FILE)) {
+      const lines = readFileSync(CSAT_FILE, 'utf8').split('\n').filter(Boolean).slice(-500);
+      for (const l of lines) {
+        try {
+          const e = JSON.parse(l);
+          if (e.ownerEmail !== owner) continue;
+          if (new Date(e.ts).getTime() < cutoff) continue;
+          const idx = buckets - 1 - dayIndex(e.ts);
+          csatPerDay[idx].tot++;
+          if (e.rating === 'positive') csatPerDay[idx].pos++;
+        } catch {}
+      }
+    }
+  } catch {}
+  // Convert to % per day (null when no ratings that day so chart can show gaps)
+  const csatTrend = csatPerDay.map(d => d.tot > 0 ? Math.round((d.pos / d.tot) * 100) : null);
+
+  // 4. Top categories — top 5
+  const topCategories = Object.entries(categoryCounts)
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+
+  // 5. Week-over-week deltas (this 7d vs previous 7d)
+  const prevCutoff = now - 2 * buckets * DAY_MS;
+  let thisWeekConvs = 0, prevWeekConvs = 0;
+  for (const m of channelMsgs) {
+    if (!m.timestamp) continue;
+    const t = new Date(m.timestamp).getTime();
+    if (t >= cutoff) thisWeekConvs++;
+    else if (t >= prevCutoff) prevWeekConvs++;
+  }
+  const pct = (cur, prev) => prev > 0 ? Math.round(((cur - prev) / prev) * 100) : (cur > 0 ? 100 : 0);
+
+  res.json({
+    period: '7d',
+    volumeByChannel,
+    totalConversations: Object.values(volumeByChannel).reduce((s, arr) => s + arr.reduce((a, b) => a + b, 0), 0),
+    leadsBreakdown,
+    sentimentDist,        // currently empty (sentiment not yet on lead records)
+    csatTrend,
+    topCategories,
+    weekOverWeek: {
+      convs: pct(thisWeekConvs, prevWeekConvs),
+      convsAbs: thisWeekConvs - prevWeekConvs,
+    },
+  });
+});
+
 // GET /api/dashboard/activity — unified feed of recent events for the
 // dashboard's Activity panel. Aggregates from multiple sources (channel
 // leads, bookings, escalations, CSAT) and returns last N events sorted
@@ -10671,6 +10778,26 @@ a{color:#00e5a0;text-decoration:none;}
 .activity-detail{color:#8888aa;font-size:11.5px;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .activity-time{font-size:11px;color:#6b6b8a;flex-shrink:0;}
 .activity-channel{font-size:10px;background:rgba(255,255,255,0.06);color:#9898b8;padding:1px 7px;border-radius:10px;text-transform:capitalize;}
+/* Analytics */
+.analytics{background:#161630;border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:18px;margin-bottom:18px;}
+.analytics-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
+.analytics-head h3{font-size:13px;color:#9898b8;text-transform:uppercase;letter-spacing:0.5px;font-weight:600;}
+.analytics-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;}
+.ana-card{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.05);border-radius:12px;padding:14px;}
+.ana-card .ana-title{font-size:11.5px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;font-weight:600;}
+.ana-card svg{display:block;margin:0 auto;}
+.ana-legend{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;font-size:10.5px;color:#8888aa;}
+.ana-legend .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:middle;}
+.wow-pill{display:inline-flex;align-items:center;gap:4px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:3px 10px;font-size:11.5px;color:#9898b8;}
+.wow-pill.up{color:#00e5a0;border-color:rgba(0,229,160,0.3);background:rgba(0,229,160,0.06);}
+.wow-pill.down{color:#ff6b6b;border-color:rgba(255,107,107,0.3);background:rgba(255,107,107,0.06);}
+.ana-stack{display:flex;flex-direction:column;gap:6px;}
+.ana-row{display:flex;align-items:center;gap:8px;font-size:12px;color:#ccc;}
+.ana-row .bar{flex:1;height:6px;background:rgba(255,255,255,0.05);border-radius:4px;overflow:hidden;position:relative;}
+.ana-row .bar-fill{height:100%;background:#00e5a0;border-radius:4px;}
+.ana-row .label{min-width:90px;color:#aaa;text-transform:capitalize;}
+.ana-row .count{min-width:30px;text-align:right;font-weight:600;color:#fff;font-size:11.5px;}
+@media(max-width:700px){.analytics-grid{grid-template-columns:1fr;}}
 /* Section status badges */
 .section-header .badge-attn{background:rgba(251,191,36,0.15);color:#fbbf24;border:1px solid rgba(251,191,36,0.3);padding:2px 8px;border-radius:10px;font-size:10.5px;font-weight:600;margin-left:8px;}
 /* Drill-down modal */
@@ -10799,6 +10926,14 @@ tr:last-child td{border-bottom:none;}
   <div class="activity-feed">
     <h3>🕐 Recent Activity</h3>
     <div id="activity-list"><div class="empty" style="padding:14px 0">Loading…</div></div>
+  </div>
+
+  <!-- ANALYTICS — 7-day rollup charts -->
+  <div class="analytics" id="analytics-panel">
+    <div class="analytics-head"><h3>📊 This week</h3><div id="ana-wow"></div></div>
+    <div class="analytics-grid" id="ana-grid">
+      <div class="empty" style="padding:14px 0">Loading…</div>
+    </div>
   </div>
 
   <!-- STATS GRID (compact, secondary) -->
@@ -11084,6 +11219,135 @@ async function loadStats() {
     document.getElementById('stats-row').innerHTML = '<div class="stat-card"><div class="value">!</div><div class="label">Failed to load stats</div></div>';
   }
 }
+// ─── SVG mini-chart helpers (zero-dep, ~100 lines for 4 chart types) ────
+// All return SVG strings. Sized to fit inside an .ana-card.
+function svgSparkline(values, { w = 240, h = 50, color = '#00e5a0', fill = true } = {}) {
+  if (!values || !values.length) return '<svg width="' + w + '" height="' + h + '"></svg>';
+  const max = Math.max(1, ...values.filter(v => v != null));
+  const step = w / (values.length - 1 || 1);
+  let pts = '';
+  values.forEach((v, i) => {
+    if (v == null) return;
+    const x = i * step;
+    const y = h - (v / max) * (h - 4) - 2;
+    pts += (pts ? ' L ' : 'M ') + x.toFixed(1) + ',' + y.toFixed(1);
+  });
+  const area = fill && pts ? '<path d="' + pts + ' L ' + w + ',' + h + ' L 0,' + h + ' Z" fill="' + color + '" opacity="0.12" />' : '';
+  const line = pts ? '<path d="' + pts + '" fill="none" stroke="' + color + '" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />' : '';
+  // Day labels along bottom (7 dots = mon-sun style relative)
+  const labels = values.map((_, i) => {
+    const daysAgo = values.length - 1 - i;
+    const d = new Date(Date.now() - daysAgo * 86400000);
+    return '<text x="' + (i * step).toFixed(1) + '" y="' + (h + 10) + '" font-size="8" fill="#6b6b8a" text-anchor="middle">' + d.toLocaleDateString('en-GB', { weekday: 'short' }).slice(0, 2) + '</text>';
+  }).join('');
+  return '<svg width="' + w + '" height="' + (h + 14) + '">' + area + line + labels + '</svg>';
+}
+function svgDonut(parts, { size = 80, colors = ['#ff6b6b', '#fbbf24', '#9898b8'] } = {}) {
+  // parts: [{label, value}], renders concentric donut + middle total
+  const total = parts.reduce((s, p) => s + (p.value || 0), 0) || 1;
+  const radius = size / 2 - 6;
+  const circ = 2 * Math.PI * radius;
+  let offset = 0;
+  const segments = parts.map((p, i) => {
+    const fraction = (p.value || 0) / total;
+    const dash = circ * fraction;
+    const seg = '<circle cx="' + (size / 2) + '" cy="' + (size / 2) + '" r="' + radius + '" fill="none" stroke="' + (colors[i] || '#666') + '" stroke-width="10" stroke-dasharray="' + dash + ' ' + (circ - dash) + '" stroke-dashoffset="-' + offset + '" transform="rotate(-90 ' + (size / 2) + ' ' + (size / 2) + ')" />';
+    offset += dash;
+    return seg;
+  }).join('');
+  return '<svg width="' + size + '" height="' + size + '">' +
+    '<circle cx="' + (size / 2) + '" cy="' + (size / 2) + '" r="' + radius + '" fill="none" stroke="rgba(255,255,255,0.05)" stroke-width="10" />' +
+    segments +
+    '<text x="' + (size / 2) + '" y="' + (size / 2 + 4) + '" font-size="16" font-weight="700" fill="#fff" text-anchor="middle">' + total + '</text>' +
+    '</svg>';
+}
+function renderHorizontalBars(items, { maxBars = 5 } = {}) {
+  if (!items?.length) return '<div class="empty" style="padding:8px 0;font-size:12px;">No data yet</div>';
+  const max = Math.max(...items.map(i => i.count || 0), 1);
+  return '<div class="ana-stack">' + items.slice(0, maxBars).map(it => {
+    const pct = ((it.count / max) * 100).toFixed(0);
+    return '<div class="ana-row">' +
+      '<div class="label">' + escH(it.name) + '</div>' +
+      '<div class="bar"><div class="bar-fill" style="width:' + pct + '%"></div></div>' +
+      '<div class="count">' + it.count + '</div>' +
+    '</div>';
+  }).join('') + '</div>';
+}
+
+async function loadAnalytics() {
+  const grid = document.getElementById('ana-grid');
+  const wowEl = document.getElementById('ana-wow');
+  try {
+    const d = await api('/api/dashboard/analytics');
+    // Week-over-week pill
+    const wow = d.weekOverWeek || {};
+    if (wow.convs != null && wow.convsAbs != null) {
+      const dir = wow.convs > 0 ? 'up' : (wow.convs < 0 ? 'down' : '');
+      const arrow = wow.convs > 0 ? '↑' : (wow.convs < 0 ? '↓' : '→');
+      wowEl.innerHTML = '<span class="wow-pill ' + dir + '">' + arrow + ' ' + Math.abs(wow.convs) + '% vs last week</span>';
+    } else { wowEl.innerHTML = ''; }
+
+    const colours = { facebook: '#1877F2', instagram: '#E1306C', whatsapp: '#25D366', email: '#fbbf24' };
+    const channelTotals = Object.entries(d.volumeByChannel || {})
+      .map(([k, vs]) => ({ key: k, total: vs.reduce((s, v) => s + v, 0), vs }));
+    const totalAll = channelTotals.reduce((s, c) => s + c.total, 0);
+
+    // 1. Volume card — combined sparkline + per-channel legend
+    const combinedVs = (d.volumeByChannel.facebook || []).map((_, i) =>
+      ['facebook','instagram','whatsapp','email'].reduce((s, k) => s + (d.volumeByChannel[k]?.[i] || 0), 0)
+    );
+    const volCard = '<div class="ana-card">' +
+      '<div class="ana-title">💬 Conversations (' + totalAll + ' this week)</div>' +
+      svgSparkline(combinedVs) +
+      '<div class="ana-legend">' +
+        channelTotals.filter(c => c.total > 0).map(c =>
+          '<span><span class="dot" style="background:' + (colours[c.key] || '#888') + '"></span>' + c.key + ' ' + c.total + '</span>'
+        ).join('') +
+        (channelTotals.every(c => c.total === 0) ? '<span style="color:#6b6b8a">No conversations yet this week</span>' : '') +
+      '</div>' +
+    '</div>';
+
+    // 2. Leads donut
+    const lb = d.leadsBreakdown || { hot: 0, warm: 0, cold: 0 };
+    const leadsCard = '<div class="ana-card">' +
+      '<div class="ana-title">🎯 Leads (' + (lb.hot + lb.warm + lb.cold) + ' this week)</div>' +
+      svgDonut([
+        { label: 'Hot', value: lb.hot },
+        { label: 'Warm', value: lb.warm },
+        { label: 'Cold', value: lb.cold },
+      ], { colors: ['#ff6b6b', '#fbbf24', '#6b6b8a'] }) +
+      '<div class="ana-legend">' +
+        '<span><span class="dot" style="background:#ff6b6b"></span>Hot ' + lb.hot + '</span>' +
+        '<span><span class="dot" style="background:#fbbf24"></span>Warm ' + lb.warm + '</span>' +
+        '<span><span class="dot" style="background:#6b6b8a"></span>Cold ' + lb.cold + '</span>' +
+      '</div>' +
+    '</div>';
+
+    // 3. CSAT trend — sparkline with null gaps
+    const csatVs = d.csatTrend || [];
+    const hasCsat = csatVs.some(v => v != null);
+    const csatCard = '<div class="ana-card">' +
+      '<div class="ana-title">⭐ CSAT trend (last 7 days)</div>' +
+      (hasCsat ? svgSparkline(csatVs.map(v => v == null ? null : v), { color: '#9d96ff' }) +
+        '<div class="ana-legend"><span style="color:#9898b8">Higher is better — based on 👍/👎 ratings</span></div>'
+        : '<div class="empty" style="padding:14px 0;font-size:12px;">No ratings yet this week</div>') +
+    '</div>';
+
+    // 4. Top categories
+    const cats = d.topCategories || [];
+    const catsCard = '<div class="ana-card">' +
+      '<div class="ana-title">🏷️ Top topics</div>' +
+      renderHorizontalBars(cats) +
+    '</div>';
+
+    grid.innerHTML = volCard + leadsCard + csatCard + catsCard;
+  } catch (e) {
+    grid.innerHTML = '<div class="empty">Failed to load analytics.</div>';
+  }
+}
+// Fire on page load
+loadAnalytics();
+
 async function resumeConv(memKey) {
   if (!confirm('Hand this conversation back to Aria? She\\'ll start auto-replying again.')) return;
   try {
@@ -13061,7 +13325,7 @@ function appendChannelLead(entry) {
 // Roll up scored lead into channelStats.{owner}.leads.{hot|warm|cold}
 // + append to the JSONL ledger. The dashboard's /api/dashboard/stats
 // later sums these alongside email leads for a unified Leads card.
-function trackChannelLead(ownerEmail, { channel, senderId, senderName, leadScore, category, contact, messagePreview }) {
+function trackChannelLead(ownerEmail, { channel, senderId, senderName, leadScore, category, contact, messagePreview, sentiment, urgency }) {
   const stats = channelStats.get(ownerEmail) || {
     whatsapp: { replied: 0, week: 0, lastReply: null },
     instagram: { replied: 0, week: 0, lastReply: null },
@@ -13081,6 +13345,8 @@ function trackChannelLead(ownerEmail, { channel, senderId, senderName, leadScore
     ts: new Date().toISOString(),
     ownerEmail, channel, senderId, senderName,
     leadScore, category,
+    sentiment: sentiment || null,
+    urgency: urgency || null,
     contact: contact || {},
     messagePreview: (messagePreview || '').slice(0, 200),
   });
@@ -13438,6 +13704,8 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     trackChannelLead(ownerEmail, {
       channel, senderId, senderName,
       leadScore, category,
+      sentiment: reply.sentiment,
+      urgency: reply.urgency,
       contact: reply.contact || {},
       messagePreview: messageText,
     });
