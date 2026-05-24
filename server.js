@@ -969,6 +969,26 @@ function persistConversationMemory() {
   } catch (e) { console.warn('Failed to persist conversation memory:', e.message); }
 }
 
+// Per-conversation runtime state. Currently tracks paused/escalated status
+// so owner-handoff actually stops Aria from talking over a human takeover.
+const CONV_STATE_FILE = resolve('data/conversation_state.json');
+const conversationState = new Map(); // memKey → { paused, escalatedAt, reason, resumedAt }
+try {
+  if (existsSync(CONV_STATE_FILE)) {
+    const saved = JSON.parse(readFileSync(CONV_STATE_FILE, 'utf8'));
+    for (const [k, v] of Object.entries(saved)) conversationState.set(k, v);
+  }
+} catch (e) { console.warn('Failed to load conv state:', e.message); }
+
+function persistConversationState() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [k, v] of conversationState) obj[k] = v;
+    writeFileSync(CONV_STATE_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist conv state:', e.message); }
+}
+
 function addToConversationMemory(ownerEmail, senderEmail, role, subject, preview) {
   const key = `${ownerEmail}::${senderEmail.toLowerCase()}`;
   const history = conversationMemory.get(key) || [];
@@ -9653,6 +9673,38 @@ app.get('/api/dashboard/stats', (req, res) => {
   });
 });
 
+// GET /api/dashboard/escalations — list paused (handed-off) conversations
+app.get('/api/dashboard/escalations', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const items = [];
+  for (const [memKey, state] of conversationState) {
+    if (!state.paused) continue;
+    const [ownerEmail, channel, senderId] = memKey.split('::');
+    if (ownerEmail !== owner) continue;
+    items.push({ memKey, channel, senderId, escalatedAt: state.escalatedAt, reason: state.reason });
+  }
+  items.sort((a, b) => (b.escalatedAt || '').localeCompare(a.escalatedAt || ''));
+  res.json({ items });
+});
+
+// POST /api/dashboard/resume-conversation — owner hands control back to Aria
+app.post('/api/dashboard/resume-conversation', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { memKey } = req.body || {};
+  if (!memKey || !memKey.startsWith(owner + '::')) {
+    return res.status(400).json({ error: 'invalid memKey' });
+  }
+  const state = conversationState.get(memKey);
+  if (!state) return res.json({ ok: true, note: 'no-op — no paused state' });
+  state.paused = false;
+  state.resumedAt = new Date().toISOString();
+  conversationState.set(memKey, state);
+  persistConversationState();
+  res.json({ ok: true });
+});
+
 // GET /api/dashboard/inbox-log
 app.get('/api/dashboard/inbox-log', (req, res) => {
   const owner = requireDashboardAuth(req, res);
@@ -10975,11 +11027,15 @@ async function processMetaWebhook(payload) {
   }
 }
 
-async function generateChannelReply(systemPrompt, senderName, messageText) {
+async function generateChannelReply(systemPrompt, senderName, messageText, opts = {}) {
+  const { allowedTopics } = opts;
+  const scopeRule = allowedTopics?.length
+    ? `\n- SCOPE: this business only handles ${allowedTopics.join(', ')}. If the message is clearly OFF these topics (e.g. asking for legal/medical advice, asking about a different industry), set outOfScope=true and politely redirect in your text reply (say what you can help with, suggest they contact the relevant expert elsewhere). Common related questions still count as in-scope.`
+    : '';
   try {
     const r = await claude.messages.create({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 500,
+      max_tokens: 600,
       messages: [{ role: 'user', content: `You received this message from ${senderName}:
 
 "${messageText}"
@@ -10988,7 +11044,12 @@ Respond with valid JSON only:
 {
   "text": "Your plain text reply here (no HTML)",
   "booking": null or { "name": "customer name", "datetime": "date/time mentioned", "notes": "what they need" },
-  "contact": { "name": "customer name or null", "email": "email if shared, else null", "phone": "phone if shared, else null" }
+  "contact": { "name": "customer name or null", "email": "email if shared, else null", "phone": "phone if shared, else null" },
+  "sentiment": "positive" | "neutral" | "negative" | "angry",
+  "urgency": "low" | "medium" | "high",
+  "outOfScope": true | false,
+  "needsHuman": true | false,
+  "handoffReason": "short reason if needsHuman, else null"
 }
 
 Rules:
@@ -10999,7 +11060,10 @@ Rules:
 - Sign off with the business name
 - Plain text only, no HTML tags
 - If a date/time/appointment is mentioned, extract into booking object
-- If sender shared their email or phone anywhere in this message OR conversation history, extract into contact object — otherwise leave fields null` }],
+- If sender shared their email or phone anywhere in this message OR conversation history, extract into contact object — otherwise leave fields null
+- sentiment: classify the sender's tone. "angry" = swearing, threats, all-caps frustration, repeated complaints. "negative" = frustrated but civil. "neutral" = transactional. "positive" = thankful/excited.
+- urgency: "high" = explicit deadline today/asap/emergency/urgent/now/leaking/broken; "medium" = "this week"/"soon"/quote-soon; "low" = browsing, future planning, no time pressure
+- needsHuman: true ONLY when the user explicitly asks for a human/manager OR you genuinely cannot help (refund disputes, complex billing, complaints about specific staff). Set handoffReason concisely. Don't escalate easy stuff.${scopeRule}` }],
       system: systemPrompt,
     });
     const text = r.content[0]?.text || '';
@@ -11008,13 +11072,46 @@ Rules:
       // Defensive defaults so downstream code never NPEs on missing fields.
       parsed.contact = parsed.contact || { name: null, email: null, phone: null };
       parsed.booking = parsed.booking || null;
+      parsed.sentiment = parsed.sentiment || 'neutral';
+      parsed.urgency = parsed.urgency || 'low';
+      parsed.outOfScope = !!parsed.outOfScope;
+      parsed.needsHuman = !!parsed.needsHuman;
+      parsed.handoffReason = parsed.handoffReason || null;
       return parsed;
     } catch {
-      return { text, booking: null, contact: { name: null, email: null, phone: null } };
+      return { text, booking: null, contact: { name: null, email: null, phone: null }, sentiment: 'neutral', urgency: 'low', outOfScope: false, needsHuman: false, handoffReason: null };
     }
   } catch (e) {
     console.warn('Channel reply generation failed:', e.message);
     return null;
+  }
+}
+
+// Second Claude call ONLY when escalating — summarises the conversation so
+// the owner gets actionable context instead of a wall of messages.
+async function generateHandoffSummary(senderName, conversationHistory, lastMessage, reason) {
+  try {
+    const r = await claude.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: `Aria needs to hand off a ${senderName} conversation to the business owner. Reason: ${reason || 'human requested'}.
+
+Conversation so far (oldest → newest):
+${conversationHistory.map(h => `[${h.role === 'sender' ? 'THEM' : 'US'}] ${h.preview}`).join('\n')}
+
+Most recent message: "${lastMessage}"
+
+Write a 3-bullet summary the owner can read in 10 seconds:
+- What does the customer want?
+- What's already been said?
+- What's the single next action the owner should take?
+
+Plain text, 3 bullets, no preamble.` }],
+    });
+    return r.content[0]?.text?.trim() || `Customer ${senderName} needs you to take over. Reason: ${reason}.`;
+  } catch (e) {
+    console.warn('Handoff summary failed:', e.message);
+    return `Customer ${senderName} needs you to take over. Reason: ${reason}.`;
   }
 }
 
@@ -11102,9 +11199,19 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
 
   console.log(`📱 [${channel}] Message from ${senderName} (${senderId}) for ${ownerEmail}: "${messageText.substring(0, 80)}"`);
 
+  // Conversation memKey + paused-state check. If owner manually paused this
+  // conv (e.g. after escalation), Aria stops auto-replying until resumed.
+  const memKey = `${ownerEmail}::${channel}::${senderId}`;
+  const convState = conversationState.get(memKey);
+  if (convState?.paused) {
+    console.log(`📱 [${channel}] Conv paused (escalated) — skipping auto-reply for ${senderId}`);
+    return;
+  }
+
   // Build system prompt from client profile
   const profile = getOwnerProfile(ownerEmail);
   const systemPrompt = profile?.systemPrompt || `You are a helpful business assistant for ${ownerEmail}.`;
+  const allowedTopics = profile?.config?.allowedTopics || profile?.allowedTopics || null;
 
   // Knowledge base
   const kbEntries = knowledgeBase.get(ownerEmail) || [];
@@ -11112,8 +11219,7 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     ? '\n\nFREQUENTLY ASKED QUESTIONS:\n' + kbEntries.map(e => `Q: ${e.question}\nA: ${e.answer}`).join('\n\n')
     : '';
 
-  // Conversation memory
-  const memKey = `${ownerEmail}::${channel}::${senderId}`;
+  // Conversation memory (memKey already defined above for paused-state check)
   const history = conversationMemory.get(memKey) || [];
   const convContext = history.length
     ? '\n\nPREVIOUS MESSAGES with this person (most recent last):\n' +
@@ -11128,10 +11234,11 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
   };
   const channelInstructions = `\n\nYou are replying via ${channel}. ${channelLimits[channel]} Never mention you are AI — write as a team member.`;
 
-  // Generate reply
+  // Generate reply (with optional scope guardrail)
   const reply = await generateChannelReply(
     systemPrompt + kbContext + convContext + channelInstructions,
-    senderName, messageText
+    senderName, messageText,
+    { allowedTopics }
   );
 
   if (!reply) {
@@ -11144,6 +11251,57 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
   if (history.length > 20) history.splice(0, history.length - 20);
   conversationMemory.set(memKey, history);
   persistConversationMemory();
+
+  // ─── Trust pack: sentiment / urgency / handoff / scope ──────────────────
+  // 1. ANGRY or HIGH-URGENCY → alert owner immediately. Aria still sends
+  //    her reply (don't ghost the customer), but owner gets a heads-up.
+  const isAngry = reply.sentiment === 'angry' || reply.sentiment === 'negative';
+  const isUrgent = reply.urgency === 'high';
+  if (isAngry || isUrgent) {
+    try {
+      await smartSend({
+        ownerEmail, to: ownerEmail,
+        subject: `🚨 ${isAngry ? 'Angry' : 'Urgent'} ${channel} message from ${senderName}`,
+        html: `<div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:20px;">
+          <h2 style="color:#${isAngry ? 'ff6b6b' : 'fbbf24'};margin-bottom:4px;">${isAngry ? '😡 Angry' : '⏰ Urgent'} message on ${channel}</h2>
+          <p style="color:#666;font-size:13px;margin-bottom:16px;">Sentiment: <b>${reply.sentiment}</b> · Urgency: <b>${reply.urgency}</b></p>
+          <div style="background:#fef2f2;border-left:4px solid #${isAngry ? 'ff6b6b' : 'fbbf24'};padding:12px 16px;margin-bottom:16px;">
+            <p style="font-size:12px;color:#999;margin-bottom:6px;">${senderName} said:</p>
+            <p style="color:#333;font-size:14px;">${messageText.substring(0, 500).replace(/</g,'&lt;')}</p>
+          </div>
+          <p style="font-size:13px;color:#666;">Aria has replied to keep the customer engaged, but you may want to take this one yourself.</p>
+        </div>`,
+      });
+      console.log(`🚨 [${channel}] Alerted owner: ${isAngry ? 'angry' : 'urgent'} message from ${senderName}`);
+    } catch (e) { console.warn('Alert send failed:', e.message); }
+  }
+
+  // 2. needsHuman → escalate: pause auto-reply on this conv + ship summary
+  if (reply.needsHuman) {
+    conversationState.set(memKey, { paused: true, escalatedAt: new Date().toISOString(), reason: reply.handoffReason });
+    persistConversationState();
+    try {
+      const summary = await generateHandoffSummary(senderName, history, messageText, reply.handoffReason);
+      await smartSend({
+        ownerEmail, to: ownerEmail,
+        subject: `🤝 Aria handed off ${senderName} (${channel}) — your turn`,
+        html: `<div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:20px;">
+          <h2 style="color:#1a1a2e;margin-bottom:4px;">Conversation needs you</h2>
+          <p style="color:#666;font-size:13px;margin-bottom:16px;">${channel} · ${senderName} · ${reply.handoffReason || 'Aria flagged this for human review'}</p>
+          <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:16px;margin-bottom:20px;white-space:pre-line;">${summary.replace(/</g,'&lt;')}</div>
+          <p style="font-size:13px;color:#666;">Auto-reply is <b>paused</b> on this conversation until you resume it from your dashboard.</p>
+        </div>`,
+      });
+      console.log(`🤝 [${channel}] Handed off ${senderName} → ${ownerEmail}: ${reply.handoffReason}`);
+    } catch (e) { console.warn('Handoff summary failed:', e.message); }
+  }
+
+  // 3. outOfScope → mark category. Aria's text already contains the polite
+  //    redirect (per the prompt's scope rule), so we just log + skip booking.
+  if (reply.outOfScope) {
+    console.log(`🚫 [${channel}] Out of scope from ${senderName}: redirected`);
+    reply.booking = null; // never book off-topic stuff even if Claude tried
+  }
 
   // Check approval mode
   const approvalMode = ownerChannels.approvalMode || ownerChannels[channel]?.approvalMode;
