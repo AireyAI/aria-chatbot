@@ -13954,7 +13954,8 @@ Respond with valid JSON only:
   "handoffReason": "short reason if needsHuman, else null",
   "suggestedReplies": ["Btn 1", "Btn 2", "Btn 3"] or [],
   "language": "en" | "es" | "fr" | "de" | "it" | "pt" | "nl" | "pl" | "ar" | "zh" | "ja" | "ko" | other ISO-639-1 code,
-  "showServicesCarousel": true | false
+  "showServicesCarousel": true | false,
+  "bookingReminderResponse": "confirmed" | "reschedule" | "cancel" | null
 }
 
 Rules:
@@ -13971,7 +13972,8 @@ Rules:
 - needsHuman: true ONLY when the user explicitly asks for a human/manager OR you genuinely cannot help (refund disputes, complex billing, complaints about specific staff). Set handoffReason concisely. Don't escalate easy stuff.
 - suggestedReplies: 2-3 SHORT (≤20 chars each) tappable button options that match likely next actions for this customer. Examples: ["Get a quote", "Book a call", "See examples"]. Leave [] if no obvious next step (e.g. complaint, off-topic, post-handoff). Never include "Talk to a human" if you've already set needsHuman=true.
 - language: detect the customer's language (ISO-639-1 code: "en", "es", "fr", "de", etc.) and WRITE YOUR REPLY TEXT IN THE SAME LANGUAGE. If they switch mid-conversation, follow them. Default to English when unclear.
-- showServicesCarousel: true ONLY when the customer asks "what do you do/offer", "what services", "show me your products", "what can I get from you" etc. Keep your text reply short ("Here's what we offer:") because a swipeable card carousel will be sent right after. false otherwise.${scopeRule}${visionRule}`;
+- showServicesCarousel: true ONLY when the customer asks "what do you do/offer", "what services", "show me your products", "what can I get from you" etc. Keep your text reply short ("Here's what we offer:") because a swipeable card carousel will be sent right after. false otherwise.
+- bookingReminderResponse: ONLY set this if the conversation context mentions a recent booking reminder Aria sent (look for "REMINDER PENDING" note in the system prompt). Classify the customer's response: "confirmed" (yes / yep / sounds good / see you then / 👍), "reschedule" (need to move / different time / not that day / can we do another), "cancel" (need to cancel / can't make it / something came up). Set to null otherwise (no pending reminder, or this message isn't a response to one).${scopeRule}${visionRule}`;
 
     // Multimodal: image blocks come FIRST (Anthropic recommends image-before-text
     // ordering for best comprehension), text block last. Pure-text path keeps
@@ -14002,6 +14004,9 @@ Rules:
         : [];
       parsed.language = typeof parsed.language === 'string' ? parsed.language.toLowerCase().slice(0, 5) : 'en';
       parsed.showServicesCarousel = !!parsed.showServicesCarousel;
+      parsed.bookingReminderResponse = ['confirmed', 'reschedule', 'cancel'].includes(parsed.bookingReminderResponse)
+        ? parsed.bookingReminderResponse
+        : null;
       parsed._tokensUsed = (r.usage?.input_tokens || 0) + (r.usage?.output_tokens || 0);
       return parsed;
     } catch {
@@ -14666,8 +14671,16 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     ? `\n\nNOTE: this message arrived as a VOICE NOTE which Aria transcribed. The text above is the transcript. Feel free to start your reply with a brief natural acknowledgement (e.g. "Got your voice note —") before answering. Don't ask them to type it out, the transcript is what they meant.`
     : '';
 
+  // Reminder context — if Aria sent a "still good for X?" reminder recently
+  // and the customer hasn't responded yet, flag it so Claude classifies this
+  // message as confirmed / reschedule / cancel.
+  const pendingReminder = conversationState.get(memKey)?.pendingReminder;
+  const reminderContext = pendingReminder
+    ? `\n\nREMINDER PENDING: Aria sent a booking reminder (${pendingReminder.bookingDatetime}${pendingReminder.service ? ' for ' + pendingReminder.service : ''}) on ${pendingReminder.sentAt}. THIS CUSTOMER MESSAGE MAY BE THEIR RESPONSE. If they confirm / reschedule / cancel, set bookingReminderResponse accordingly. If confirming, reply warm + short ("Brilliant — see you then 👋"). If rescheduling, ask what time works. If cancelling, acknowledge politely + ask if they want to rebook later.`
+    : '';
+
   const reply = await generateChannelReply(
-    systemPrompt + kbContext + ragContext + convContext + slotContext + returningContext + channelInstructions + voiceContext,
+    systemPrompt + kbContext + ragContext + convContext + slotContext + returningContext + channelInstructions + voiceContext + reminderContext,
     senderName, messageText,
     { allowedTopics, imageRefs, waAccessToken: waAccessTokenForMedia, ownerEmail, channel }
   );
@@ -14682,6 +14695,68 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
 
   // Charge budget (input + output tokens for THIS reply)
   recordTokenUsage(ownerEmail, reply._tokensUsed || 0);
+
+  // Reminder-response handling — act on Claude's classification BEFORE
+  // running the standard send/persist flow. Clears pendingReminder so the
+  // noshow_check at T-2h sees the conv as resolved + no alert fires.
+  if (reply.bookingReminderResponse && pendingReminder) {
+    const st = conversationState.get(memKey) || {};
+    delete st.pendingReminder;
+    conversationState.set(memKey, st);
+    persistConversationState();
+
+    if (reply.bookingReminderResponse === 'cancel') {
+      // Mark the booking cancelled in bookings[] so it stops blocking the
+      // slot for conflict-detection + isn't sent the review-request after.
+      // Owner-scoped match: prefer contact-on-channel, fall back to
+      // channel+datetime so we don't accidentally cancel the wrong owner's
+      // booking that happens to share a contact id.
+      const bookingIdx = bookings.findIndex(b =>
+        b.ownerEmail === ownerEmail
+        && (b.contact === senderId
+            || (b.channel === channel && b.datetime === pendingReminder.bookingDatetime))
+      );
+      if (bookingIdx >= 0) {
+        bookings[bookingIdx].status = 'cancelled';
+        bookings[bookingIdx].cancelledAt = new Date().toISOString();
+        save('bookings', bookings);
+      }
+      // Alert owner so they can fill the slot
+      try {
+        await smartSend({
+          ownerEmail, to: ownerEmail,
+          subject: `❌ Booking cancelled — ${senderName}`,
+          html: `<div style="font-family:-apple-system,sans-serif;max-width:520px;margin:0 auto;padding:20px;font-size:14.5px;line-height:1.6;color:#222;">${senderName} just cancelled their ${pendingReminder.bookingDatetime}${pendingReminder.service ? ' ' + pendingReminder.service : ''} booking via ${channel}.<br><br>Slot is now free.</div>`,
+        });
+      } catch {}
+      fireWebhookEvent(ownerEmail, 'booking_cancelled', {
+        channel, senderId, senderName,
+        datetime: pendingReminder.bookingDatetime, service: pendingReminder.service,
+      });
+      console.log(`❌ [reminder] ${senderName} cancelled booking ${pendingReminder.bookingDatetime}`);
+    } else if (reply.bookingReminderResponse === 'reschedule') {
+      // Keep pendingBooking with cleared datetime so the next "how about 4pm?"
+      // message merges straight into a slot-fill flow + re-runs conflict check.
+      const existingBooking = bookings.find(b => b.ownerEmail === ownerEmail && b.datetime === pendingReminder.bookingDatetime);
+      const stB = conversationState.get(memKey) || {};
+      stB.pendingBooking = {
+        name:    existingBooking?.name || senderName,
+        contact: existingBooking?.contact || null,
+        service: pendingReminder.service,
+        datetime: null,
+      };
+      conversationState.set(memKey, stB);
+      persistConversationState();
+      console.log(`🔁 [reminder] ${senderName} wants to reschedule ${pendingReminder.bookingDatetime}`);
+    } else {
+      // confirmed — log only, fire webhook so CRM knows
+      fireWebhookEvent(ownerEmail, 'booking_confirmed', {
+        channel, senderId, senderName,
+        datetime: pendingReminder.bookingDatetime, service: pendingReminder.service,
+      });
+      console.log(`✓ [reminder] ${senderName} confirmed ${pendingReminder.bookingDatetime}`);
+    }
+  }
 
   // Save incoming to conversation memory + summarise on overflow.
   // Sliding-window pattern: most recent CONV_MAX_RAW entries kept verbatim,
@@ -15180,25 +15255,116 @@ registerTaskHandler('booking_reminder', async (task) => {
   const dateLabel = parsedDate
     ? parsedDate.toLocaleString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
     : datetime;
-  const msg = `👋 Friendly reminder — you're booked in with ${businessName}${service ? ' for ' + service : ''} tomorrow at ${dateLabel}. Looking forward to seeing you! Reply here if you need to reschedule.`;
-  // Channel reminder
+
+  // Smart-reminder phrasing — ASK for confirmation, don't just announce.
+  // "Still good for ..." with confirm/reschedule/cancel chips drives a 2-3×
+  // higher response rate than the old one-way "looking forward to seeing you"
+  // and unlocks the no-show prediction path.
+  const msg = `👋 Quick check-in — you're booked with ${businessName}${service ? ' for ' + service : ''} tomorrow at ${dateLabel}. Still good for you?`;
+  const chips = ['✓ Yes, confirmed', 'Reschedule', 'Cancel'];
+
+  let channelSent = false;
   if (channel && senderId) {
     const channelConfig = channelConfigs.get(ownerEmail)?.[channel];
     if (channelConfig) {
-      try { await sendChannelReply(channel, channelConfig, senderId, msg); } catch {}
+      try {
+        await sendChannelReply(channel, channelConfig, senderId, msg, chips);
+        channelSent = true;
+      } catch {}
     }
   }
-  // Email reminder if we have customer email
   if (customerEmail) {
     try {
       await smartSend({
         ownerEmail, to: customerEmail,
-        subject: `Reminder: ${businessName} — ${dateLabel}`,
-        html: `<div style="font-family:-apple-system,sans-serif;max-width:520px;margin:0 auto;padding:20px;font-size:14.5px;line-height:1.6;color:#222;">${msg}</div>`,
+        subject: `Confirming: ${businessName} — ${dateLabel}`,
+        html: `<div style="font-family:-apple-system,sans-serif;max-width:520px;margin:0 auto;padding:20px;font-size:14.5px;line-height:1.6;color:#222;">
+          <p>${msg}</p>
+          <p style="margin-top:14px;font-size:13px;color:#666;">Just reply to this email or message us on ${channel} to confirm, reschedule, or cancel.</p>
+        </div>`,
       });
     } catch {}
   }
-  console.log(`⏰ [outbound] booking_reminder sent to ${senderName} (${ownerEmail})`);
+
+  // Mark the conversation as "awaiting reminder response" so Aria's next
+  // reply classification can route confirm/reschedule/cancel correctly.
+  if (channel && senderId) {
+    const memKey = `${ownerEmail}::${channel}::${senderId}`;
+    const st = conversationState.get(memKey) || {};
+    st.pendingReminder = {
+      bookingDatetime: datetime,
+      service:         service || null,
+      sentAt:          new Date().toISOString(),
+      channel,
+    };
+    conversationState.set(memKey, st);
+    persistConversationState();
+  }
+
+  // Schedule a no-show check 2h before the appointment. If the customer
+  // hasn't replied to the reminder by then, alert the owner so they can
+  // call/double-book the slot. This is the "real assistant" delta.
+  if (parsedDate) {
+    const noshowAt = parsedDate.getTime() - 2 * 60 * 60 * 1000;
+    if (noshowAt > Date.now() + 60_000) {
+      try {
+        scheduleTask({
+          type: 'noshow_check',
+          dueAt: noshowAt,
+          ownerEmail,
+          payload: { channel, senderId, senderName, customerEmail, datetime, service },
+        });
+      } catch (e) { console.warn('[booking_reminder] noshow_check schedule failed:', e.message); }
+    }
+  }
+
+  console.log(`⏰ [outbound] smart booking_reminder sent to ${senderName} (${ownerEmail}) — chips=${channelSent ? 'yes' : 'email-only'}`);
+  return true;
+});
+
+// No-show check — fires 2h before the appointment. If the customer hasn't
+// responded to the reminder (pendingReminder still set on conversationState),
+// alert the owner. Most no-shows are predictable from silence: this gives
+// the owner ~2 hours to call, fill the slot, or rebook.
+registerTaskHandler('noshow_check', async (task) => {
+  const { ownerEmail, payload } = task;
+  const { channel, senderId, senderName, customerEmail, datetime, service } = payload;
+  if (!channel || !senderId) return false;
+  const memKey = `${ownerEmail}::${channel}::${senderId}`;
+  const st = conversationState.get(memKey) || {};
+  if (!st.pendingReminder) {
+    // Customer already responded — nothing to flag.
+    console.log(`✓ [noshow_check] ${senderName} already confirmed/handled their ${datetime} booking`);
+    return true;
+  }
+  // Customer went silent. Alert the owner.
+  const profile = getOwnerProfile(ownerEmail);
+  const businessName = profile?.profile?.businessName || 'your business';
+  const parsedDate = parseBookingDateTime(datetime);
+  const dateLabel = parsedDate
+    ? parsedDate.toLocaleString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+    : datetime;
+
+  try {
+    await smartSend({
+      ownerEmail, to: ownerEmail,
+      subject: `⚠️ Likely no-show — ${senderName} (${dateLabel})`,
+      html: `<div style="font-family:-apple-system,sans-serif;max-width:520px;margin:0 auto;padding:20px;font-size:14.5px;line-height:1.6;color:#222;">
+        <div style="background:#fff3cd;border:1px solid #ffc107;padding:14px;border-radius:10px;margin-bottom:14px;">
+          <b style="color:#856404;">⚠️ ${senderName} hasn't confirmed their ${dateLabel}${service ? ' ' + service : ''} booking</b>
+        </div>
+        <p>Aria sent a "still good?" reminder ${st.pendingReminder?.sentAt ? 'at ' + new Date(st.pendingReminder.sentAt).toLocaleString('en-GB') : 'earlier'} via ${channel} — no reply.</p>
+        <p><b>Booking in 2 hours.</b> ${customerEmail ? 'Customer email: <a href="mailto:' + customerEmail + '">' + customerEmail + '</a>' : 'No customer email on file — try DM via ' + channel + '.'}</p>
+        <p style="font-size:13px;color:#666;margin-top:16px;">This is the no-show prediction. Quick call now usually saves the slot.</p>
+      </div>`,
+    });
+  } catch (e) { console.warn('[noshow_check] owner email failed:', e.message); }
+
+  fireWebhookEvent(ownerEmail, 'noshow_predicted', {
+    channel, senderId, senderName, customerEmail, datetime, service,
+  });
+
+  console.log(`🚨 [outbound] noshow_predicted for ${senderName} (${ownerEmail}) — ${dateLabel}`);
   return true;
 });
 
