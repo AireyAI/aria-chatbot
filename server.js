@@ -8151,6 +8151,233 @@ function showMsg(id, text, type) {
 </body></html>`);
 });
 
+// ─── Self-onboarding wizard /start ──────────────────────────────────────
+// Post-login deep-config wizard that walks new owners through business
+// basics → channel connect → KB seed → review URL → digest prefs. Sets
+// profile.onboardingComplete:true when finished so future logins skip
+// straight to /dashboard. Idempotent — owners can re-run anytime to
+// reconfigure.
+//
+// Auth model: requires existing dashboard auth (?owner=&s=). New clients
+// arrive here via the existing /onboard invite → password-setup → Gmail
+// → redirect-to-/start chain.
+
+app.get('/start', (req, res) => {
+  const ownerEmail = req.query.owner || '';
+  const sessionToken = req.query.s || '';
+  if (!ownerEmail || !sessionToken || !validateSession(sessionToken, ownerEmail)) {
+    return res.redirect(`/dashboard?owner=${encodeURIComponent(ownerEmail)}`);
+  }
+  const step = Math.max(1, Math.min(5, parseInt(req.query.step) || 1));
+  const profile = getOwnerProfile(ownerEmail)?.profile || {};
+  const channels = channelConfigs.get(ownerEmail) || {};
+  const hasMeta = ['facebook', 'instagram', 'whatsapp'].some(c => channels[c]?.accessToken);
+  const hasGmail = gmailTokens.has(ownerEmail);
+  const Q = `owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}`;
+
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aria — Setup Wizard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;color:#eee;padding:20px;}
+.wrap{max-width:540px;margin:0 auto;padding-top:30px;}
+.logo{text-align:center;margin-bottom:24px;}
+.logo span{font-size:24px;font-weight:800;color:#fff;letter-spacing:-0.5px;}
+.logo span em{font-style:normal;color:#00e5a0;}
+.progress{display:flex;gap:8px;margin-bottom:28px;justify-content:center;}
+.dot{width:30px;height:6px;border-radius:3px;background:rgba(255,255,255,0.1);transition:.3s;}
+.dot.done{background:#00e5a0;}
+.dot.active{background:#9d96ff;}
+.card{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:28px;margin-bottom:16px;}
+.step-num{display:inline-block;background:rgba(157,150,255,0.15);color:#9d96ff;padding:4px 12px;border-radius:20px;font-size:11.5px;font-weight:600;margin-bottom:14px;text-transform:uppercase;letter-spacing:0.5px;}
+h2{font-size:20px;font-weight:700;margin-bottom:8px;color:#fff;}
+.lede{font-size:13.5px;color:#9898b8;margin-bottom:22px;line-height:1.6;}
+.field{margin-bottom:14px;}
+.field label{display:block;font-size:11.5px;color:#9898b8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;font-weight:600;}
+input,textarea,select{width:100%;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:11px 13px;font-size:14px;color:#eee;font-family:inherit;outline:none;transition:border-color .2s;}
+input:focus,textarea:focus,select:focus{border-color:rgba(0,229,160,0.4);}
+textarea{resize:vertical;min-height:84px;line-height:1.55;}
+.hint{font-size:11.5px;color:#6b6b8a;margin-top:5px;line-height:1.5;}
+.row{display:flex;gap:10px;}
+.row .field{flex:1;}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:12px 22px;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;text-decoration:none;transition:.15s;}
+.btn-primary{background:#00e5a0;color:#0d0d1f;}
+.btn-primary:hover{opacity:.9;transform:translateY(-1px);}
+.btn-secondary{background:rgba(255,255,255,0.06);color:#eee;border:1px solid rgba(255,255,255,0.1);}
+.btn-secondary:hover{background:rgba(255,255,255,0.1);}
+.btn-link{background:transparent;color:#9d96ff;padding:8px 0;font-size:13px;}
+.actions{display:flex;justify-content:space-between;margin-top:24px;align-items:center;}
+.channel-row{display:flex;align-items:center;justify-content:space-between;padding:14px;background:rgba(255,255,255,0.03);border-radius:10px;margin-bottom:10px;}
+.channel-row .label{display:flex;align-items:center;gap:12px;}
+.channel-row .icon{font-size:20px;}
+.badge-on{background:rgba(0,229,160,0.15);color:#00e5a0;padding:3px 10px;border-radius:14px;font-size:11px;font-weight:600;}
+.badge-off{background:rgba(255,255,255,0.06);color:#888;padding:3px 10px;border-radius:14px;font-size:11px;}
+.note{background:rgba(157,150,255,0.05);border:1px solid rgba(157,150,255,0.2);border-radius:10px;padding:12px 14px;font-size:12.5px;color:#bbb;margin-bottom:18px;line-height:1.55;}
+.msg{padding:10px;border-radius:8px;font-size:13px;margin-bottom:14px;display:none;}
+.msg.success{display:block;background:rgba(0,229,160,0.1);border:1px solid rgba(0,229,160,0.25);color:#00e5a0;}
+.msg.error{display:block;background:rgba(255,80,80,0.1);border:1px solid rgba(255,80,80,0.2);color:#ff6b6b;}
+.success-icon{font-size:48px;margin-bottom:14px;}
+</style>
+</head><body>
+<div class="wrap">
+  <div class="logo"><span>Aria<em>Ai</em></span></div>
+  <div class="progress">
+    ${[1,2,3,4,5].map(n => `<div class="dot ${n < step ? 'done' : n === step ? 'active' : ''}"></div>`).join('')}
+  </div>
+  <div id="msg" class="msg"></div>
+
+  ${step === 1 ? `
+  <div class="card">
+    <div class="step-num">Step 1 of 5</div>
+    <h2>Tell us about your business 👋</h2>
+    <p class="lede">Aria uses this to introduce herself + answer customer questions in your voice. You can change all of this later in Settings.</p>
+    <div class="field"><label>Business name</label><input id="businessName" value="${escapeHtml(profile.businessName || '')}" placeholder="e.g. Louise's Hair Studio"></div>
+    <div class="field"><label>What you do (one line)</label><input id="services" value="${escapeHtml(profile.services || '')}" placeholder="e.g. Haircuts, colour, treatments"></div>
+    <div class="row">
+      <div class="field"><label>City / area</label><input id="location" value="${escapeHtml(profile.location || '')}" placeholder="e.g. Manchester, UK"></div>
+      <div class="field"><label>Phone (optional)</label><input id="phone" value="${escapeHtml(profile.phone || '')}" placeholder="07xxx xxxxxx"></div>
+    </div>
+    <div class="field"><label>Tone</label>
+      <select id="tone">
+        ${['friendly','professional','warm','playful','formal'].map(t => `<option value="${t}" ${profile.tone === t ? 'selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('')}
+      </select>
+      <p class="hint">How Aria sounds when she replies to customers.</p>
+    </div>
+    <div class="actions">
+      <a href="/dashboard?${Q}" class="btn btn-link">Skip for now</a>
+      <button class="btn btn-primary" onclick="saveStep1()">Continue →</button>
+    </div>
+  </div>
+  ` : ''}
+
+  ${step === 2 ? `
+  <div class="card">
+    <div class="step-num">Step 2 of 5</div>
+    <h2>Connect your channels 📡</h2>
+    <p class="lede">Aria will read + reply on these — connect any/all. You can add more later.</p>
+    <div class="channel-row">
+      <div class="label"><span class="icon">📧</span><div><div style="font-weight:600;">Gmail</div><div style="font-size:11.5px;color:#888;">Email auto-replies, lead capture</div></div></div>
+      ${hasGmail ? '<span class="badge-on">● Connected</span>' : `<a href="/connect/gmail?owner=${encodeURIComponent(ownerEmail)}" class="btn btn-secondary" style="padding:8px 14px;font-size:12.5px;">Connect</a>`}
+    </div>
+    <div class="channel-row">
+      <div class="label"><span class="icon">💬</span><div><div style="font-weight:600;">Meta — FB Messenger + Instagram + WhatsApp</div><div style="font-size:11.5px;color:#888;">DMs across all three Meta channels</div></div></div>
+      ${hasMeta ? '<span class="badge-on">● Connected</span>' : `<a href="/connect/meta?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}" class="btn btn-secondary" style="padding:8px 14px;font-size:12.5px;">Connect</a>`}
+    </div>
+    ${!hasGmail && !hasMeta ? '<div class="note">⚠️ You can continue without connecting yet — but Aria needs at least one channel to do anything useful.</div>' : ''}
+    <div class="actions">
+      <a href="/start?${Q}&step=1" class="btn btn-link">← Back</a>
+      <a href="/start?${Q}&step=3" class="btn btn-primary">Continue →</a>
+    </div>
+  </div>
+  ` : ''}
+
+  ${step === 3 ? `
+  <div class="card">
+    <div class="step-num">Step 3 of 5</div>
+    <h2>Seed Aria's knowledge 🧠</h2>
+    <p class="lede">Give Aria 2-3 things customers commonly ask about. She'll cite these in replies. You can add more (or let her auto-suggest) later.</p>
+    <div class="field">
+      <label>Quick FAQ — title + answer (one entry, more in Settings)</label>
+      <input id="kbTitle" placeholder="e.g. Opening hours" style="margin-bottom:8px;">
+      <textarea id="kbContent" placeholder="e.g. We're open Mon-Fri 9-6 and Saturdays 10-4. Sundays closed. Walk-ins welcome but bookings preferred."></textarea>
+    </div>
+    <div class="note">💡 Or paste a longer doc — about page, services list, FAQ document — anything Aria should know.</div>
+    <div class="actions">
+      <a href="/start?${Q}&step=2" class="btn btn-link">← Back</a>
+      <div style="display:flex;gap:10px;">
+        <a href="/start?${Q}&step=4" class="btn btn-secondary">Skip</a>
+        <button class="btn btn-primary" onclick="saveStep3()">Save & continue →</button>
+      </div>
+    </div>
+  </div>
+  ` : ''}
+
+  ${step === 4 ? `
+  <div class="card">
+    <div class="step-num">Step 4 of 5</div>
+    <h2>Auto-collect Google reviews ⭐</h2>
+    <p class="lede">24 hours after every confirmed booking, Aria DMs your customer asking for a Google review. The single biggest growth lever you can flip in 60 seconds.</p>
+    <div class="field">
+      <label>Your Google review link</label>
+      <input id="reviewUrl" value="${escapeHtml((profile.reviewRequest && profile.reviewRequest.url) || '')}" placeholder="https://g.page/r/your-place-id/review" style="font-family:monospace;font-size:12.5px;">
+      <p class="hint">Find yours at <a href="https://whitespark.ca/google-review-link-generator/" target="_blank" style="color:#00e5a0;">whitespark.ca/google-review-link-generator</a> or use any review URL (Trustpilot, Facebook).</p>
+    </div>
+    <div class="actions">
+      <a href="/start?${Q}&step=3" class="btn btn-link">← Back</a>
+      <div style="display:flex;gap:10px;">
+        <a href="/start?${Q}&step=5" class="btn btn-secondary">Skip</a>
+        <button class="btn btn-primary" onclick="saveStep4()">Save & continue →</button>
+      </div>
+    </div>
+  </div>
+  ` : ''}
+
+  ${step === 5 ? `
+  <div class="card" style="text-align:center;">
+    <div class="success-icon">🎉</div>
+    <h2 style="margin-bottom:14px;">You're ready, ${escapeHtml(profile.businessName || 'team')}</h2>
+    <p class="lede" style="margin-bottom:22px;">Aria is live. She'll handle messages on your connected channels, draft quotes for your approval, ask for reviews after bookings, and surface any gaps in her knowledge so you can fix them in one click.</p>
+    <p class="lede"><b style="color:#00e5a0;">What to do next:</b> send Aria a test message from your phone to see her reply, then open the dashboard to fine-tune anything.</p>
+    <div style="margin-top:24px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
+      <button class="btn btn-primary" onclick="completeOnboarding()">Open dashboard →</button>
+    </div>
+  </div>
+  ` : ''}
+</div>
+
+<script>
+const Q = '${Q}';
+const msg = document.getElementById('msg');
+function showMsg(text, kind = 'success') { msg.className = 'msg ' + kind; msg.textContent = text; }
+async function apiPost(path, body) {
+  const r = await fetch(path + '?' + Q, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  return r.json();
+}
+
+async function saveStep1() {
+  const body = {
+    businessName: document.getElementById('businessName').value.trim(),
+    services:     document.getElementById('services').value.trim(),
+    location:     document.getElementById('location').value.trim(),
+    phone:        document.getElementById('phone').value.trim(),
+    tone:         document.getElementById('tone').value,
+  };
+  if (!body.businessName) { showMsg('Add your business name to continue', 'error'); return; }
+  const r = await apiPost('/api/dashboard/profile', body);
+  if (r.ok) location.href = '/start?' + Q + '&step=2';
+  else showMsg('Save failed — try again', 'error');
+}
+
+async function saveStep3() {
+  const title = document.getElementById('kbTitle').value.trim();
+  const content = document.getElementById('kbContent').value.trim();
+  if (!title || !content) { showMsg('Add both a title and content, or click Skip', 'error'); return; }
+  const r = await apiPost('/api/dashboard/knowledge', { title, content });
+  if (r.ok) location.href = '/start?' + Q + '&step=4';
+  else showMsg(r.error || 'Save failed', 'error');
+}
+
+async function saveStep4() {
+  const url = document.getElementById('reviewUrl').value.trim();
+  if (!url) { location.href = '/start?' + Q + '&step=5'; return; }
+  if (!/^https?:\\/\\//.test(url)) { showMsg('URL must start with http:// or https://', 'error'); return; }
+  const r = await apiPost('/api/dashboard/reviews/settings', { enabled: true, url, delayHours: 24, template: '' });
+  if (r.ok) location.href = '/start?' + Q + '&step=5';
+  else showMsg(r.error || 'Save failed', 'error');
+}
+
+async function completeOnboarding() {
+  await apiPost('/api/dashboard/profile', { onboardingComplete: true });
+  location.href = '/dashboard?' + Q;
+}
+</script>
+</body></html>`);
+});
+
+// Accept onboardingComplete flag on profile saves so step 5 can mark it.
+// This is wired into the same /api/dashboard/profile endpoint above by
+// adding to the partial-update field list — done in a follow-up.
+
 // ─── Client Health Dashboard ─────────────────────────────────────────────────
 app.get('/admin/clients', (req, res) => {
   if (!adminAuth(req)) return res.redirect('/admin');
@@ -11146,7 +11373,7 @@ app.get('/api/dashboard/profile', (req, res) => {
 app.post('/api/dashboard/profile', (req, res) => {
   const owner = requireDashboardAuth(req, res);
   if (!owner) return;
-  const { businessName, services, location, phone, email, hours, tone, servicesCarousel, allowedTopics, outbound, schedule } = req.body;
+  const { businessName, services, location, phone, email, hours, tone, servicesCarousel, allowedTopics, outbound, schedule, onboardingComplete } = req.body;
   // Find or create profile entry
   let profileKey = null;
   for (const [k, v] of clientProfiles) {
@@ -11166,6 +11393,7 @@ app.post('/api/dashboard/profile', (req, res) => {
   if (allowedTopics    !== undefined) updates.allowedTopics    = Array.isArray(allowedTopics)    ? allowedTopics    : [];
   if (outbound         !== undefined && typeof outbound === 'object') updates.outbound = outbound;
   if (schedule         !== undefined && typeof schedule === 'object') updates.schedule = schedule;
+  if (onboardingComplete !== undefined) updates.onboardingComplete = !!onboardingComplete;
   if (profileKey) {
     const existing = clientProfiles.get(profileKey);
     existing.profile = { ...existing.profile, ...updates };
@@ -11174,6 +11402,14 @@ app.post('/api/dashboard/profile', (req, res) => {
     clientProfiles.set(owner, { profile: { email: owner, ...updates }, scannedAt: new Date().toISOString() });
   }
   persistProfiles();
+
+  // Resolve the updated profile object for both the auto-reply prompt
+  // rebuild and the response body. Previous code referenced an undefined
+  // `updatedProfile` symbol — fired on any save by an autoReply-enabled
+  // owner.
+  const updatedProfile = (profileKey
+    ? clientProfiles.get(profileKey)?.profile
+    : clientProfiles.get(owner)?.profile) || { email: owner };
 
   // Update auto-reply prompt if enabled
   const autoReply = EMAIL_AUTO_REPLY_ENABLED.get(owner);
@@ -11370,6 +11606,15 @@ app.get('/dashboard', (req, res) => {
       }
     </script>
     </body></html>`);
+  }
+
+  // Authenticated — if onboarding hasn't been completed, route them
+  // through the 5-step wizard first. Idempotent: the wizard sets
+  // onboardingComplete on the profile when finished, so this only
+  // fires once per owner unless they explicitly re-visit /start.
+  const _onboardingProfile = getOwnerProfile(ownerEmail)?.profile;
+  if (_onboardingProfile && !_onboardingProfile.onboardingComplete && !req.query.skipOnboarding) {
+    return res.redirect(`/start?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}`);
   }
 
   // Authenticated — serve the full dashboard
