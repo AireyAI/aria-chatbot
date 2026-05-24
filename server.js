@@ -14391,6 +14391,63 @@ const _pendingCount = bootstrapFromLedger();
 console.log(`📅 Outbound scheduler: ${_pendingCount} pending tasks loaded from ledger`);
 startTickLoop(60_000);
 
+// Daily 8am sentiment digest — sums yesterday's negative + angry interactions
+// from channel_leads.jsonl, emails owner a digest with examples. Only fires
+// if threshold met (>=1 angry OR >=3 negative) — silence when things are fine.
+let lastSentimentDigestDay = null;
+setInterval(async () => {
+  const now = new Date();
+  if (now.getHours() !== 8 || lastSentimentDigestDay === now.toDateString()) return;
+  lastSentimentDigestDay = now.toDateString();
+
+  // Build per-owner buckets
+  const byOwner = new Map(); // ownerEmail → { angry: [], negative: [] }
+  try {
+    if (existsSync(CHANNEL_LEADS_FILE)) {
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      const lines = readFileSync(CHANNEL_LEADS_FILE, 'utf8').split('\n').filter(Boolean).slice(-2000);
+      for (const l of lines) {
+        try {
+          const e = JSON.parse(l);
+          if (!e.ownerEmail || !e.sentiment) continue;
+          if (new Date(e.ts).getTime() < cutoff) continue;
+          if (e.sentiment !== 'angry' && e.sentiment !== 'negative') continue;
+          if (!byOwner.has(e.ownerEmail)) byOwner.set(e.ownerEmail, { angry: [], negative: [] });
+          byOwner.get(e.ownerEmail)[e.sentiment].push(e);
+        } catch {}
+      }
+    }
+  } catch {}
+
+  for (const [ownerEmail, bucket] of byOwner) {
+    const angryCount = bucket.angry.length;
+    const negCount = bucket.negative.length;
+    if (angryCount === 0 && negCount < 3) continue; // threshold
+    try {
+      const exampleRows = [...bucket.angry, ...bucket.negative].slice(0, 5).map(e => {
+        const colour = e.sentiment === 'angry' ? '#ff6b6b' : '#fbbf24';
+        return `<div style="background:#fff;border-left:3px solid ${colour};padding:10px 14px;margin-bottom:8px;border-radius:6px;font-size:13px;">
+          <div style="color:#888;font-size:11px;margin-bottom:4px;">${e.sentiment.toUpperCase()} · ${e.channel} · ${e.senderName || 'anon'}</div>
+          <div style="color:#333;font-style:italic;">"${(e.messagePreview || '').slice(0, 200).replace(/</g, '&lt;')}"</div>
+        </div>`;
+      }).join('');
+      await smartSend({
+        ownerEmail, to: ownerEmail,
+        subject: `🚨 Aria sentiment digest — ${angryCount} angry, ${negCount} negative in last 24h`,
+        html: `<div style="font-family:-apple-system,sans-serif;max-width:560px;margin:0 auto;padding:20px;">
+          <div style="background:#0d0d1f;color:#fff;padding:18px;border-radius:12px;">
+            <h2 style="margin:0 0 6px;color:#ff6b6b;">😤 Sentiment digest — last 24h</h2>
+            <p style="margin:0;color:#9898b8;font-size:13px;">${angryCount} angry · ${negCount} negative</p>
+          </div>
+          <div style="margin-top:14px;">${exampleRows}</div>
+          <p style="margin:14px 0 0;font-size:12px;color:#666;text-align:center;">These are interactions Aria classified as negative or angry. Worth reviewing — could be a recurring issue, a missing service detail, or one customer worth a personal follow-up.</p>
+        </div>`,
+      });
+      console.log(`📧 Sentiment digest sent to ${ownerEmail}: ${angryCount} angry, ${negCount} negative`);
+    } catch (e) { console.warn('[sentiment-digest] send failed:', e.message); }
+  }
+}, 5 * 60 * 1000); // check every 5 min, fires once per day
+
 // Daily sweep — once a day, find conversations that had ≥3 exchanges
 // but went quiet >24h ago. Schedule a recovery nudge for each (one per
 // memKey, dedupe via in-memory set so we don't re-nudge repeatedly).
