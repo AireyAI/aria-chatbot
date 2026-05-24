@@ -50,6 +50,7 @@ import { scoreChannelLead, categorizeChannelMessage } from './lib/channel_lead_s
 import { retrieveRelevantChunks } from './lib/rag_retriever.js';
 import { buildIcsEvent, parseBookingDateTime } from './lib/ics_builder.js';
 import { scheduleTask, cancelTask, listPending, bootstrapFromLedger, registerTaskHandler, startTickLoop } from './lib/outbound_scheduler.js';
+import { ltvScore, ltvTier } from './lib/customer_ltv.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
@@ -9855,6 +9856,112 @@ app.get('/api/admin/usage', (req, res) => {
   res.json({ rows, totalUsedToday: rows.reduce((s, r) => s + r.usedToday, 0) });
 });
 
+// GET /api/dashboard/customers — list all known customers for the owner,
+// sorted by most-recent touch. Pulled from the in-memory customerIndex
+// which is rebuilt at startup from channel_leads.jsonl.
+app.get('/api/dashboard/customers', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const owned = customerIndex.get(owner);
+  if (!owned) return res.json({ customers: [] });
+  const list = [];
+  for (const [key, c] of owned) {
+    list.push({
+      key,
+      name: c.name || key.split(':')[1],
+      channels: Array.from(c.channels || []),
+      touches: c.totalTouches || 0,
+      lastSeen: c.lastSeen,
+      recent: (c.recent || []).slice(0, 1),
+    });
+  }
+  list.sort((a, b) => (b.lastSeen || '').localeCompare(a.lastSeen || ''));
+  res.json({ customers: list });
+});
+
+// GET /api/dashboard/customer/:contactKey — full profile for one customer.
+// Aggregates conversations (from conversationMemory across all channels for
+// this senderId), bookings (matched on contact), leads (matched on
+// contactKey), and computes a simple LTV proxy.
+app.get('/api/dashboard/customer/:contactKey', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const targetKey = decodeURIComponent(req.params.contactKey || '');
+  const owned = customerIndex.get(owner);
+  if (!owned?.has(targetKey)) return res.status(404).json({ error: 'Customer not found' });
+  const customer = owned.get(targetKey);
+
+  // 1. Lead history from channel_leads.jsonl — filter by contactKey match
+  const leadHistory = [];
+  const sentimentTimeline = [];
+  try {
+    if (existsSync(CHANNEL_LEADS_FILE)) {
+      for (const line of readFileSync(CHANNEL_LEADS_FILE, 'utf8').split('\n').filter(Boolean)) {
+        try {
+          const e = JSON.parse(line);
+          if (e.ownerEmail !== owner) continue;
+          const ek = customerKey(e.contact || {});
+          if (ek !== targetKey) continue;
+          leadHistory.push({
+            ts: e.ts, channel: e.channel, leadScore: e.leadScore, category: e.category,
+            sentiment: e.sentiment, preview: e.messagePreview,
+          });
+          if (e.sentiment) sentimentTimeline.push({ ts: e.ts, sentiment: e.sentiment });
+        } catch {}
+      }
+    }
+  } catch {}
+
+  // 2. Bookings matched on contact
+  const customerBookings = bookings.filter(b => {
+    if (b.ownerEmail !== owner) return false;
+    const bKey = customerKey({ name: b.name, email: b.contact?.includes('@') ? b.contact : null, phone: b.contact && !b.contact?.includes('@') ? b.contact : null });
+    return bKey === targetKey;
+  }).reverse();
+
+  // 3. Conversations across all channels — scan conversationMemory keys
+  // for any matching senderId across channels this customer touched.
+  const conversations = [];
+  const recentSenderIds = new Set((customer.recent || []).map(r => r.channel + '::' + r.preview));
+  for (const [memKey, history] of conversationMemory) {
+    if (!memKey.startsWith(owner + '::')) continue;
+    const [, channel, senderId] = memKey.split('::');
+    if (!customer.channels?.has(channel)) continue;
+    // Check the recorded touches for this customer — does this senderId appear in any of them?
+    // (We don't have a senderId↔customerKey map yet so we use the conv's contact preview as proxy.)
+    const matchesByPreview = (history || []).some(h =>
+      h.role === 'sender' && (customer.recent || []).some(r => h.preview?.slice(0, 60).includes(r.preview?.slice(0, 60)))
+    );
+    if (matchesByPreview) {
+      conversations.push({ memKey, channel, senderId, msgCount: history.length, lastMsgTs: history[history.length - 1]?.date });
+    }
+  }
+  conversations.sort((a, b) => (b.lastMsgTs || '').localeCompare(a.lastMsgTs || ''));
+
+  // 4. LTV proxy — simple weighted sum. Tunable in lib/customer_ltv.js
+  //    (Kyle owns the formula — see TODO at top of that file.)
+  const ltv = ltvScore({
+    bookings: customerBookings.length,
+    leads: leadHistory.length,
+    hotLeads: leadHistory.filter(l => l.leadScore === 'hot').length,
+    conversations: conversations.length,
+    touches: customer.totalTouches,
+  });
+
+  res.json({
+    key: targetKey,
+    name: customer.name,
+    channels: Array.from(customer.channels || []),
+    touches: customer.totalTouches,
+    lastSeen: customer.lastSeen,
+    leadHistory,
+    bookings: customerBookings,
+    conversations,
+    sentimentTimeline,
+    ltv,
+  });
+});
+
 // GET /api/dashboard/analytics — 7-day rollup of conversation volume,
 // sentiment, leads, CSAT, top categories. Reads directly from the JSONL
 // ledgers (no separate aggregation layer needed at current scale; cache
@@ -10970,6 +11077,15 @@ tr:last-child td{border-bottom:none;}
     <div class="section-body" id="body-leads"><div class="empty">Loading...</div></div>
   </div>
 
+  <!-- Customers — repeat-customer profile drill-down -->
+  <div class="section" id="sec-customers">
+    <div class="section-header" onclick="toggleSection('customers')">
+      <h3>&#x1F465; Customers</h3>
+      <span class="arrow">&#x25B6;</span>
+    </div>
+    <div class="section-body" id="body-customers"><div class="empty">Loading...</div></div>
+  </div>
+
   <!-- Bookings -->
   <div class="section" id="sec-bookings">
     <div class="section-header" onclick="toggleSection('bookings')">
@@ -11406,6 +11522,104 @@ async function loadSection(name) {
   else if (name === 'settings') await loadSettings();
   else if (name === 'conversations') await loadUnifiedConvs('all');
   else if (name === 'train') await loadTrainAria();
+  else if (name === 'customers') await loadCustomers();
+}
+
+// ─── Customers — repeat-customer profile drill-down ──────────────────────
+async function loadCustomers() {
+  const body = document.getElementById('body-customers');
+  try {
+    const d = await api('/api/dashboard/customers');
+    const list = d.customers || [];
+    if (!list.length) {
+      body.innerHTML = '<div class="cta-card"><h4>No returning customers yet</h4><p>Aria builds this list automatically — whenever the same customer messages you 2+ times (matched by email, phone, or name), they show up here with their full history.</p></div>';
+      return;
+    }
+    const icons = { facebook: '📘', instagram: '📷', whatsapp: '💬', email: '📧', voice: '☎️' };
+    let html = '<div style="display:flex;flex-direction:column;gap:8px;">';
+    for (const c of list.slice(0, 100)) {
+      const chans = (c.channels || []).map(ch => icons[ch] || '·').join(' ');
+      html += '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:12px 14px;display:flex;align-items:center;gap:12px;cursor:pointer;transition:all 0.15s;" onmouseover="this.style.borderColor=\\'rgba(255,255,255,0.15)\\'" onmouseout="this.style.borderColor=\\'rgba(255,255,255,0.06)\\'" onclick="showCustomerProfile(\\'' + encodeURIComponent(c.key) + '\\')">' +
+        '<div style="flex:1;min-width:0;">' +
+          '<div style="font-size:13.5px;color:#fff;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH(c.name || c.key.split(':')[1]) + '</div>' +
+          '<div style="font-size:11.5px;color:#8888aa;margin-top:3px;">' + chans + ' · ' + c.touches + ' touch' + (c.touches !== 1 ? 'es' : '') + ' · last seen ' + timeAgo(c.lastSeen) + '</div>' +
+        '</div>' +
+        '<div style="font-size:11px;color:#9d96ff;flex-shrink:0;">View →</div>' +
+      '</div>';
+    }
+    html += '</div>';
+    body.innerHTML = html;
+  } catch (e) { body.innerHTML = '<div class="empty">Failed to load customers.</div>'; }
+}
+
+async function showCustomerProfile(contactKey) {
+  openModal('<div style="color:#8888aa;text-align:center;padding:24px">Loading customer profile…</div>');
+  try {
+    const d = await api('/api/dashboard/customer/' + contactKey);
+    if (d.error) { openModal('<h3>Not found<button class="close-x" onclick="closeModal()">×</button></h3><p style="color:#9898b8">' + escH(d.error) + '</p>'); return; }
+    const ltv = d.ltv || 0;
+    const tier = ltv >= 60 ? {l:'VIP',c:'#00e5a0'} : ltv >= 30 ? {l:'Engaged',c:'#fbbf24'} : ltv >= 10 ? {l:'Active',c:'#9d96ff'} : {l:'New',c:'#8888aa'};
+    const icons = { facebook: '📘', instagram: '📷', whatsapp: '💬', email: '📧' };
+    const channels = (d.channels || []).map(ch => icons[ch] || '·').join(' ');
+
+    // Sentiment timeline as a tiny inline visual
+    const sentBuckets = { positive: 0, neutral: 0, negative: 0, angry: 0 };
+    (d.sentimentTimeline || []).forEach(s => { if (sentBuckets[s.sentiment] !== undefined) sentBuckets[s.sentiment]++; });
+    const sentTotal = Object.values(sentBuckets).reduce((a, b) => a + b, 0);
+    const sentBar = sentTotal ? Object.entries(sentBuckets).filter(([, v]) => v > 0).map(([k, v]) => {
+      const w = (v / sentTotal * 100).toFixed(0);
+      const colorMap = { positive: '#00e5a0', neutral: '#9898b8', negative: '#fbbf24', angry: '#ff6b6b' };
+      return '<div style="flex:' + w + ';background:' + colorMap[k] + ';height:6px;" title="' + k + ': ' + v + '"></div>';
+    }).join('') : '<div style="background:rgba(255,255,255,0.05);height:6px;border-radius:3px;flex:1;"></div>';
+
+    // Lead history rows
+    const leadRows = (d.leadHistory || []).slice(0, 10).map(l => {
+      const scoreColor = l.leadScore === 'hot' ? '#ff6b6b' : l.leadScore === 'warm' ? '#fbbf24' : '#9898b8';
+      return '<div style="padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05);font-size:12px;">' +
+        '<div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;">' +
+          '<span style="background:' + scoreColor + '20;color:' + scoreColor + ';padding:1px 8px;border-radius:10px;font-size:10.5px;font-weight:600;text-transform:uppercase;">' + (l.leadScore || 'unscored') + '</span>' +
+          '<span style="font-size:10.5px;color:#8888aa;">' + (icons[l.channel] || '·') + ' ' + (l.category || 'general') + '</span>' +
+          '<span style="font-size:10.5px;color:#6b6b8a;margin-left:auto;">' + timeAgo(l.ts) + '</span>' +
+        '</div>' +
+        (l.preview ? '<div style="color:#bbb;font-style:italic;line-height:1.5;">"' + escH(l.preview.slice(0, 200)) + '"</div>' : '') +
+      '</div>';
+    }).join('') || '<div class="empty" style="padding:14px 0;font-size:12px;">No lead history</div>';
+
+    // Bookings
+    const bookingRows = (d.bookings || []).slice(0, 5).map(b =>
+      '<div style="background:rgba(0,229,160,0.05);border-radius:8px;padding:10px;margin-bottom:6px;font-size:12.5px;">' +
+        '<div style="color:#fff;font-weight:600;">📅 ' + escH(b.service || 'Booking') + '</div>' +
+        '<div style="color:#00e5a0;font-size:11.5px;margin-top:3px;">' + escH(b.datetime || '—') + '</div>' +
+      '</div>'
+    ).join('') || '<div class="empty" style="padding:14px 0;font-size:12px;">No bookings yet</div>';
+
+    // Conversation threads
+    const convRows = (d.conversations || []).slice(0, 5).map(c =>
+      '<div onclick="closeModal();setTimeout(() => showThread(\\'' + c.memKey + '\\'), 100)" style="background:rgba(255,255,255,0.03);border-radius:8px;padding:10px;margin-bottom:6px;font-size:12.5px;cursor:pointer;border:1px solid rgba(255,255,255,0.06);" onmouseover="this.style.borderColor=\\'rgba(157,150,255,0.4)\\'" onmouseout="this.style.borderColor=\\'rgba(255,255,255,0.06)\\'">' +
+        '<div style="color:#fff;">' + (icons[c.channel] || '·') + ' ' + c.msgCount + ' messages</div>' +
+        '<div style="color:#8888aa;font-size:11px;margin-top:3px;">Last: ' + timeAgo(c.lastMsgTs) + ' — click to view →</div>' +
+      '</div>'
+    ).join('') || '<div class="empty" style="padding:14px 0;font-size:12px;">No conversation threads found</div>';
+
+    openModal(
+      '<div style="display:flex;align-items:start;justify-content:space-between;margin-bottom:18px;gap:12px;">' +
+        '<div style="flex:1;min-width:0;">' +
+          '<h3 style="font-size:18px;color:#fff;margin:0 0 4px;">' + escH(d.name || contactKey.split(':')[1]) + '</h3>' +
+          '<div style="font-size:11.5px;color:#8888aa;">' + channels + ' · ' + d.touches + ' touch' + (d.touches !== 1 ? 'es' : '') + ' · first seen ' + timeAgo(d.lastSeen) + '</div>' +
+        '</div>' +
+        '<div style="text-align:right;flex-shrink:0;">' +
+          '<div style="background:' + tier.c + '20;color:' + tier.c + ';padding:3px 12px;border-radius:14px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;display:inline-block;">' + tier.l + '</div>' +
+          '<div style="font-size:20px;font-weight:800;color:' + tier.c + ';margin-top:6px;">' + ltv + '</div>' +
+          '<div style="font-size:10px;color:#6b6b8a;text-transform:uppercase;letter-spacing:0.5px;">LTV score</div>' +
+        '</div>' +
+        '<button class="close-x" onclick="closeModal()" style="margin-left:8px;">×</button>' +
+      '</div>' +
+      (sentTotal ? '<div style="margin-bottom:18px;"><div style="font-size:11px;color:#8888aa;text-transform:uppercase;margin-bottom:6px;letter-spacing:0.5px;">Sentiment over time</div><div style="display:flex;gap:0;border-radius:3px;overflow:hidden;">' + sentBar + '</div></div>' : '') +
+      '<div style="margin-bottom:18px;"><div style="font-size:11px;color:#8888aa;text-transform:uppercase;margin-bottom:8px;letter-spacing:0.5px;">📅 Bookings (' + (d.bookings?.length || 0) + ')</div>' + bookingRows + '</div>' +
+      '<div style="margin-bottom:18px;"><div style="font-size:11px;color:#8888aa;text-transform:uppercase;margin-bottom:8px;letter-spacing:0.5px;">💬 Conversation threads</div>' + convRows + '</div>' +
+      '<div><div style="font-size:11px;color:#8888aa;text-transform:uppercase;margin-bottom:8px;letter-spacing:0.5px;">🎯 Lead history (' + (d.leadHistory?.length || 0) + ')</div>' + leadRows + '</div>'
+    );
+  } catch (e) { openModal('<div style="color:#ff6b6b">Failed to load profile: ' + e.message + '</div>'); }
 }
 
 // ─── Modal + drill-down helpers ─────────────────────────────────────────
