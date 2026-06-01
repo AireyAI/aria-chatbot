@@ -57,6 +57,7 @@ import { extractImageRefs, resolveImageRefsToBlocks } from './lib/image_intake.j
 import { extractAudioRefs, transcribeAudioRef } from './lib/audio_intake.js';
 import { findBookingConflicts, describeConflictsForCustomer } from './lib/booking_conflicts.js';
 import { canBatch as digestCanBatch, shouldFireDigest, renderDigestHtml } from './lib/digest.js';
+import { verifyVapiSignature, buildAssistantConfig, extractCallReport, extractToolCall } from './lib/vapi_handler.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
@@ -121,6 +122,16 @@ function mintAdminMagicLink(req) {
     base = `http://localhost:${process.env.PORT || 3000}`;
   }
   return `${base}/admin/auth?t=${token}`;
+}
+
+// Public base URL of this server. Prefers the live request host, falls back
+// to Railway domain / BASE_URL / localhost. Used by integrations that need
+// to hand external services a callback URL (Vapi serverUrl, etc).
+function appBaseUrl(req) {
+  if (req) return `${req.protocol}://${req.get('host')}`;
+  if (process.env.RAILWAY_PUBLIC_DOMAIN) return `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
+  if (process.env.BASE_URL) return process.env.BASE_URL.replace(/\/+$/, '');
+  return `http://localhost:${process.env.PORT || 3000}`;
 }
 
 function mintAdminSession(ip) {
@@ -257,6 +268,7 @@ app.options('*', cors(corsOpts));
 // Raw body capture for Shopify webhook HMAC verification — must run before express.json()
 app.use('/api/shopify/webhook', express.raw({ type: 'application/json' }));
 app.use('/api/meta/webhook', express.raw({ type: 'application/json' }));
+app.use('/api/vapi/webhook', express.raw({ type: '*/*' })); // raw for HMAC signature verify
 app.use(express.json());
 app.use('/chatbot.js', (req, res, next) => {
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
@@ -2358,6 +2370,9 @@ function save(name, data, delay = 500) {
 
   // Notification digest buffer (informational alerts batched into daily email)
   loadDigestState();
+
+  // Voice receptionist — number→owner map + per-owner voice config
+  loadVoiceConfig();
 
   console.log(`📂 Loaded: ${savedFaqs.length} FAQs, ${savedBookings.length} bookings, ${savedProducts.length} products, ${savedDsOrders.length} dropship orders, ${usage.messages} msgs this month`);
 })();
@@ -13359,6 +13374,9 @@ async function loadSettings() {
         Gmail Settings
       </a>
 
+      <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">📞 Phone receptionist <span style="font-size:11px;font-weight:400;color:#9898b8;">— Aria answers your phone, books + quotes by voice</span></h4>
+      <div id="phone-panel"><div class="empty" style="padding:14px 0;font-size:12px;">Loading…</div></div>
+
       <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">📋 Notification digest <span style="font-size:11px;font-weight:400;color:#9898b8;">— batch informational alerts into one daily email</span></h4>
       <div id="digest-panel"><div class="empty" style="padding:14px 0;font-size:12px;">Loading…</div></div>
 
@@ -13371,7 +13389,66 @@ async function loadSettings() {
     loadWebhooks();
     loadReviewSettings();
     loadDigestSettings();
+    loadPhoneSettings();
   } catch (e) { body.innerHTML = '<div class="empty">Failed to load settings.</div>'; }
+}
+
+// ─── Phone receptionist settings panel ──────────────────────────────────
+async function loadPhoneSettings() {
+  const el = document.getElementById('phone-panel');
+  if (!el) return;
+  try {
+    const d = await api('/api/dashboard/phone/settings');
+    const s = d.settings || {};
+    const calls = (await api('/api/dashboard/calls')).calls || [];
+
+    const intentEmoji = { booking: '📅', quote: '💷', enquiry: '💬', complaint: '⚠️', message: '✉️', other: '📞' };
+    const callRows = calls.length ? calls.slice(0, 6).map(c =>
+      '<div style="display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:12px;">' +
+        '<span style="font-size:14px;">' + (intentEmoji[c.intent] || '📞') + '</span>' +
+        '<span style="color:#ddd;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH(c.summary || c.intent || 'Call') + '</span>' +
+        (c.recordingUrl ? '<a href="' + escH(c.recordingUrl) + '" target="_blank" style="color:#00e5a0;font-size:11px;">▶</a>' : '') +
+        '<span style="color:#6b6b8a;font-size:10.5px;">' + (c.durationSec ? c.durationSec + 's · ' : '') + timeAgo(c.ts) + '</span>' +
+      '</div>'
+    ).join('') : '<div class="empty" style="padding:10px 0;font-size:11.5px;">No calls yet. Once your Vapi number is live, calls appear here.</div>';
+
+    el.innerHTML =
+      '<div style="background:rgba(0,229,160,0.04);border:1px solid rgba(0,229,160,0.2);border-radius:10px;padding:14px;">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
+          '<div style="font-size:12px;color:#fff;font-weight:600;">Voice answering ' + (s.enabled && s.phoneNumber ? '<span style="color:#00e5a0;font-size:11px;">● Live</span>' : '<span style="color:#6b6b8a;font-size:11px;">● Off</span>') + '</div>' +
+          '<label class="toggle"><input type="checkbox" id="ph-enabled" ' + (s.enabled ? 'checked' : '') + '><span class="slider"></span></label>' +
+        '</div>' +
+        '<p style="font-size:11.5px;color:#9898b8;margin:0 0 12px;line-height:1.5;">Aria answers calls 24/7, books appointments (with conflict-checking), takes quote requests, and texts callers a follow-up. Set up your Vapi number below.</p>' +
+        '<div class="form-group" style="margin-bottom:10px;">' +
+          '<label style="font-size:11px;">Your Vapi phone number</label>' +
+          '<input id="ph-number" value="' + escH(s.phoneNumber || '') + '" placeholder="+44 7700 900123" style="font-family:monospace;font-size:13px;">' +
+        '</div>' +
+        '<div class="form-group" style="margin-bottom:10px;">' +
+          '<label style="font-size:11px;">Greeting (first thing callers hear)</label>' +
+          '<input id="ph-greeting" value="' + escH(s.firstMessage || '') + '" placeholder="Hi, you\\'ve reached [business], this is Aria. How can I help?">' +
+        '</div>' +
+        '<div style="background:rgba(255,255,255,0.03);border-radius:8px;padding:10px 12px;margin-bottom:10px;">' +
+          '<div style="font-size:10.5px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Vapi webhook URL — paste into your Vapi number\\'s Server settings</div>' +
+          '<code style="font-size:11px;color:#00e5a0;word-break:break-all;">' + escH(d.webhookUrl || '') + '</code>' +
+        '</div>' +
+        '<button class="btn-save" onclick="savePhoneSettings()">Save</button>' +
+      '</div>' +
+      '<h5 style="font-size:11px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin:18px 0 8px;">Recent calls</h5>' +
+      callRows;
+  } catch (e) { el.innerHTML = '<div class="empty">Failed to load phone settings.</div>'; }
+}
+
+async function savePhoneSettings() {
+  const body = {
+    enabled: document.getElementById('ph-enabled').checked,
+    phoneNumber: document.getElementById('ph-number').value.trim(),
+    firstMessage: document.getElementById('ph-greeting').value.trim(),
+  };
+  try {
+    const r = await apiPost('/api/dashboard/phone/settings', body);
+    if (r.ok) { toast(body.enabled && body.phoneNumber ? '✓ Voice answering live' : '✓ Saved'); loadPhoneSettings(); }
+    else toast(r.error || 'Save failed');
+  } catch (e) { toast('Save failed'); }
 }
 
 // ─── Webhooks panel ─────────────────────────────────────────────────────
@@ -14841,6 +14918,55 @@ function persistKnowledgeDocs() {
   } catch (e) { console.warn('Failed to persist knowledge docs:', e.message); }
 }
 
+// ─── Voice receptionist (Vapi) state ─────────────────────────────────────
+// voiceConfig: ownerEmail → { enabled, phoneNumber, voiceId, firstMessage,
+//   greetingHours }. Keyed by owner so the dashboard can read/write it.
+// voiceNumberIndex: dialedNumber (E.164) → ownerEmail. Built from
+//   voiceConfig so an inbound call's assistant-request resolves to an owner
+//   in O(1). Rebuilt whenever voiceConfig changes.
+const VOICE_CONFIG_FILE = resolve('data/voice_config.json');
+const PHONE_CALLS_LEDGER = resolve('data/phone_calls.jsonl');
+const voiceConfig = new Map();
+const voiceNumberIndex = new Map();
+
+function rebuildVoiceNumberIndex() {
+  voiceNumberIndex.clear();
+  for (const [owner, cfg] of voiceConfig) {
+    if (cfg?.phoneNumber) voiceNumberIndex.set(normalisePhone(cfg.phoneNumber), owner);
+  }
+}
+// Strip everything but digits + leading + so "+44 7497 812186" and
+// "447497812186" resolve to the same key.
+function normalisePhone(p) {
+  if (!p) return '';
+  const s = String(p).replace(/[^\d+]/g, '');
+  return s.startsWith('+') ? s : (s.startsWith('00') ? '+' + s.slice(2) : '+' + s);
+}
+function loadVoiceConfig() {
+  try {
+    if (existsSync(VOICE_CONFIG_FILE)) {
+      const saved = JSON.parse(readFileSync(VOICE_CONFIG_FILE, 'utf8'));
+      for (const [k, v] of Object.entries(saved)) voiceConfig.set(k, v);
+    }
+  } catch (e) { console.warn('Failed to load voice config:', e.message); }
+  rebuildVoiceNumberIndex();
+}
+function persistVoiceConfig() {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    const obj = {};
+    for (const [k, v] of voiceConfig) obj[k] = v;
+    writeFileSync(VOICE_CONFIG_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) { console.warn('Failed to persist voice config:', e.message); }
+  rebuildVoiceNumberIndex();
+}
+function appendPhoneCallLedger(entry) {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    appendFileSync(PHONE_CALLS_LEDGER, JSON.stringify(entry) + '\n');
+  } catch (e) { console.warn('[voice] call ledger append failed:', e.message); }
+}
+
 // GET /api/dashboard/knowledge — list owner's docs
 app.get('/api/dashboard/knowledge', (req, res) => {
   const owner = requireDashboardAuth(req, res);
@@ -15949,6 +16075,248 @@ app.get('/api/quotes/reject', (req, res) => {
     <h2 style="color:#ff6b6b;">✗ Quote rejected</h2>
     <p style="color:#9898b8;">Nothing sent. Customer is waiting for you to reply on the channel directly.</p>
   </body></html>`);
+});
+
+// ─── Voice receptionist (Vapi) webhook ──────────────────────────────────
+// ONE endpoint, four event types. Vapi posts raw JSON (express.raw is set
+// for this path so we can HMAC-verify), then we parse + switch on
+// message.type. See lib/vapi_handler.js for the multi-tenant design notes.
+app.post('/api/vapi/webhook', async (req, res) => {
+  // req.body is a Buffer (express.raw). Verify signature over the raw bytes.
+  const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : JSON.stringify(req.body || {});
+  const secret = process.env.VAPI_WEBHOOK_SECRET;
+  if (!verifyVapiSignature(raw, req.headers['x-vapi-signature'], secret)) {
+    console.warn('[voice] webhook signature verification failed');
+    return res.status(401).json({ error: 'bad signature' });
+  }
+  if (!secret) console.warn('[voice] VAPI_WEBHOOK_SECRET not set — accepting unverified webhook (dev mode)');
+
+  let payload;
+  try { payload = JSON.parse(raw); } catch { return res.status(400).json({ error: 'bad json' }); }
+  const message = payload.message || payload;
+  const type = message.type;
+
+  try {
+    // ── 1. assistant-request — Vapi asks which assistant answers this call.
+    //    Resolve owner by the dialed number, build their assistant fresh.
+    if (type === 'assistant-request') {
+      const dialed = normalisePhone(message.call?.phoneNumber?.number || message.phoneNumber?.number || '');
+      const ownerEmail = voiceNumberIndex.get(dialed);
+      if (!ownerEmail || voiceConfig.get(ownerEmail)?.enabled === false) {
+        // No tenant for this number (or disabled) — let Vapi play a default.
+        return res.json({ error: 'This number is not currently configured for voice answering.' });
+      }
+      const profile = getOwnerProfile(ownerEmail)?.profile || {};
+      const knowledge = knowledgeDocs.get(ownerEmail) || [];
+      const cfg = voiceConfig.get(ownerEmail) || {};
+      const serverUrl = appBaseUrl(req);
+      const assistant = buildAssistantConfig({
+        ownerEmail, profile, knowledge, serverUrl,
+        opts: { voiceId: cfg.voiceId, firstMessage: cfg.firstMessage, maxDurationSec: cfg.maxDurationSec },
+      });
+      console.log(`📞 [voice] assistant-request for ${ownerEmail} on ${dialed}`);
+      return res.json({ assistant });
+    }
+
+    // ── 2. tool-calls — mid-call function call (check_availability).
+    if (type === 'tool-calls' || type === 'function-call') {
+      const tool = extractToolCall(message);
+      const ownerEmail = message.call?.metadata?.ownerEmail || message.assistant?.metadata?.ownerEmail;
+      if (tool?.name === 'check_availability') {
+        const parsed = parseBookingDateTime(tool.args.datetime);
+        let resultText;
+        if (!parsed) {
+          resultText = `I couldn't pin down that exact time — could you say the day and time again?`;
+        } else {
+          const ownerBookings = bookings.filter(b => b.ownerEmail === ownerEmail);
+          const conflicts = findBookingConflicts({ newDatetime: tool.args.datetime, durationMin: 60, existing: ownerBookings, bufferMin: 0 });
+          resultText = conflicts.length === 0
+            ? `That time is free. Confirm with the caller and let them know you'll text a confirmation shortly.`
+            : `That slot is already taken. Offer the caller a nearby alternative (e.g. an hour earlier or later, or the next day).`;
+        }
+        // Vapi expects { results: [{ toolCallId, result }] } (or legacy { result })
+        const body = tool.id
+          ? { results: [{ toolCallId: tool.id, result: resultText }] }
+          : { result: resultText };
+        return res.json(body);
+      }
+      return res.json({ result: 'OK' });
+    }
+
+    // ── 3. status-update — call lifecycle. Log but no action needed.
+    if (type === 'status-update') {
+      return res.json({ ok: true });
+    }
+
+    // ── 4. end-of-call-report — the payoff. Persist + run pipelines.
+    if (type === 'end-of-call-report') {
+      const report = extractCallReport(message);
+      const ownerEmail = report.ownerEmail || voiceNumberIndex.get(normalisePhone(report.dialedNumber || ''));
+      if (!ownerEmail) { console.warn('[voice] end-of-call-report with no resolvable owner'); return res.json({ ok: true }); }
+
+      // Persist the call (append-only — Rule 13)
+      appendPhoneCallLedger({
+        ts: new Date().toISOString(),
+        ownerEmail,
+        callId: report.callId,
+        customerNumber: report.customerNumber,
+        durationSec: report.durationSec,
+        endedReason: report.endedReason,
+        intent: report.structured?.intent || 'other',
+        summary: report.structured?.summary || report.summary || '',
+        structured: report.structured || {},
+        transcript: String(report.transcript || '').slice(0, 20000),
+        recordingUrl: report.recordingUrl,
+      });
+
+      // Fire the rest async so we return 200 to Vapi fast.
+      setImmediate(() => handleVoiceCallOutcome({ ownerEmail, report }).catch(e => console.error('[voice] outcome handler failed:', e.message)));
+
+      console.log(`📞 [voice] call ended for ${ownerEmail} — intent=${report.structured?.intent || '?'} dur=${report.durationSec}s`);
+      return res.json({ ok: true });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[voice] webhook handler error:', e.message);
+    return res.status(200).json({ ok: false }); // 200 so Vapi doesn't retry-storm
+  }
+});
+
+// Post-call fan-out: booking pipeline, owner notification, customer SMS/WA.
+async function handleVoiceCallOutcome({ ownerEmail, report }) {
+  const s = report.structured || {};
+  const profile = getOwnerProfile(ownerEmail);
+  const businessName = profile?.profile?.businessName || profile?.businessName || 'your business';
+  const customerNumber = report.customerNumber;
+  const callerName = s.callerName || 'Caller';
+
+  // 1. BOOKING — route through the SAME pipeline as a DM booking so conflict
+  //    detection, ICS, reminders, and review-requests all work for free.
+  let bookingResult = null;
+  if (s.intent === 'booking' && s.booking?.datetime) {
+    const ownerBookings = bookings.filter(b => b.ownerEmail === ownerEmail);
+    const conflicts = findBookingConflicts({ newDatetime: s.booking.datetime, durationMin: 60, existing: ownerBookings, bufferMin: 0 });
+    if (conflicts.length === 0) {
+      const bookingRecord = {
+        name: callerName, contact: customerNumber, service: s.booking.service || null,
+        datetime: s.booking.datetime, notes: s.booking.notes || null,
+        channel: 'phone', ownerEmail, ts: new Date().toISOString(), durationMin: 60, source: 'voice',
+      };
+      bookings.push(bookingRecord);
+      save('bookings', bookings);
+      fireWebhookEvent(ownerEmail, 'new_booking', { channel: 'phone', senderName: callerName, booking: bookingRecord });
+      try {
+        await confirmAndShipBooking({
+          ownerEmail, channel: 'phone', channelConfig: null,
+          senderId: customerNumber, senderName: callerName,
+          bookingData: { name: callerName, contact: customerNumber, service: s.booking.service, datetime: s.booking.datetime, notes: s.booking.notes },
+        });
+      } catch (e) { console.warn('[voice] confirmAndShipBooking failed:', e.message); }
+      bookingResult = 'booked';
+    } else {
+      bookingResult = 'conflict';
+    }
+  }
+
+  // 2. CUSTOMER FOLLOW-UP via WhatsApp (if owner has WA connected + we have
+  //    the caller's number). Phone callers love a written confirmation.
+  const waConfig = channelConfigs.get(ownerEmail)?.whatsapp;
+  if (waConfig?.accessToken && customerNumber) {
+    let followText = null;
+    if (bookingResult === 'booked') {
+      followText = `Hi ${callerName}, thanks for calling ${businessName}! Confirming your booking${s.booking?.service ? ' for ' + s.booking.service : ''} on ${s.booking?.datetime}. Reply here if you need to change anything. 👋`;
+    } else if (s.intent === 'quote' && s.quoteRequest) {
+      followText = `Hi ${callerName}, thanks for calling ${businessName}! We'll get a quote together for ${s.quoteRequest} and text it over shortly.`;
+    } else if (bookingResult === 'conflict') {
+      followText = `Hi ${callerName}, thanks for calling ${businessName}! That time's just been taken — reply here with another time that suits and we'll lock it in.`;
+    }
+    if (followText) {
+      try { await sendWhatsAppMessage(waConfig, customerNumber, followText); }
+      catch (e) { console.warn('[voice] customer WA follow-up failed:', e.message); }
+    }
+  }
+
+  // 3. OWNER notification — digest-aware. Calls are informational unless
+  //    the caller needs a callback / left a complaint (then immediate).
+  const urgent = s.intent === 'complaint' || s.followUpNeeded === true;
+  const intentEmoji = { booking: '📅', quote: '💷', enquiry: '💬', complaint: '⚠️', message: '✉️', other: '📞' }[s.intent] || '📞';
+  const html = `<div style="font-family:-apple-system,sans-serif;max-width:560px;margin:0 auto;padding:20px;">
+    <div style="background:#0d0d1f;color:#fff;padding:16px;border-radius:12px;">
+      <h2 style="margin:0 0 4px;color:#00e5a0;">${intentEmoji} Phone call handled by Aria</h2>
+      <p style="margin:0;color:#9898b8;font-size:13px;">${callerName}${customerNumber ? ' · ' + escapeHtml(customerNumber) : ''} · ${report.durationSec || '?'}s</p>
+    </div>
+    <div style="background:#fff;color:#222;padding:18px;border-radius:12px;margin-top:12px;border:1px solid #eee;">
+      <p style="margin:0 0 10px;font-weight:600;">${escapeHtml(s.summary || report.summary || 'Call completed')}</p>
+      ${s.booking?.datetime ? `<p style="margin:0 0 6px;"><b>Booking:</b> ${escapeHtml(s.booking.service || 'appointment')} — ${escapeHtml(s.booking.datetime)} ${bookingResult === 'booked' ? '✅ confirmed' : bookingResult === 'conflict' ? '⚠️ clashed, customer asked to rebook' : ''}</p>` : ''}
+      ${s.quoteRequest ? `<p style="margin:0 0 6px;"><b>Quote wanted:</b> ${escapeHtml(s.quoteRequest)}</p>` : ''}
+      ${s.message ? `<p style="margin:0 0 6px;"><b>Message:</b> ${escapeHtml(s.message)}</p>` : ''}
+      ${s.callbackNumber ? `<p style="margin:0 0 6px;"><b>Callback:</b> ${escapeHtml(s.callbackNumber)}</p>` : ''}
+      ${report.recordingUrl ? `<p style="margin:12px 0 0;"><a href="${report.recordingUrl}" style="color:#00a070;">▶ Listen to recording</a></p>` : ''}
+    </div>
+  </div>`;
+  await notify({
+    ownerEmail, type: 'phone_call',
+    subject: `${intentEmoji} Aria handled a call — ${escapeHtml(s.summary || callerName)}`,
+    html,
+    summary: `${callerName} · ${s.intent || 'call'} · ${s.summary || ''}`.slice(0, 200),
+    urgency: urgent ? 'immediate' : undefined,
+  });
+}
+
+// ─── Voice dashboard endpoints ──────────────────────────────────────────
+app.get('/api/dashboard/phone/settings', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const cfg = voiceConfig.get(owner) || {};
+  res.json({
+    settings: {
+      enabled: !!cfg.enabled,
+      phoneNumber: cfg.phoneNumber || '',
+      voiceId: cfg.voiceId || 'paula',
+      firstMessage: cfg.firstMessage || '',
+    },
+    webhookUrl: `${appBaseUrl(req)}/api/vapi/webhook`,
+  });
+});
+
+app.post('/api/dashboard/phone/settings', express.json({ limit: '8kb' }), (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const { enabled = false, phoneNumber = '', voiceId = 'paula', firstMessage = '' } = req.body || {};
+  voiceConfig.set(owner, {
+    enabled: !!enabled,
+    phoneNumber: String(phoneNumber).trim().slice(0, 24),
+    voiceId: String(voiceId).slice(0, 40),
+    firstMessage: String(firstMessage).slice(0, 300),
+  });
+  persistVoiceConfig();
+  res.json({ ok: true, settings: voiceConfig.get(owner) });
+});
+
+// Recent calls panel — reads the append-only ledger, newest first.
+app.get('/api/dashboard/calls', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const out = [];
+  try {
+    if (existsSync(PHONE_CALLS_LEDGER)) {
+      const lines = readFileSync(PHONE_CALLS_LEDGER, 'utf8').split('\n').filter(Boolean).slice(-500);
+      for (let i = lines.length - 1; i >= 0 && out.length < 40; i--) {
+        try {
+          const e = JSON.parse(lines[i]);
+          if (e.ownerEmail !== owner) continue;
+          out.push({
+            ts: e.ts, intent: e.intent, summary: e.summary,
+            customerNumber: e.customerNumber, durationSec: e.durationSec,
+            recordingUrl: e.recordingUrl,
+            booking: e.structured?.booking || null,
+          });
+        } catch {}
+      }
+    }
+  } catch {}
+  res.json({ calls: out });
 });
 
 // Note: legacy /auth/meta/start + duplicate /auth/meta/callback removed
