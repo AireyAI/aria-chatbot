@@ -10250,6 +10250,52 @@ app.get('/api/admin/usage', (req, res) => {
 // clients never see minutes or cost (same wall as token usage).
 const VOICE_COST_PER_MIN = Number(process.env.VOICE_COST_PER_MIN) || 0.11; // £/min raw (Vapi+Twilio+STT+LLM+TTS)
 const VOICE_NUMBER_RENTAL = Number(process.env.VOICE_NUMBER_RENTAL) || 1.20; // £/mo per number
+// Admin-only — set a client's plan ('lite' | 'receptionist'). This is how
+// Kyle grants/revokes the voice receptionist when a client pays (manual
+// until Stripe is wired; Stripe will later POST the same change).
+app.post('/api/admin/set-plan', express.json({ limit: '2kb' }), (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  const { ownerEmail, plan } = req.body || {};
+  if (!ownerEmail) return res.status(400).json({ error: 'ownerEmail required' });
+  if (![PLANS.LITE, PLANS.RECEPTIONIST].includes(plan)) {
+    return res.status(400).json({ error: `plan must be '${PLANS.LITE}' or '${PLANS.RECEPTIONIST}'` });
+  }
+  // Find/create the profile entry and set plan.
+  let key = null, entry = null;
+  for (const [k, v] of clientProfiles) {
+    if (v?.profile?.email === ownerEmail) { key = k; entry = v; break; }
+  }
+  if (!entry) { entry = { profile: { email: ownerEmail }, scannedAt: new Date().toISOString() }; clientProfiles.set(ownerEmail, entry); }
+  entry.profile.plan = plan;
+  clientProfiles.set(key || ownerEmail, entry);
+  persistProfiles();
+  // If downgrading to lite while they hold a number, disable voice so it
+  // stops answering (we leave the number provisioned; release is separate).
+  if (plan === PLANS.LITE) {
+    const vc = voiceConfig.get(ownerEmail);
+    if (vc?.enabled) { voiceConfig.set(ownerEmail, { ...vc, enabled: false }); persistVoiceConfig(); }
+  }
+  console.log(`💳 [plan] ${ownerEmail} → ${plan}`);
+  res.json({ ok: true, ownerEmail, plan });
+});
+
+// Admin-only — list every owner's current plan (quick estate view).
+app.get('/api/admin/plans', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  const owners = new Set([
+    ...Array.from(EMAIL_AUTO_REPLY_ENABLED.keys()),
+    ...Array.from(channelConfigs.keys()),
+  ]);
+  for (const [, v] of clientProfiles) { if (v?.profile?.email) owners.add(v.profile.email); }
+  const rows = Array.from(owners).map(o => ({
+    ownerEmail: o,
+    plan: getOwnerPlan(o),
+    hasNumber: !!voiceConfig.get(o)?.vapiNumberId,
+  }));
+  rows.sort((a, b) => (a.plan === b.plan ? 0 : a.plan === PLANS.RECEPTIONIST ? -1 : 1));
+  res.json({ rows });
+});
+
 app.get('/api/admin/voice-usage', (req, res) => {
   if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
   const now = new Date();
@@ -13458,6 +13504,20 @@ async function loadPhoneSettings() {
   try {
     const d = await api('/api/dashboard/phone/settings');
     const s = d.settings || {};
+
+    // PLAN GATE — Lite owners see an upsell, not the controls. Drives the
+    // upgrade without exposing any voice surface they aren't paying for.
+    if (!d.planAllowed) {
+      el.innerHTML =
+        '<div style="background:linear-gradient(135deg,rgba(157,150,255,0.1),rgba(0,229,160,0.08));border:1px solid rgba(157,150,255,0.3);border-radius:12px;padding:20px;text-align:center;">' +
+          '<div style="font-size:28px;margin-bottom:8px;">📞</div>' +
+          '<div style="font-size:15px;color:#fff;font-weight:700;margin-bottom:6px;">Add a phone receptionist</div>' +
+          '<p style="font-size:12.5px;color:#9898b8;margin:0 auto 14px;max-width:380px;line-height:1.6;">Upgrade to the <b style="color:#9d96ff;">Receptionist</b> plan and Aria answers your phone 24/7 — booking appointments, taking quote requests, and texting callers a follow-up. Everything your inbox Aria does, now by voice.</p>' +
+          '<div style="font-size:11.5px;color:#6b6b8a;">You\\'re on the <b>Lite</b> plan (Instagram + Facebook DMs + email). Contact us to upgrade.</div>' +
+        '</div>';
+      return;
+    }
+
     const calls = (await api('/api/dashboard/calls')).calls || [];
 
     const intentEmoji = { booking: '📅', quote: '💷', enquiry: '💬', complaint: '⚠️', message: '✉️', other: '📞' };
@@ -14442,6 +14502,25 @@ function getOwnerProfile(ownerEmail) {
   }
   if (dashProfile) return { profile: dashProfile, ...dashProfile };
   return null;
+}
+
+// ─── Plan tiers ──────────────────────────────────────────────────────────
+// Two plans (no billing system yet — Kyle assigns manually when a client
+// pays; Stripe later just sets the same field):
+//   'lite'         — IG/FB DM replies + email auto-reply (the base product)
+//   'receptionist' — everything in lite PLUS the voice phone receptionist
+//
+// Stored on profile.plan. Anything unset/unknown defaults to 'lite' so a
+// brand-new account can't accidentally get the expensive feature for free.
+const PLANS = { LITE: 'lite', RECEPTIONIST: 'receptionist' };
+function getOwnerPlan(ownerEmail) {
+  const p = getOwnerProfile(ownerEmail)?.profile?.plan;
+  return p === PLANS.RECEPTIONIST ? PLANS.RECEPTIONIST : PLANS.LITE;
+}
+// Single source of truth for "can this owner use voice?" — gate every
+// voice surface (dashboard, provisioning, webhook) through this.
+function canUseVoice(ownerEmail) {
+  return getOwnerPlan(ownerEmail) === PLANS.RECEPTIONIST;
 }
 
 async function processMetaWebhook(payload) {
@@ -16214,6 +16293,13 @@ app.post('/api/vapi/webhook', async (req, res) => {
         // No tenant for this number (or disabled) — let Vapi play a default.
         return res.json({ error: 'This number is not currently configured for voice answering.' });
       }
+      // PLAN GATE (backstop) — even if a number is somehow configured for a
+      // Lite owner, refuse to answer. Stops voice minutes billing on an
+      // account that isn't paying for the receptionist tier.
+      if (!canUseVoice(ownerEmail)) {
+        console.warn(`📞 [voice] assistant-request refused — ${ownerEmail} not on receptionist plan`);
+        return res.json({ error: 'Voice answering is not enabled on this plan.' });
+      }
       const profile = getOwnerProfile(ownerEmail)?.profile || {};
       const knowledge = knowledgeDocs.get(ownerEmail) || [];
       const cfg = voiceConfig.get(ownerEmail) || {};
@@ -16377,7 +16463,10 @@ app.get('/api/dashboard/phone/settings', (req, res) => {
   const owner = requireDashboardAuth(req, res);
   if (!owner) return;
   const cfg = voiceConfig.get(owner) || {};
+  const allowed = canUseVoice(owner);
   res.json({
+    planAllowed: allowed,           // false → dashboard shows upsell, hides controls
+    plan: getOwnerPlan(owner),
     settings: {
       enabled: !!cfg.enabled,
       phoneNumber: cfg.phoneNumber || '',
@@ -16385,7 +16474,7 @@ app.get('/api/dashboard/phone/settings', (req, res) => {
       firstMessage: cfg.firstMessage || '',
       provisioned: !!cfg.vapiNumberId, // true = we bought it (vs BYO paste)
     },
-    canProvision: !!process.env.VAPI_API_KEY, // one-click available?
+    canProvision: allowed && !!process.env.VAPI_API_KEY, // one-click available?
     webhookUrl: `${appBaseUrl(req)}/api/vapi/webhook`,
   });
 });
@@ -16393,6 +16482,7 @@ app.get('/api/dashboard/phone/settings', (req, res) => {
 app.post('/api/dashboard/phone/settings', express.json({ limit: '8kb' }), (req, res) => {
   const owner = requireDashboardAuth(req, res);
   if (!owner) return;
+  if (!canUseVoice(owner)) return res.status(403).json({ error: 'Voice receptionist requires the Receptionist plan.' });
   // Merge, don't replace — a provisioned number stores vapiNumberId +
   // phoneNumber that the settings form doesn't send back. Overwriting the
   // whole object on a greeting-only save would orphan the number (still
@@ -16422,6 +16512,7 @@ app.post('/api/dashboard/phone/settings', express.json({ limit: '8kb' }), (req, 
 app.post('/api/dashboard/phone/provision', express.json({ limit: '4kb' }), async (req, res) => {
   const owner = requireDashboardAuth(req, res);
   if (!owner) return;
+  if (!canUseVoice(owner)) return res.status(403).json({ error: 'Voice receptionist requires the Receptionist plan. Upgrade to add a phone number.' });
   const apiKey = process.env.VAPI_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Phone provisioning is not enabled yet — contact support.' });
 
