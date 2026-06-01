@@ -13651,11 +13651,56 @@ async function loadPhoneSettings() {
           '<label style="font-size:11px;">Greeting (first thing callers hear)</label>' +
           '<input id="ph-greeting" value="' + escH(s.firstMessage || '') + '" placeholder="Hi, you\\'ve reached [business], this is Aria. How can I help?">' +
         '</div>' +
+        phoneScheduleBlock(s) +
         '<button class="btn-save" onclick="savePhoneSettings()">Save</button>' +
       '</div>' +
       '<h5 style="font-size:11px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin:18px 0 8px;">Recent calls</h5>' +
       callRows;
   } catch (e) { el.innerHTML = '<div class="empty">Failed to load phone settings.</div>'; }
+}
+
+// Renders the "when should Aria answer?" controls. Mode selector + (when
+// not 24/7) a per-day hours grid, timezone, and a fallback number that
+// calls transfer to when Aria is off-schedule.
+function phoneScheduleBlock(s) {
+  const mode = s.answerMode || 'always';
+  const hrs = s.businessHours || { mon:'9-17', tue:'9-17', wed:'9-17', thu:'9-17', fri:'9-17', sat:'closed', sun:'closed' };
+  const tz = s.timezone || 'Europe/London';
+  const days = [['mon','Mon'],['tue','Tue'],['wed','Wed'],['thu','Thu'],['fri','Fri'],['sat','Sat'],['sun','Sun']];
+  const detailHidden = mode === 'always';
+  const dayRows = days.map(function(d){
+    return '<div style="display:flex;align-items:center;gap:8px;">' +
+      '<span style="min-width:34px;font-size:11px;color:#aaa;text-transform:uppercase;font-weight:600;">' + d[1] + '</span>' +
+      '<input id="ph-hrs-' + d[0] + '" value="' + escH(hrs[d[0]] || 'closed') + '" placeholder="closed" style="flex:1;font-size:12px;font-family:monospace;">' +
+    '</div>';
+  }).join('');
+  return '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:14px;margin-bottom:10px;">' +
+    '<label style="font-size:11px;display:block;margin-bottom:6px;">When should Aria answer?</label>' +
+    '<select id="ph-mode" onchange="togglePhoneSchedule()" style="width:100%;font-size:13px;margin-bottom:10px;">' +
+      '<option value="always" ' + (mode==='always'?'selected':'') + '>Always — 24/7</option>' +
+      '<option value="out_of_hours" ' + (mode==='out_of_hours'?'selected':'') + '>Out of hours only (after you close)</option>' +
+      '<option value="business_hours" ' + (mode==='business_hours'?'selected':'') + '>Business hours only (overflow while you\\'re busy)</option>' +
+    '</select>' +
+    '<div id="ph-schedule-detail" style="display:' + (detailHidden?'none':'block') + ';">' +
+      '<p style="font-size:10.5px;color:#8888aa;margin:0 0 8px;line-height:1.5;">Set your opening hours below. Format: <b>9-17</b> or <b>9:30-17:30</b> · <b>closed</b> · <b>24h</b>.</p>' +
+      '<div style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px;">' + dayRows + '</div>' +
+      '<div class="form-group" style="margin-bottom:10px;">' +
+        '<label style="font-size:11px;">Timezone</label>' +
+        '<input id="ph-tz" value="' + escH(tz) + '" placeholder="Europe/London" style="font-family:monospace;font-size:12.5px;">' +
+      '</div>' +
+      '<div class="form-group" style="margin-bottom:0;">' +
+        '<label style="font-size:11px;">Transfer calls to (when Aria isn\\'t answering)</label>' +
+        '<input id="ph-fallback" value="' + escH(s.fallbackNumber || '') + '" placeholder="+44 7700 900123 — your mobile / shop line" style="font-family:monospace;font-size:12.5px;">' +
+        '<p style="font-size:10.5px;color:#6b6b8a;margin-top:4px;line-height:1.5;">When Aria is off-schedule, callers ring through to this number. Leave blank to just let them try again later.</p>' +
+      '</div>' +
+    '</div>' +
+  '</div>';
+}
+
+function togglePhoneSchedule() {
+  const mode = document.getElementById('ph-mode').value;
+  const detail = document.getElementById('ph-schedule-detail');
+  if (detail) detail.style.display = (mode === 'always') ? 'none' : 'block';
 }
 
 async function provisionPhoneNumber(btn) {
@@ -13697,6 +13742,21 @@ async function savePhoneSettings() {
     firstMessage: document.getElementById('ph-greeting').value.trim(),
   };
   if (numEl) body.phoneNumber = numEl.value.trim();
+  // Schedule fields (present whenever the panel is unlocked)
+  const modeEl = document.getElementById('ph-mode');
+  if (modeEl) {
+    body.answerMode = modeEl.value;
+    const tzEl = document.getElementById('ph-tz');
+    const fbEl = document.getElementById('ph-fallback');
+    if (tzEl) body.timezone = tzEl.value.trim();
+    if (fbEl) body.fallbackNumber = fbEl.value.trim();
+    const bh = {};
+    ['mon','tue','wed','thu','fri','sat','sun'].forEach(function(dk){
+      const inp = document.getElementById('ph-hrs-' + dk);
+      if (inp) bh[dk] = inp.value.trim() || 'closed';
+    });
+    if (Object.keys(bh).length) body.businessHours = bh;
+  }
   try {
     const r = await apiPost('/api/dashboard/phone/settings', body);
     if (r.ok) { toast(body.enabled ? '✓ Voice answering live' : '✓ Saved'); loadPhoneSettings(); }
@@ -14610,6 +14670,26 @@ function getOwnerPlan(ownerEmail) {
 // voice surface (dashboard, provisioning, webhook) through this.
 function canUseVoice(ownerEmail) {
   return getOwnerPlan(ownerEmail) === PLANS.RECEPTIONIST;
+}
+
+// Decide whether Aria should ANSWER a call right now given the owner's
+// voice schedule. Reuses evaluateSchedule() (the same engine the DM
+// channel office-hours uses) so we don't keep two time-window codepaths.
+//   answerMode:
+//     'always'         → 24/7 (default)
+//     'business_hours' → only DURING the configured open hours (overflow)
+//     'out_of_hours'   → only OUTSIDE open hours (after staff go home)
+// Returns true if Aria should pick up; false → caller transfers/declines.
+function voiceShouldAnswer(cfg, now = new Date()) {
+  const mode = cfg?.answerMode || 'always';
+  if (mode === 'always') return true;
+  const sched = {
+    mode: 'business_hours',
+    businessHours: cfg.businessHours || { mon: '9-17', tue: '9-17', wed: '9-17', thu: '9-17', fri: '9-17', sat: 'closed', sun: 'closed' },
+    timezone: cfg.timezone || 'Europe/London',
+  };
+  const { inHours } = evaluateSchedule(sched, now);
+  return mode === 'out_of_hours' ? !inHours : inHours;
 }
 
 async function processMetaWebhook(payload) {
@@ -16389,6 +16469,22 @@ app.post('/api/vapi/webhook', async (req, res) => {
         console.warn(`📞 [voice] assistant-request refused — ${ownerEmail} not on receptionist plan`);
         return res.json({ error: 'Voice answering is not enabled on this plan.' });
       }
+      // SCHEDULE GATE — owner may set Aria to answer only out-of-hours, only
+      // during business hours, or 24/7. When she's off-schedule, transfer the
+      // call to the owner's fallback number (so a human can pick up); if no
+      // fallback is set, decline so Vapi plays its default + the caller can
+      // try later / leave voicemail via their carrier.
+      {
+        const sc = voiceConfig.get(ownerEmail) || {};
+        if (!voiceShouldAnswer(sc)) {
+          if (sc.fallbackNumber) {
+            console.log(`📞 [voice] off-schedule for ${ownerEmail} → transfer to ${sc.fallbackNumber}`);
+            return res.json({ destination: { type: 'number', number: normalisePhone(sc.fallbackNumber) } });
+          }
+          console.log(`📞 [voice] off-schedule for ${ownerEmail}, no fallback → declining`);
+          return res.json({ error: 'Outside answering hours.' });
+        }
+      }
       const profile = getOwnerProfile(ownerEmail)?.profile || {};
       const knowledge = knowledgeDocs.get(ownerEmail) || [];
       const cfg = voiceConfig.get(ownerEmail) || {};
@@ -16562,6 +16658,10 @@ app.get('/api/dashboard/phone/settings', (req, res) => {
       voiceId: cfg.voiceId || 'paula',
       firstMessage: cfg.firstMessage || '',
       provisioned: !!cfg.vapiNumberId, // true = we bought it (vs BYO paste)
+      answerMode: cfg.answerMode || 'always', // always | business_hours | out_of_hours
+      businessHours: cfg.businessHours || { mon: '9-17', tue: '9-17', wed: '9-17', thu: '9-17', fri: '9-17', sat: 'closed', sun: 'closed' },
+      timezone: cfg.timezone || 'Europe/London',
+      fallbackNumber: cfg.fallbackNumber || '',
     },
     canProvision: allowed && !!process.env.VAPI_API_KEY, // one-click available?
     webhookUrl: `${appBaseUrl(req)}/api/vapi/webhook`,
@@ -16577,7 +16677,7 @@ app.post('/api/dashboard/phone/settings', express.json({ limit: '8kb' }), (req, 
   // whole object on a greeting-only save would orphan the number (still
   // billing on Vapi, but unreachable from our index).
   const existing = voiceConfig.get(owner) || {};
-  const { enabled, phoneNumber, voiceId, firstMessage } = req.body || {};
+  const { enabled, phoneNumber, voiceId, firstMessage, answerMode, businessHours, timezone, fallbackNumber } = req.body || {};
   const merged = { ...existing };
   if (enabled !== undefined)      merged.enabled = !!enabled;
   // Only let the form set phoneNumber when this ISN'T a provisioned number
@@ -16585,6 +16685,18 @@ app.post('/api/dashboard/phone/settings', express.json({ limit: '8kb' }), (req, 
   if (phoneNumber !== undefined && !existing.vapiNumberId) merged.phoneNumber = String(phoneNumber).trim().slice(0, 24);
   if (voiceId !== undefined)      merged.voiceId = String(voiceId).slice(0, 40);
   if (firstMessage !== undefined) merged.firstMessage = String(firstMessage).slice(0, 300);
+  // Schedule fields
+  if (answerMode !== undefined)   merged.answerMode = ['always', 'business_hours', 'out_of_hours'].includes(answerMode) ? answerMode : 'always';
+  if (timezone !== undefined)     merged.timezone = String(timezone).slice(0, 60) || 'Europe/London';
+  if (fallbackNumber !== undefined) merged.fallbackNumber = String(fallbackNumber).trim().slice(0, 24);
+  if (businessHours !== undefined && businessHours && typeof businessHours === 'object') {
+    // Whitelist the 7 day keys; each value a short range string.
+    const clean = {};
+    for (const k of ['mon','tue','wed','thu','fri','sat','sun']) {
+      if (businessHours[k] !== undefined) clean[k] = String(businessHours[k]).slice(0, 16);
+    }
+    merged.businessHours = { ...(existing.businessHours || {}), ...clean };
+  }
   voiceConfig.set(owner, merged);
   persistVoiceConfig();
   res.json({ ok: true, settings: merged });
