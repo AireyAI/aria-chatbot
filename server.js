@@ -57,7 +57,7 @@ import { extractImageRefs, resolveImageRefsToBlocks } from './lib/image_intake.j
 import { extractAudioRefs, transcribeAudioRef } from './lib/audio_intake.js';
 import { findBookingConflicts, describeConflictsForCustomer } from './lib/booking_conflicts.js';
 import { canBatch as digestCanBatch, shouldFireDigest, renderDigestHtml } from './lib/digest.js';
-import { verifyVapiSignature, buildAssistantConfig, extractCallReport, extractToolCall } from './lib/vapi_handler.js';
+import { verifyVapiSignature, buildAssistantConfig, extractCallReport, extractToolCall, provisionVapiNumber, releaseVapiNumber } from './lib/vapi_handler.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
@@ -13412,24 +13412,49 @@ async function loadPhoneSettings() {
       '</div>'
     ).join('') : '<div class="empty" style="padding:10px 0;font-size:11.5px;">No calls yet. Once your Vapi number is live, calls appear here.</div>';
 
+    // Number block: three states —
+    //  (1) has a number we provisioned → show it + forwarding tip + release
+    //  (2) no number, one-click available → "Get my Aria number" button
+    //  (3) no number, no provisioning → BYO paste fallback (+ webhook URL)
+    let numberBlock;
+    if (s.phoneNumber && s.provisioned) {
+      numberBlock =
+        '<div style="background:rgba(0,229,160,0.06);border:1px solid rgba(0,229,160,0.25);border-radius:8px;padding:12px 14px;margin-bottom:10px;">' +
+          '<div style="font-size:10.5px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Your Aria number</div>' +
+          '<div style="font-size:18px;color:#00e5a0;font-weight:700;font-family:monospace;">' + escH(s.phoneNumber) + '</div>' +
+          '<p style="font-size:11px;color:#9898b8;margin:8px 0 0;line-height:1.5;">📣 Put this on your website + Google listing, OR keep your current number and set it to <b>forward calls</b> to this one (your phone provider can do this — we\\'ll guide you).</p>' +
+          '<button onclick="releasePhoneNumber()" style="margin-top:10px;background:rgba(255,80,80,0.1);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);border-radius:6px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;">Release number</button>' +
+        '</div>';
+    } else if (d.canProvision) {
+      numberBlock =
+        '<div style="background:rgba(157,150,255,0.06);border:1px solid rgba(157,150,255,0.25);border-radius:8px;padding:14px;margin-bottom:10px;text-align:center;">' +
+          '<div style="font-size:13px;color:#fff;font-weight:600;margin-bottom:4px;">📲 Get your Aria phone number</div>' +
+          '<p style="font-size:11.5px;color:#9898b8;margin:0 0 12px;line-height:1.5;">One click and Aria gets a real phone number, ready to answer. Use it directly or forward your existing line to it.</p>' +
+          '<button onclick="provisionPhoneNumber(this)" class="btn-save" style="width:auto;padding:10px 20px;">Get my number →</button>' +
+        '</div>';
+    } else {
+      numberBlock =
+        '<div class="form-group" style="margin-bottom:10px;">' +
+          '<label style="font-size:11px;">Your Vapi phone number</label>' +
+          '<input id="ph-number" value="' + escH(s.phoneNumber || '') + '" placeholder="+44 7700 900123" style="font-family:monospace;font-size:13px;">' +
+        '</div>' +
+        '<div style="background:rgba(255,255,255,0.03);border-radius:8px;padding:10px 12px;margin-bottom:10px;">' +
+          '<div style="font-size:10.5px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Webhook URL — paste into your Vapi number\\'s Server settings</div>' +
+          '<code style="font-size:11px;color:#00e5a0;word-break:break-all;">' + escH(d.webhookUrl || '') + '</code>' +
+        '</div>';
+    }
+
     el.innerHTML =
       '<div style="background:rgba(0,229,160,0.04);border:1px solid rgba(0,229,160,0.2);border-radius:10px;padding:14px;">' +
         '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
           '<div style="font-size:12px;color:#fff;font-weight:600;">Voice answering ' + (s.enabled && s.phoneNumber ? '<span style="color:#00e5a0;font-size:11px;">● Live</span>' : '<span style="color:#6b6b8a;font-size:11px;">● Off</span>') + '</div>' +
           '<label class="toggle"><input type="checkbox" id="ph-enabled" ' + (s.enabled ? 'checked' : '') + '><span class="slider"></span></label>' +
         '</div>' +
-        '<p style="font-size:11.5px;color:#9898b8;margin:0 0 12px;line-height:1.5;">Aria answers calls 24/7, books appointments (with conflict-checking), takes quote requests, and texts callers a follow-up. Set up your Vapi number below.</p>' +
-        '<div class="form-group" style="margin-bottom:10px;">' +
-          '<label style="font-size:11px;">Your Vapi phone number</label>' +
-          '<input id="ph-number" value="' + escH(s.phoneNumber || '') + '" placeholder="+44 7700 900123" style="font-family:monospace;font-size:13px;">' +
-        '</div>' +
+        '<p style="font-size:11.5px;color:#9898b8;margin:0 0 12px;line-height:1.5;">Aria answers calls 24/7, books appointments (with conflict-checking), takes quote requests, and texts callers a follow-up.</p>' +
+        numberBlock +
         '<div class="form-group" style="margin-bottom:10px;">' +
           '<label style="font-size:11px;">Greeting (first thing callers hear)</label>' +
           '<input id="ph-greeting" value="' + escH(s.firstMessage || '') + '" placeholder="Hi, you\\'ve reached [business], this is Aria. How can I help?">' +
-        '</div>' +
-        '<div style="background:rgba(255,255,255,0.03);border-radius:8px;padding:10px 12px;margin-bottom:10px;">' +
-          '<div style="font-size:10.5px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Vapi webhook URL — paste into your Vapi number\\'s Server settings</div>' +
-          '<code style="font-size:11px;color:#00e5a0;word-break:break-all;">' + escH(d.webhookUrl || '') + '</code>' +
         '</div>' +
         '<button class="btn-save" onclick="savePhoneSettings()">Save</button>' +
       '</div>' +
@@ -13438,15 +13463,36 @@ async function loadPhoneSettings() {
   } catch (e) { el.innerHTML = '<div class="empty">Failed to load phone settings.</div>'; }
 }
 
+async function provisionPhoneNumber(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Getting your number…'; }
+  try {
+    const r = await apiPost('/api/dashboard/phone/provision', {});
+    if (r.ok) { toast('✓ Your Aria number: ' + r.number); loadPhoneSettings(); }
+    else { toast(r.error || 'Could not get a number'); if (btn) { btn.disabled = false; btn.textContent = 'Get my number →'; } }
+  } catch (e) { toast('Provisioning failed'); if (btn) { btn.disabled = false; btn.textContent = 'Get my number →'; } }
+}
+
+async function releasePhoneNumber() {
+  if (!confirm('Release this number? Aria will stop answering calls to it and the number is gone for good.')) return;
+  try {
+    const r = await apiPost('/api/dashboard/phone/release', {});
+    if (r.ok) { toast('Number released'); loadPhoneSettings(); }
+    else toast(r.error || 'Release failed');
+  } catch (e) { toast('Release failed'); }
+}
+
 async function savePhoneSettings() {
+  // ph-number only exists in the BYO-paste state; provisioned numbers have
+  // no input field, so guard the read.
+  const numEl = document.getElementById('ph-number');
   const body = {
     enabled: document.getElementById('ph-enabled').checked,
-    phoneNumber: document.getElementById('ph-number').value.trim(),
     firstMessage: document.getElementById('ph-greeting').value.trim(),
   };
+  if (numEl) body.phoneNumber = numEl.value.trim();
   try {
     const r = await apiPost('/api/dashboard/phone/settings', body);
-    if (r.ok) { toast(body.enabled && body.phoneNumber ? '✓ Voice answering live' : '✓ Saved'); loadPhoneSettings(); }
+    if (r.ok) { toast(body.enabled ? '✓ Voice answering live' : '✓ Saved'); loadPhoneSettings(); }
     else toast(r.error || 'Save failed');
   } catch (e) { toast('Save failed'); }
 }
@@ -16275,7 +16321,9 @@ app.get('/api/dashboard/phone/settings', (req, res) => {
       phoneNumber: cfg.phoneNumber || '',
       voiceId: cfg.voiceId || 'paula',
       firstMessage: cfg.firstMessage || '',
+      provisioned: !!cfg.vapiNumberId, // true = we bought it (vs BYO paste)
     },
+    canProvision: !!process.env.VAPI_API_KEY, // one-click available?
     webhookUrl: `${appBaseUrl(req)}/api/vapi/webhook`,
   });
 });
@@ -16283,15 +16331,82 @@ app.get('/api/dashboard/phone/settings', (req, res) => {
 app.post('/api/dashboard/phone/settings', express.json({ limit: '8kb' }), (req, res) => {
   const owner = requireDashboardAuth(req, res);
   if (!owner) return;
-  const { enabled = false, phoneNumber = '', voiceId = 'paula', firstMessage = '' } = req.body || {};
-  voiceConfig.set(owner, {
-    enabled: !!enabled,
-    phoneNumber: String(phoneNumber).trim().slice(0, 24),
-    voiceId: String(voiceId).slice(0, 40),
-    firstMessage: String(firstMessage).slice(0, 300),
-  });
+  // Merge, don't replace — a provisioned number stores vapiNumberId +
+  // phoneNumber that the settings form doesn't send back. Overwriting the
+  // whole object on a greeting-only save would orphan the number (still
+  // billing on Vapi, but unreachable from our index).
+  const existing = voiceConfig.get(owner) || {};
+  const { enabled, phoneNumber, voiceId, firstMessage } = req.body || {};
+  const merged = { ...existing };
+  if (enabled !== undefined)      merged.enabled = !!enabled;
+  // Only let the form set phoneNumber when this ISN'T a provisioned number
+  // (provisioned numbers are managed by provision/release, not the form).
+  if (phoneNumber !== undefined && !existing.vapiNumberId) merged.phoneNumber = String(phoneNumber).trim().slice(0, 24);
+  if (voiceId !== undefined)      merged.voiceId = String(voiceId).slice(0, 40);
+  if (firstMessage !== undefined) merged.firstMessage = String(firstMessage).slice(0, 300);
+  voiceConfig.set(owner, merged);
   persistVoiceConfig();
-  res.json({ ok: true, settings: voiceConfig.get(owner) });
+  res.json({ ok: true, settings: merged });
+});
+
+// POST /api/dashboard/phone/provision — one-click "Get my Aria number".
+// Buys a Vapi-native number on AireyAI's account, points it at our webhook
+// (no assistantId → per-call assistant-request → multi-tenant), stores it.
+//
+// GUARDS (this spends real money — ~£1.20/mo per number on our Vapi acct):
+//   - one number per owner (refuses if they already have one)
+//   - requires VAPI_API_KEY (else returns a clean "not available yet")
+//   - the client clicking the button IS the two-stage approval (Rule 12)
+app.post('/api/dashboard/phone/provision', express.json({ limit: '4kb' }), async (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const apiKey = process.env.VAPI_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'Phone provisioning is not enabled yet — contact support.' });
+
+  const existing = voiceConfig.get(owner);
+  if (existing?.phoneNumber && existing?.vapiNumberId) {
+    return res.status(409).json({ error: 'You already have a number. Release it first to get a new one.', number: existing.phoneNumber });
+  }
+
+  try {
+    const profile = getOwnerProfile(owner)?.profile || {};
+    const { areaCode } = req.body || {};
+    const { id, number } = await provisionVapiNumber({
+      apiKey,
+      serverUrl: appBaseUrl(req),
+      secret: process.env.VAPI_WEBHOOK_SECRET,
+      name: `Aria — ${profile.businessName || owner}`,
+      areaCode: areaCode || null,
+    });
+    voiceConfig.set(owner, {
+      ...(existing || {}),
+      enabled: true,
+      phoneNumber: number,
+      vapiNumberId: id,
+      voiceId: existing?.voiceId || 'paula',
+      firstMessage: existing?.firstMessage || '',
+      provisionedAt: new Date().toISOString(),
+    });
+    persistVoiceConfig();
+    console.log(`📞 [voice] provisioned ${number} (${id}) for ${owner}`);
+    res.json({ ok: true, number, vapiNumberId: id });
+  } catch (e) {
+    console.error('[voice] provision failed:', e.message);
+    res.status(502).json({ error: 'Could not provision a number right now. ' + e.message });
+  }
+});
+
+// POST /api/dashboard/phone/release — give the number back, stop the charge.
+app.post('/api/dashboard/phone/release', express.json({ limit: '2kb' }), async (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const cfg = voiceConfig.get(owner);
+  if (!cfg?.vapiNumberId) return res.status(404).json({ error: 'No provisioned number to release.' });
+  await releaseVapiNumber({ apiKey: process.env.VAPI_API_KEY, id: cfg.vapiNumberId });
+  voiceConfig.set(owner, { ...cfg, enabled: false, phoneNumber: '', vapiNumberId: null });
+  persistVoiceConfig();
+  console.log(`📞 [voice] released number for ${owner}`);
+  res.json({ ok: true });
 });
 
 // Recent calls panel — reads the append-only ledger, newest first.
