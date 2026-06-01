@@ -8480,6 +8480,69 @@ app.get('/admin/clients', (req, res) => {
 });
 
 // ─── Bulk Embed Generator ────────────────────────────────────────────────────
+// Admin plan manager — flip any client between Lite ↔ Receptionist with a
+// click. The in-page fetches inherit the admin cookie (adminAuth passed to
+// render this page), so no password is embedded in the HTML.
+app.get('/admin/plans', (req, res) => {
+  if (!adminAuth(req)) return res.redirect('/admin');
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Plans — Aria Admin</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;color:#eee;padding:20px;}
+    .container{max-width:680px;margin:0 auto;}
+    .back{color:#00e5a0;font-size:13px;text-decoration:none;display:inline-block;margin-bottom:16px;}
+    h1{font-size:22px;margin-bottom:4px;} .sub{color:#9898b8;font-size:13px;margin-bottom:24px;}
+    .row{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;gap:12px;}
+    .row .email{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;}
+    .badge{font-size:11px;font-weight:600;padding:4px 10px;border-radius:12px;white-space:nowrap;}
+    .badge.lite{background:rgba(255,255,255,0.08);color:#9898b8;}
+    .badge.rec{background:rgba(0,229,160,0.15);color:#00e5a0;}
+    .num{font-size:11px;color:#6b6b8a;white-space:nowrap;}
+    .btn{border:none;border-radius:8px;padding:7px 14px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap;}
+    .btn.up{background:#00e5a0;color:#0d0d1f;}
+    .btn.down{background:rgba(255,80,80,0.12);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);}
+    .btn:hover{opacity:.85;}
+    .empty{color:#6b6b8a;font-size:13px;padding:20px;text-align:center;}
+    #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#161630;border:1px solid rgba(0,229,160,0.3);color:#00e5a0;padding:10px 18px;border-radius:10px;font-size:13px;opacity:0;transition:.3s;pointer-events:none;}
+    #toast.show{opacity:1;}
+  </style>
+  </head><body>
+    <div class="container">
+      <a class="back" href="/admin">← Back to Admin</a>
+      <h1>Client Plans</h1>
+      <p class="sub">Flip any client between Aria Lite and Receptionist. Receptionist unlocks the voice phone receptionist.</p>
+      <div id="list"><div class="empty">Loading…</div></div>
+    </div>
+    <div id="toast"></div>
+    <script>
+      function toast(t){var e=document.getElementById('toast');e.textContent=t;e.classList.add('show');setTimeout(function(){e.classList.remove('show');},2200);}
+      function esc(s){return String(s||'').replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+      async function load(){
+        const r = await fetch('/api/admin/plans').then(x=>x.json());
+        const rows = r.rows||[];
+        const el = document.getElementById('list');
+        if(!rows.length){el.innerHTML='<div class="empty">No clients yet.</div>';return;}
+        el.innerHTML = rows.map(function(o){
+          const isRec = o.plan==='receptionist';
+          return '<div class="row">'+
+            '<span class="email">'+esc(o.ownerEmail)+'</span>'+
+            (o.hasNumber?'<span class="num">📞 number</span>':'')+
+            '<span class="badge '+(isRec?'rec':'lite')+'">'+(isRec?'Receptionist':'Lite')+'</span>'+
+            '<button class="btn '+(isRec?'down':'up')+'" onclick="setPlan(\\''+esc(o.ownerEmail)+'\\',\\''+(isRec?'lite':'receptionist')+'\\')">'+(isRec?'Downgrade to Lite':'Upgrade to Receptionist')+'</button>'+
+          '</div>';
+        }).join('');
+      }
+      async function setPlan(email, plan){
+        const r = await fetch('/api/admin/set-plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ownerEmail:email,plan:plan})}).then(x=>x.json());
+        if(r.ok){toast('✓ '+email+' → '+plan);load();}
+        else toast(r.error||'Failed');
+      }
+      load();
+    </script>
+  </body></html>`);
+});
+
 app.get('/admin/embed', (req, res) => {
   if (!adminAuth(req)) return res.redirect('/admin');
   const serverUrl = process.env.GOOGLE_REDIRECT_URI?.replace('/auth/gmail/callback', '') || `http://localhost:${process.env.PORT || 3000}`;
