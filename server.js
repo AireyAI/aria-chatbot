@@ -13609,9 +13609,23 @@ async function loadPhoneSettings() {
     } else if (d.canProvision) {
       numberBlock =
         '<div style="background:rgba(157,150,255,0.06);border:1px solid rgba(157,150,255,0.25);border-radius:8px;padding:14px;margin-bottom:10px;text-align:center;">' +
-          '<div style="font-size:13px;color:#fff;font-weight:600;margin-bottom:4px;">📲 Get your Aria phone number</div>' +
-          '<p style="font-size:11.5px;color:#9898b8;margin:0 0 12px;line-height:1.5;">One click and Aria gets a real phone number, ready to answer. Use it directly or forward your existing line to it.</p>' +
+          '<div style="font-size:13px;color:#fff;font-weight:600;margin-bottom:4px;">📲 Get a new Aria phone number</div>' +
+          '<p style="font-size:11.5px;color:#9898b8;margin:0 0 12px;line-height:1.5;">One click and Aria gets a brand-new number, ready to answer. Use it directly or forward your existing line to it.</p>' +
           '<button onclick="provisionPhoneNumber(this)" class="btn-save" style="width:auto;padding:10px 20px;">Get my number →</button>' +
+        '</div>' +
+        // OR — connect a number the client already has
+        '<div style="display:flex;align-items:center;gap:10px;margin:12px 0;"><div style="flex:1;height:1px;background:rgba(255,255,255,0.08);"></div><span style="font-size:11px;color:#6b6b8a;">OR</span><div style="flex:1;height:1px;background:rgba(255,255,255,0.08);"></div></div>' +
+        '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:14px;margin-bottom:10px;">' +
+          '<div style="font-size:13px;color:#fff;font-weight:600;margin-bottom:4px;">📞 Use a number you already have</div>' +
+          '<p style="font-size:11px;color:#9898b8;margin:0 0 10px;line-height:1.5;">Enter your existing business number. To make Aria answer it, you\\'ll either point that number\\'s call-routing at Aria, or forward its calls to an Aria number — we\\'ll guide you after you save.</p>' +
+          '<div style="display:flex;gap:8px;">' +
+            '<input id="ph-own-number" value="' + escH(s.phoneNumber || '') + '" placeholder="+44 7700 900123" style="flex:1;font-family:monospace;font-size:13px;">' +
+            '<button onclick="connectOwnNumber()" style="background:rgba(157,150,255,0.15);color:#9d96ff;border:1px solid rgba(157,150,255,0.3);border-radius:8px;padding:8px 16px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap;">Connect</button>' +
+          '</div>' +
+          '<div style="background:rgba(0,0,0,0.15);border-radius:6px;padding:8px 10px;margin-top:10px;">' +
+            '<div style="font-size:10px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:3px;">Webhook URL (for your number\\'s call provider)</div>' +
+            '<code style="font-size:10.5px;color:#00e5a0;word-break:break-all;">' + escH(d.webhookUrl || '') + '</code>' +
+          '</div>' +
         '</div>';
     } else {
       numberBlock =
@@ -13651,6 +13665,18 @@ async function provisionPhoneNumber(btn) {
     if (r.ok) { toast('✓ Your Aria number: ' + r.number); loadPhoneSettings(); }
     else { toast(r.error || 'Could not get a number'); if (btn) { btn.disabled = false; btn.textContent = 'Get my number →'; } }
   } catch (e) { toast('Provisioning failed'); if (btn) { btn.disabled = false; btn.textContent = 'Get my number →'; } }
+}
+
+async function connectOwnNumber() {
+  const el = document.getElementById('ph-own-number');
+  const num = (el && el.value || '').trim();
+  if (!num) { toast('Enter your number first'); return; }
+  if (!/^[+0-9 ()-]{7,}$/.test(num)) { toast('That doesn\\'t look like a phone number'); return; }
+  try {
+    const r = await apiPost('/api/dashboard/phone/settings', { phoneNumber: num, enabled: true });
+    if (r.ok) { toast('✓ Number connected — see the setup note to route calls to Aria'); loadPhoneSettings(); }
+    else toast(r.error || 'Could not connect number');
+  } catch (e) { toast('Connect failed'); }
 }
 
 async function releasePhoneNumber() {
