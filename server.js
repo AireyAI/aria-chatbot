@@ -2371,8 +2371,11 @@ function save(name, data, delay = 500) {
   // Notification digest buffer (informational alerts batched into daily email)
   loadDigestState();
 
-  // Voice receptionist — number→owner map + per-owner voice config
-  loadVoiceConfig();
+  // NOTE: loadVoiceConfig() is called at its own declaration site lower in
+  // the file — its state consts (VOICE_CONFIG_FILE, voiceNumberIndex) are
+  // declared there, so calling it here would hit a temporal-dead-zone
+  // ReferenceError and crash boot. (Same TDZ class as the CHANNEL_LEADS_FILE
+  // fix earlier this session.)
 
   console.log(`📂 Loaded: ${savedFaqs.length} FAQs, ${savedBookings.length} bookings, ${savedProducts.length} products, ${savedDsOrders.length} dropship orders, ${usage.messages} msgs this month`);
 })();
@@ -15067,6 +15070,10 @@ function appendPhoneCallLedger(entry) {
     appendFileSync(PHONE_CALLS_LEDGER, JSON.stringify(entry) + '\n');
   } catch (e) { console.warn('[voice] call ledger append failed:', e.message); }
 }
+// Load voice config NOW — after its state consts are initialized. Module
+// top-level runs once at boot, same effect as loading in the startup IIFE
+// but without the TDZ crash that calling it earlier caused.
+loadVoiceConfig();
 
 // GET /api/dashboard/knowledge — list owner's docs
 app.get('/api/dashboard/knowledge', (req, res) => {
