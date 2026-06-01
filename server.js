@@ -10240,6 +10240,61 @@ app.get('/api/admin/usage', (req, res) => {
   res.json({ rows, totalUsedToday: rows.reduce((s, r) => s + r.usedToday, 0) });
 });
 
+// Admin-only — per-owner VOICE usage + estimated cost. Derives entirely
+// from the append-only phone_calls.jsonl ledger (no counter state to drift).
+// Voice is real per-minute money on AireyAI's Vapi account, so this is the
+// "who's costing what" view BEFORE the Vapi invoice lands. Kyle-only —
+// clients never see minutes or cost (same wall as token usage).
+const VOICE_COST_PER_MIN = Number(process.env.VOICE_COST_PER_MIN) || 0.11; // £/min raw (Vapi+Twilio+STT+LLM+TTS)
+const VOICE_NUMBER_RENTAL = Number(process.env.VOICE_NUMBER_RENTAL) || 1.20; // £/mo per number
+app.get('/api/admin/voice-usage', (req, res) => {
+  if (!adminAuth(req)) return res.status(403).json({ error: 'Unauthorised' });
+  const now = new Date();
+  const monthKey = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+  const perOwner = new Map(); // owner → { calls, seconds }
+  try {
+    if (existsSync(PHONE_CALLS_LEDGER)) {
+      for (const line of readFileSync(PHONE_CALLS_LEDGER, 'utf8').split('\n')) {
+        if (!line.trim()) continue;
+        let e; try { e = JSON.parse(line); } catch { continue; }
+        if (!e.ownerEmail || !e.ts) continue;
+        if (!String(e.ts).startsWith(monthKey)) continue; // this calendar month only
+        const cur = perOwner.get(e.ownerEmail) || { calls: 0, seconds: 0 };
+        cur.calls += 1;
+        cur.seconds += Number(e.durationSec) || 0;
+        perOwner.set(e.ownerEmail, cur);
+      }
+    }
+  } catch (e) { console.warn('[voice-usage] ledger read failed:', e.message); }
+
+  const rows = [];
+  for (const [owner, v] of perOwner) {
+    const minutes = v.seconds / 60;
+    const hasNumber = !!voiceConfig.get(owner)?.vapiNumberId;
+    const cost = minutes * VOICE_COST_PER_MIN + (hasNumber ? VOICE_NUMBER_RENTAL : 0);
+    rows.push({
+      ownerEmail: owner,
+      calls: v.calls,
+      minutes: Math.round(minutes * 10) / 10,
+      estCostGbp: Math.round(cost * 100) / 100,
+      hasNumber,
+    });
+  }
+  rows.sort((a, b) => b.estCostGbp - a.estCostGbp);
+  res.json({
+    month: monthKey,
+    perMinRate: VOICE_COST_PER_MIN,
+    numberRental: VOICE_NUMBER_RENTAL,
+    rows,
+    totals: {
+      calls: rows.reduce((s, r) => s + r.calls, 0),
+      minutes: Math.round(rows.reduce((s, r) => s + r.minutes, 0) * 10) / 10,
+      estCostGbp: Math.round(rows.reduce((s, r) => s + r.estCostGbp, 0) * 100) / 100,
+      activeNumbers: rows.filter(r => r.hasNumber).length,
+    },
+  });
+});
+
 // ─── Webhook events — central dispatcher used by every firing site ─────
 // Looks up owner's webhooks from profile.webhooks[], filters by event +
 // enabled, fires each via the dispatcher (which handles HMAC signing +
