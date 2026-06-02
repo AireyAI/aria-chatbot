@@ -11694,7 +11694,7 @@ app.get('/api/dashboard/channel-stats', (req, res) => {
     total: 0,
   };
   const channels = channelConfigs.get(owner) || {};
-  res.json({ stats, channels });
+  res.json({ stats, channels, gmailConnected: gmailTokens.has(owner) });
 });
 
 // POST /api/dashboard/channel-toggle — enable/disable a channel
@@ -12091,7 +12091,7 @@ tr:last-child td{border-bottom:none;}
     </div>
     <div class="section-body" id="body-channels">
       <div style="padding:8px 0;">
-        <p style="font-size:13px;color:#9898b8;margin-bottom:16px;">Connect more social accounts or reconnect existing ones.</p>
+        <p style="font-size:13px;color:#9898b8;margin-bottom:16px;">Connect Aria to your channels. Once connected they <b>stay connected</b> — you won't need to do this again.</p>
 
         <a href="/connect/meta?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}" id="meta-connect-btn" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:13px;background:#1877F2;color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;margin-bottom:6px;">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg>
@@ -12104,11 +12104,12 @@ tr:last-child td{border-bottom:none;}
           <span>Connect Instagram (DMs)</span>
         </a>
 
-        <a class="gmail-link" href="/connect/gmail?owner=\${encodeURIComponent(OWNER)}&s=\${encodeURIComponent(TOKEN)}" style="margin-top:0;margin-bottom:20px;">
+        <a class="gmail-link" id="gmail-connect-btn" href="/connect/gmail?owner=\${encodeURIComponent(OWNER)}&s=\${encodeURIComponent(TOKEN)}" style="margin-top:0;margin-bottom:20px;">
           <svg viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
           Connect Gmail (Inbox + Auto-reply)
         </a>
 
+        <div id="gmail-status-row" style="margin-bottom:12px;"></div>
         <div id="channel-cards" style="display:flex;flex-direction:column;gap:12px;"></div>
       </div>
     </div>
@@ -14037,13 +14038,15 @@ async function loadChannels() {
       const st = stats[def.key] || { replied: 0 };
       if (ch && ch.accessToken) {
         anyConnected = true;
-        const statusColor = ch.enabled ? '#00e5a0' : '#ff6b6b';
-        const statusText = ch.enabled ? 'Active' : 'Paused';
-        html += '<div style="background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;">' +
+        // Connection is solid (we have a token). The toggle below controls
+        // whether Aria actively REPLIES \u2014 that's separate from "connected".
+        const replyColor = ch.enabled ? '#00e5a0' : '#ffa726';
+        const replyText = ch.enabled ? 'Aria is replying' : 'Replies paused';
+        html += '<div style="background:#161630;border:1px solid rgba(0,229,160,0.25);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;">' +
           '<div style="display:flex;align-items:center;gap:12px;">' +
             '<span style="font-size:24px;">' + def.icon + '</span>' +
-            '<div><div style="font-weight:600;font-size:14px;">' + def.name + '</div>' +
-            '<div style="font-size:12px;color:' + statusColor + ';">' + statusText + ' \u00B7 ' + escH(def.detail(ch)) + '</div>' +
+            '<div><div style="font-weight:600;font-size:14px;">' + def.name + ' <span style="color:#00e5a0;font-size:12px;font-weight:700;">\u2713 Connected</span></div>' +
+            '<div style="font-size:12px;color:' + replyColor + ';">' + escH(def.detail(ch)) + ' \u00B7 ' + replyText + '</div>' +
             '<div style="font-size:11px;color:#6b6b8a;margin-top:2px;">' + st.replied + ' replies</div></div>' +
           '</div>' +
           '<div style="display:flex;align-items:center;gap:8px;">' +
@@ -14063,19 +14066,31 @@ async function loadChannels() {
     }
     container.innerHTML = html;
 
-    // When a channel is connected, soften its connect button to "Reconnect"
-    // styling but PRESERVE the icon — only swap the label span text.
-    const renameIfConnected = (btnId, connectedKey, reconnectLabel) => {
+    // When a channel IS connected, HIDE its big "Connect" button — leaving it
+    // visible (even relabeled "Reconnect") makes users think the connection
+    // is broken and they must act. Connected state is shown clearly by the
+    // ✓ Connected card above. A connected channel only needs the small
+    // Disconnect control on its card, not a giant blue Connect button.
+    const hideIfConnected = (btnId, isConnected) => {
       const btn = document.getElementById(btnId);
-      if (!btn) return;
-      const labelEl = btn.querySelector('span');
-      if (channels[connectedKey]?.accessToken) {
-        if (labelEl) labelEl.textContent = reconnectLabel;
-        btn.style.opacity = '0.85';
-      }
+      if (btn) btn.style.display = isConnected ? 'none' : '';
     };
-    renameIfConnected('meta-connect-btn', 'facebook', 'Reconnect Facebook / Add Page');
-    renameIfConnected('ig-connect-btn', 'instagram', 'Reconnect Instagram');
+    hideIfConnected('meta-connect-btn', !!channels.facebook?.accessToken);
+    hideIfConnected('ig-connect-btn',   !!channels.instagram?.accessToken);
+    hideIfConnected('gmail-connect-btn', !!d.gmailConnected);
+
+    // Gmail has no card in #channel-cards (it's not a social channel), so when
+    // connected give it its own clear ✓ Connected confirmation row.
+    const gmailRow = document.getElementById('gmail-status-row');
+    if (gmailRow) {
+      gmailRow.innerHTML = d.gmailConnected
+        ? '<div style="background:#161630;border:1px solid rgba(0,229,160,0.25);border-radius:12px;padding:16px;display:flex;align-items:center;gap:12px;">' +
+            '<span style="font-size:24px;">📧</span>' +
+            '<div><div style="font-weight:600;font-size:14px;">Gmail <span style="color:#00e5a0;font-size:12px;font-weight:700;">✓ Connected</span></div>' +
+            '<div style="font-size:12px;color:#00e5a0;">Inbox + auto-reply active</div></div>' +
+          '</div>'
+        : '';
+    }
   } catch (e) { console.warn('Failed to load channels:', e); }
 }
 
