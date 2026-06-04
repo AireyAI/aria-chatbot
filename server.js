@@ -12038,6 +12038,21 @@ tbody tr:hover{background:rgba(255,255,255,0.025);}
 /* Topbar ghost buttons (cleaner than the old inline tutorial button) */
 .tb-ghost{background:rgba(255,255,255,0.05);border:1px solid var(--line-2);border-radius:var(--r-sm);padding:6px 13px;font-size:12px;color:var(--text-2);cursor:pointer;font-family:inherit;font-weight:500;transition:all .14s;}
 .tb-ghost:hover{background:rgba(255,255,255,0.09);color:var(--text);}
+/* ⌘K command palette */
+.cmdk-overlay{position:fixed;inset:0;background:rgba(5,5,12,0.62);backdrop-filter:blur(5px);z-index:600;display:none;align-items:flex-start;justify-content:center;padding-top:13vh;}
+.cmdk-overlay.show{display:flex;}
+.cmdk-box{width:100%;max-width:560px;background:var(--surface-2);border:1px solid var(--line-2);border-radius:var(--r-lg);box-shadow:var(--shadow-2);overflow:hidden;animation:panelIn .18s ease;}
+.cmdk-input{width:100%;padding:17px 20px;background:none;border:none;border-bottom:1px solid var(--line);color:var(--text);font-family:var(--font-body);font-size:16px;outline:none;}
+.cmdk-input::placeholder{color:var(--text-3);}
+.cmdk-list{max-height:340px;overflow-y:auto;padding:8px;}
+.cmdk-item{display:flex;align-items:center;gap:12px;padding:11px 13px;border-radius:var(--r-sm);font-size:14px;color:var(--text-2);cursor:pointer;}
+.cmdk-item .cmdk-ic{font-size:16px;width:22px;text-align:center;flex-shrink:0;}
+.cmdk-item .cmdk-grp{margin-left:auto;font-size:10.5px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.6px;}
+.cmdk-item.sel{background:var(--accent-12);color:var(--accent);}
+.cmdk-item.sel .cmdk-grp{color:var(--accent);opacity:.7;}
+.cmdk-empty{padding:26px;text-align:center;color:var(--text-3);font-size:13px;}
+.cmdk-foot{display:flex;gap:18px;padding:10px 18px;border-top:1px solid var(--line);font-size:11px;color:var(--text-3);}
+.cmdk-foot b{color:var(--text-2);font-weight:600;}
 /* Panel header action buttons (Refresh, Export, …) */
 .panel-actions{display:flex;gap:7px;align-items:center;}
 .panel-action{display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,0.05);border:1px solid var(--line-2);border-radius:var(--r-sm);padding:6px 12px;font-size:11.5px;color:var(--text-2);cursor:pointer;font-family:inherit;font-weight:600;transition:all .14s;}
@@ -12073,6 +12088,7 @@ tbody tr:hover{background:rgba(255,255,255,0.025);}
   <div class="logo"><span>Aria<em>Ai</em></span></div>
   <div class="right">
     <div class="email-badge">${ownerEmail}</div>
+    <button class="tb-ghost" onclick="openPalette()" title="Search (⌘K)">⌘ K</button>
     <button class="tb-ghost" onclick="localStorage.removeItem('_aria_tutorial_done');location.reload()">? Tutorial</button>
     <button class="btn-logout" onclick="logout()">Logout</button>
   </div>
@@ -12264,6 +12280,15 @@ tbody tr:hover{background:rgba(255,255,255,0.025);}
 </div>
 
 <div class="toast" id="toast"></div>
+
+<!-- ⌘K command palette -->
+<div class="cmdk-overlay" id="cmdk" onclick="if(event.target.id==='cmdk')closePalette()">
+  <div class="cmdk-box">
+    <input id="cmdk-input" class="cmdk-input" placeholder="Search panels &amp; actions…" oninput="renderPalette(this.value)" autocomplete="off" spellcheck="false">
+    <div class="cmdk-list" id="cmdk-list"></div>
+    <div class="cmdk-foot"><span><b>↑↓</b> navigate</span><span><b>↵</b> open</span><span><b>esc</b> close</span></div>
+  </div>
+</div>
 
 <script>
 const OWNER = '${ownerEmail}';
@@ -12702,6 +12727,58 @@ async function exportLeads() {
     toast('Exported ' + rows.length + ' lead' + (rows.length === 1 ? '' : 's'));
   } catch (e) { toast('Export failed'); }
 }
+
+// ─── ⌘K command palette ──────────────────────────────────────────────────
+// Press Cmd/Ctrl+K anywhere → fuzzy-search to any panel or action. The
+// signature "power product" feature. Self-contained: one overlay + keymap.
+const CMDS = [
+  { ic: '🏠', label: 'Home',             grp: 'Go', run: function(){ showPanel('home'); } },
+  { ic: '💬', label: 'Conversations',    grp: 'Go', run: function(){ showPanel('conversations'); } },
+  { ic: '🎯', label: 'Leads',            grp: 'Go', run: function(){ showPanel('leads'); } },
+  { ic: '👥', label: 'Customers',        grp: 'Go', run: function(){ showPanel('customers'); } },
+  { ic: '📅', label: 'Bookings',         grp: 'Go', run: function(){ showPanel('bookings'); } },
+  { ic: '🧠', label: 'Train Aria',       grp: 'Go', run: function(){ showPanel('train'); } },
+  { ic: '🔗', label: 'Channels',         grp: 'Go', run: function(){ showPanel('channels'); } },
+  { ic: '🏢', label: 'Business Profile', grp: 'Go', run: function(){ showPanel('profile'); } },
+  { ic: '⚙️', label: 'Settings',         grp: 'Go', run: function(){ showPanel('settings'); } },
+  { ic: '↧', label: 'Export leads as CSV', grp: 'Do', run: function(){ exportLeads(); } },
+  { ic: '↻', label: 'Refresh current panel', grp: 'Do', run: function(){ var p; try{ p = localStorage.getItem('aria_panel'); }catch(e){} if (p && p !== 'home') refreshPanel(p); } },
+  { ic: '🚪', label: 'Log out',          grp: 'Do', run: function(){ logout(); } },
+];
+let _palItems = [], _palSel = 0;
+function openPalette(){ const o = document.getElementById('cmdk'); o.classList.add('show'); const i = document.getElementById('cmdk-input'); i.value = ''; renderPalette(''); setTimeout(function(){ i.focus(); }, 20); }
+function closePalette(){ document.getElementById('cmdk').classList.remove('show'); }
+function renderPalette(q){
+  q = (q || '').toLowerCase().trim();
+  _palItems = CMDS.map(function(c, i){ return { c: c, i: i }; }).filter(function(x){ return !q || x.c.label.toLowerCase().indexOf(q) >= 0; });
+  _palSel = 0;
+  const list = document.getElementById('cmdk-list');
+  if (!_palItems.length) { list.innerHTML = '<div class="cmdk-empty">No matching commands</div>'; return; }
+  list.innerHTML = _palItems.map(function(x, idx){
+    return '<div class="cmdk-item' + (idx === 0 ? ' sel' : '') + '" data-idx="' + idx + '" onclick="runPalette(' + idx + ')"><span class="cmdk-ic">' + x.c.ic + '</span>' + escH(x.c.label) + '<span class="cmdk-grp">' + x.c.grp + '</span></div>';
+  }).join('');
+}
+function movePalette(d){
+  const items = document.querySelectorAll('.cmdk-item');
+  if (!items.length) return;
+  _palSel = (_palSel + d + items.length) % items.length;
+  items.forEach(function(el, i){ el.classList.toggle('sel', i === _palSel); });
+  items[_palSel].scrollIntoView({ block: 'nearest' });
+}
+function runPalette(idx){ const x = _palItems[idx != null ? idx : _palSel]; if (x) { closePalette(); x.c.run(); } }
+document.addEventListener('keydown', function(e){
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+    e.preventDefault();
+    const o = document.getElementById('cmdk');
+    if (o.classList.contains('show')) closePalette(); else openPalette();
+    return;
+  }
+  if (!document.getElementById('cmdk').classList.contains('show')) return;
+  if (e.key === 'Escape') closePalette();
+  else if (e.key === 'ArrowDown') { e.preventDefault(); movePalette(1); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); movePalette(-1); }
+  else if (e.key === 'Enter') { e.preventDefault(); runPalette(); }
+});
 
 async function loadSection(name) {
   if (name === 'leads') await loadLeads();
