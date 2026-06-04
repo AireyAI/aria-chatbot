@@ -11994,6 +11994,27 @@ tr:last-child td{border-bottom:none;}
 .gmail-link svg{width:20px;height:20px;}
 .gmail-card{background:linear-gradient(135deg,rgba(0,229,160,0.08),rgba(0,229,160,0.02));border:1px solid rgba(0,229,160,0.2);border-radius:14px;padding:20px;margin-bottom:16px;text-align:center;}
 .gmail-card p{font-size:13px;color:#9898b8;margin-bottom:14px;}
+/* ── Sidebar navigation ─────────────────────────────────────────────── */
+.sidebar{position:fixed;top:55px;left:0;width:236px;height:calc(100vh - 55px);overflow-y:auto;padding:18px 12px 24px;border-right:1px solid var(--line);background:rgba(10,10,20,0.45);backdrop-filter:blur(10px);display:flex;flex-direction:column;gap:3px;z-index:50;}
+.nav-label{font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.9px;font-weight:700;padding:16px 12px 7px;}
+.nav-group{display:flex;flex-direction:column;gap:3px;}
+.nav-item{display:flex;align-items:center;gap:11px;padding:10px 12px;border:none;background:none;color:var(--text-2);font-family:inherit;font-size:13.5px;font-weight:500;border-radius:var(--r-sm);cursor:pointer;text-align:left;width:100%;transition:background .14s,color .14s,box-shadow .14s;}
+.nav-item .ni-ic{font-size:16px;width:20px;text-align:center;flex-shrink:0;}
+.nav-item:hover{background:rgba(255,255,255,0.05);color:var(--text);}
+.nav-item.active{background:var(--accent-12);color:var(--accent);font-weight:600;box-shadow:inset 3px 0 0 var(--accent);}
+.container{margin-left:236px;}
+/* In sidebar/panel mode the sections are full pages, not accordions */
+.section .arrow{display:none;}
+.section .section-header{cursor:default;}
+.section .section-header:hover{background:none;}
+@media(max-width:900px){
+  .sidebar{position:sticky;top:55px;width:auto;height:auto;flex-direction:row;align-items:center;overflow-x:auto;overflow-y:hidden;border-right:none;border-bottom:1px solid var(--line);gap:6px;padding:10px 12px;}
+  .sidebar .nav-label{display:none;}
+  .nav-group{flex-direction:row;gap:6px;}
+  .nav-item{white-space:nowrap;padding:9px 13px;font-size:13px;}
+  .nav-item .ni-ic{display:none;}
+  .container{margin-left:0;}
+}
 @media(max-width:700px){
   .topbar{padding:12px 16px;}
   .topbar .logo span{font-size:18px;}
@@ -12020,11 +12041,30 @@ tr:last-child td{border-bottom:none;}
   </div>
 </div>
 
+<aside class="sidebar" id="sidebar">
+  <nav class="nav-group">
+    <button class="nav-item active" data-panel="home" onclick="showPanel('home')"><span class="ni-ic">🏠</span>Home</button>
+    <button class="nav-item" data-panel="conversations" onclick="showPanel('conversations')"><span class="ni-ic">💬</span>Conversations</button>
+    <button class="nav-item" data-panel="leads" onclick="showPanel('leads')"><span class="ni-ic">🎯</span>Leads</button>
+    <button class="nav-item" data-panel="customers" onclick="showPanel('customers')"><span class="ni-ic">👥</span>Customers</button>
+    <button class="nav-item" data-panel="bookings" onclick="showPanel('bookings')"><span class="ni-ic">📅</span>Bookings</button>
+  </nav>
+  <div class="nav-label">Manage</div>
+  <nav class="nav-group">
+    <button class="nav-item" data-panel="train" onclick="showPanel('train')"><span class="ni-ic">🧠</span>Train Aria</button>
+    <button class="nav-item" data-panel="channels" onclick="showPanel('channels')"><span class="ni-ic">🔗</span>Channels</button>
+    <button class="nav-item" data-panel="profile" onclick="showPanel('profile')"><span class="ni-ic">🏢</span>Business</button>
+    <button class="nav-item" data-panel="settings" onclick="showPanel('settings')"><span class="ni-ic">⚙️</span>Settings</button>
+  </nav>
+</aside>
+
 <div class="container">
 
   <!-- Escalations banner (only when present) -->
   <div id="escalations-banner" style="display:none;"></div>
 
+  <!-- HOME PANEL: overview (hero + channels + activity + analytics + stats) -->
+  <div id="panel-home">
   <!-- HERO STATUS BAR -->
   <div class="hero" id="hero-status">
     <div class="hero-status">
@@ -12064,7 +12104,9 @@ tr:last-child td{border-bottom:none;}
     <div class="stat-card"><div class="value">—</div><div class="label">Loading...</div></div>
   </div>
 
-  <!-- DRILL-DOWN SECTIONS -->
+  </div><!-- /panel-home -->
+
+  <!-- DRILL-DOWN SECTIONS (each shown as a full panel via the sidebar) -->
 
   <!-- Conversations — merged inbox log + channel messages -->
   <div class="section" id="sec-conversations">
@@ -12490,6 +12532,16 @@ async function resumeConv(memKey) {
 }
 loadStats();
 
+// Sidebar init — open the last-viewed panel (or Home). This also hides the
+// non-active section panels so the dashboard opens as one clean view
+// instead of a long accordion scroll.
+(function(){
+  let p = 'home';
+  try { p = localStorage.getItem('aria_panel') || 'home'; } catch (e) {}
+  if (p !== 'home' && !document.getElementById('sec-' + p)) p = 'home';
+  showPanel(p);
+})();
+
 // Welcome tutorial — show on first visit
 if (!localStorage.getItem('_aria_tutorial_done')) {
   const overlay = document.createElement('div');
@@ -12524,12 +12576,34 @@ if (!localStorage.getItem('_aria_tutorial_done')) {
 
 // One-click test button (already in topbar)
 
+// In sidebar/panel mode each section is a full page, not a collapsible
+// accordion — so this only ever OPENS + lazy-loads, never collapses.
 function toggleSection(name) {
   const sec = document.getElementById('sec-' + name);
-  const isOpen = sec.classList.contains('open');
-  if (isOpen) { sec.classList.remove('open'); return; }
-  sec.classList.add('open');
-  if (!loaded[name]) { loaded[name] = true; loadSection(name); }
+  if (!sec) return;
+  if (!sec.classList.contains('open')) {
+    sec.classList.add('open');
+    if (!loaded[name]) { loaded[name] = true; loadSection(name); }
+  }
+}
+
+// Sidebar navigation — show one panel at a time. 'home' = the overview
+// (hero + activity + analytics); everything else maps to a section.
+const PANEL_NAMES = ['conversations','leads','customers','bookings','train','channels','profile','settings'];
+function showPanel(name) {
+  const home = document.getElementById('panel-home');
+  if (home) home.style.display = (name === 'home') ? 'block' : 'none';
+  PANEL_NAMES.forEach(p => {
+    const s = document.getElementById('sec-' + p);
+    if (s) s.style.display = (p === name) ? 'block' : 'none';
+  });
+  if (name !== 'home') {
+    const s = document.getElementById('sec-' + name);
+    if (s) { s.classList.add('open'); if (!loaded[name]) { loaded[name] = true; loadSection(name); } }
+  }
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.panel === name));
+  try { localStorage.setItem('aria_panel', name); } catch (e) {}
+  window.scrollTo({ top: 0, behavior: 'instant' in window ? 'instant' : 'auto' });
 }
 
 async function loadSection(name) {
