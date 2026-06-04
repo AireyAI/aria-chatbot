@@ -12243,6 +12243,10 @@ const OWNER = '${ownerEmail}';
 const TOKEN = '${sessionToken}';
 const Q = 'owner=' + encodeURIComponent(OWNER) + '&s=' + encodeURIComponent(TOKEN);
 const loaded = {};
+// Sidebar panel names — declared at top so showPanel() (called during init,
+// further down) never hits a temporal-dead-zone on this const. Browser-side
+// TDZ is invisible to node --check, which is why this broke every button.
+const PANEL_NAMES = ['conversations','leads','customers','bookings','train','channels','profile','settings'];
 
 function api(path) { return fetch(path + (path.includes('?') ? '&' : '?') + Q).then(r => r.json()); }
 function apiPost(path, body) {
@@ -12616,7 +12620,7 @@ function toggleSection(name) {
 
 // Sidebar navigation — show one panel at a time. 'home' = the overview
 // (hero + activity + analytics); everything else maps to a section.
-const PANEL_NAMES = ['conversations','leads','customers','bookings','train','channels','profile','settings'];
+// (PANEL_NAMES is declared at the top of this script to avoid a TDZ on init.)
 function showPanel(name) {
   const home = document.getElementById('panel-home');
   if (home) home.style.display = (name === 'home') ? 'block' : 'none';
