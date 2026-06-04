@@ -12011,8 +12011,12 @@ tr:last-child td{border-bottom:none;}
 .container{margin-left:236px;}
 /* In sidebar/panel mode the sections are full pages, not accordions */
 .section .arrow{display:none;}
-.section .section-header{cursor:default;}
+.section .section-header{cursor:default;padding:20px 22px 16px;}
 .section .section-header:hover{background:none;}
+.section .section-header h3{font-size:18px;letter-spacing:-0.02em;}
+/* Premium panel-switch entrance */
+@keyframes panelIn{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+.panel-enter{animation:panelIn .28s cubic-bezier(.2,.8,.2,1);}
 @media(max-width:900px){
   .sidebar{position:sticky;top:55px;width:auto;height:auto;flex-direction:row;align-items:center;overflow-x:auto;overflow-y:hidden;border-right:none;border-bottom:1px solid var(--line);gap:6px;padding:10px 12px;}
   .sidebar .nav-label{display:none;}
@@ -12625,6 +12629,9 @@ function showPanel(name) {
     if (s) { s.classList.add('open'); if (!loaded[name]) { loaded[name] = true; loadSection(name); } }
   }
   document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.panel === name));
+  // Premium entrance — retrigger the fade/slide on the panel now shown.
+  const shown = (name === 'home') ? home : document.getElementById('sec-' + name);
+  if (shown) { shown.classList.remove('panel-enter'); void shown.offsetWidth; shown.classList.add('panel-enter'); }
   try { localStorage.setItem('aria_panel', name); } catch (e) {}
   window.scrollTo({ top: 0, behavior: 'instant' in window ? 'instant' : 'auto' });
 }
