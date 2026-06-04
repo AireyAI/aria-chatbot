@@ -11994,6 +11994,12 @@ tr:last-child td{border-bottom:none;}
 .gmail-link svg{width:20px;height:20px;}
 .gmail-card{background:linear-gradient(135deg,rgba(0,229,160,0.08),rgba(0,229,160,0.02));border:1px solid rgba(0,229,160,0.2);border-radius:14px;padding:20px;margin-bottom:16px;text-align:center;}
 .gmail-card p{font-size:13px;color:#9898b8;margin-bottom:14px;}
+/* ── Home greeting ──────────────────────────────────────────────────── */
+.home-greet{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:18px;}
+.greet-hi{font-family:var(--font-display);font-size:27px;font-weight:800;color:var(--text);letter-spacing:-0.03em;line-height:1.1;}
+.greet-sub{font-size:13px;color:var(--text-2);margin-top:4px;}
+.greet-date{font-size:12px;color:var(--text-3);text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;}
+@media(max-width:700px){.greet-hi{font-size:22px;}.greet-date{display:none;}}
 /* ── Sidebar navigation ─────────────────────────────────────────────── */
 .sidebar{position:fixed;top:55px;left:0;width:236px;height:calc(100vh - 55px);overflow-y:auto;padding:18px 12px 24px;border-right:1px solid var(--line);background:rgba(10,10,20,0.45);backdrop-filter:blur(10px);display:flex;flex-direction:column;gap:3px;z-index:50;}
 .nav-label{font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.9px;font-weight:700;padding:16px 12px 7px;}
@@ -12065,6 +12071,13 @@ tr:last-child td{border-bottom:none;}
 
   <!-- HOME PANEL: overview (hero + channels + activity + analytics + stats) -->
   <div id="panel-home">
+  <div class="home-greet">
+    <div>
+      <div class="greet-hi" id="greet-hi">Welcome back</div>
+      <div class="greet-sub" id="greet-sub">Here's how Aria is doing</div>
+    </div>
+    <div class="greet-date" id="greet-date"></div>
+  </div>
   <!-- HERO STATUS BAR -->
   <div class="hero" id="hero-status">
     <div class="hero-status">
@@ -12531,6 +12544,16 @@ async function resumeConv(memKey) {
   } catch (e) { toast('Resume failed'); }
 }
 loadStats();
+
+// Home greeting — time-aware + today's date.
+(function(){
+  const h = new Date().getHours();
+  const g = h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
+  const hi = document.getElementById('greet-hi');
+  if (hi) hi.textContent = g + ' 👋';
+  const d = document.getElementById('greet-date');
+  if (d) { try { d.textContent = new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' }); } catch (e) {} }
+})();
 
 // Sidebar init — open the last-viewed panel (or Home). This also hides the
 // non-active section panels so the dashboard opens as one clean view
