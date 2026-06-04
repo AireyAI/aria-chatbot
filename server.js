@@ -11820,7 +11820,7 @@ app.get('/dashboard', (req, res) => {
 <title>Aria — Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=Schibsted+Grotesk:wght@500;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 /* ── Institutional design system — "AI Command Center" ───────────────── */
 :root{
@@ -11838,8 +11838,10 @@ app.get('/dashboard', (req, res) => {
   --shadow-1:0 1px 2px rgba(0,0,0,0.3);
   --shadow-2:0 8px 24px -8px rgba(0,0,0,0.5),0 2px 6px rgba(0,0,0,0.3);
   --shadow-glow:0 0 0 1px var(--accent-30),0 8px 30px -10px rgba(0,229,160,0.25);
-  --font-display:'Schibsted Grotesk',system-ui,sans-serif;
-  --font-body:'Hanken Grotesk',system-ui,sans-serif;
+  /* One disciplined grotesque across the board — institutional, systematic,
+     professional. Hierarchy comes from weight + size, not a second family. */
+  --font-display:'Geist',system-ui,-apple-system,sans-serif;
+  --font-body:'Geist',system-ui,-apple-system,sans-serif;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:var(--font-body);background:var(--bg);min-height:100vh;color:var(--text);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
