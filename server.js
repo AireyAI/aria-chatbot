@@ -12017,6 +12017,27 @@ tr:last-child td{border-bottom:none;}
 /* Premium panel-switch entrance */
 @keyframes panelIn{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
 .panel-enter{animation:panelIn .28s cubic-bezier(.2,.8,.2,1);}
+/* Skeleton loaders — the institutional alternative to "Loading…" text */
+@keyframes shimmer{0%{background-position:-400px 0}100%{background-position:400px 0}}
+.skeleton{background:linear-gradient(90deg,rgba(255,255,255,0.04) 25%,rgba(255,255,255,0.09) 37%,rgba(255,255,255,0.04) 63%);background-size:800px 100%;animation:shimmer 1.4s ease-in-out infinite;border-radius:8px;}
+.sk-row{height:14px;margin:9px 0;}
+.sk-card{height:78px;border-radius:var(--r-lg);}
+.sk-wrap{display:flex;flex-direction:column;gap:2px;padding:4px 0;}
+/* Polished empty states */
+.empty-state{text-align:center;padding:38px 24px;}
+.empty-state .es-ic{font-size:34px;margin-bottom:10px;opacity:.9;}
+.empty-state .es-t{font-family:var(--font-display);font-size:15px;font-weight:700;color:var(--text);margin-bottom:5px;}
+.empty-state .es-s{font-size:12.5px;color:var(--text-2);line-height:1.6;max-width:340px;margin:0 auto;}
+/* Numbers don't jitter as they update */
+.stat-card .value,.hero-metric .v,.ana-row .count,td{font-variant-numeric:tabular-nums;}
+/* Row micro-interactions */
+tbody tr{transition:background .12s;}
+tbody tr:hover{background:rgba(255,255,255,0.025);}
+.activity-row{transition:background .12s;border-radius:8px;}
+.activity-row:hover{background:rgba(255,255,255,0.025);}
+/* Topbar ghost buttons (cleaner than the old inline tutorial button) */
+.tb-ghost{background:rgba(255,255,255,0.05);border:1px solid var(--line-2);border-radius:var(--r-sm);padding:6px 13px;font-size:12px;color:var(--text-2);cursor:pointer;font-family:inherit;font-weight:500;transition:all .14s;}
+.tb-ghost:hover{background:rgba(255,255,255,0.09);color:var(--text);}
 @media(max-width:900px){
   .sidebar{position:sticky;top:55px;width:auto;height:auto;flex-direction:row;align-items:center;overflow-x:auto;overflow-y:hidden;border-right:none;border-bottom:1px solid var(--line);gap:6px;padding:10px 12px;}
   .sidebar .nav-label{display:none;}
@@ -12046,7 +12067,7 @@ tr:last-child td{border-bottom:none;}
   <div class="logo"><span>Aria<em>Ai</em></span></div>
   <div class="right">
     <div class="email-badge">${ownerEmail}</div>
-    <button onclick="localStorage.removeItem('_aria_tutorial_done');location.reload()" style="background:rgba(0,229,160,0.1);color:#00e5a0;border:1px solid rgba(0,229,160,0.2);border-radius:8px;padding:6px 14px;font-size:12px;cursor:pointer;font-family:inherit;font-weight:500;">? Tutorial</button>
+    <button class="tb-ghost" onclick="localStorage.removeItem('_aria_tutorial_done');location.reload()">? Tutorial</button>
     <button class="btn-logout" onclick="logout()">Logout</button>
   </div>
 </div>
@@ -12247,6 +12268,7 @@ const loaded = {};
 // further down) never hits a temporal-dead-zone on this const. Browser-side
 // TDZ is invisible to node --check, which is why this broke every button.
 const PANEL_NAMES = ['conversations','leads','customers','bookings','train','channels','profile','settings'];
+const SKELETON_HTML = '<div class="sk-wrap">' + ['60%','85%','72%','90%','50%'].map(function(w){ return '<div class="skeleton sk-row" style="width:' + w + '"></div>'; }).join('') + '</div>';
 
 function api(path) { return fetch(path + (path.includes('?') ? '&' : '?') + Q).then(r => r.json()); }
 function apiPost(path, body) {
@@ -12630,7 +12652,18 @@ function showPanel(name) {
   });
   if (name !== 'home') {
     const s = document.getElementById('sec-' + name);
-    if (s) { s.classList.add('open'); if (!loaded[name]) { loaded[name] = true; loadSection(name); } }
+    if (s) {
+      s.classList.add('open');
+      if (!loaded[name]) {
+        loaded[name] = true;
+        // Show a skeleton shimmer in the panel body while its data loads
+        // (institutional touch — beats a "Loading…" string). loadSection
+        // replaces it with real content.
+        const b = document.getElementById('body-' + name);
+        if (b) b.innerHTML = SKELETON_HTML;
+        loadSection(name);
+      }
+    }
   }
   document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.panel === name));
   // Premium entrance — retrigger the fade/slide on the panel now shown.
