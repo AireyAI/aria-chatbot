@@ -12038,6 +12038,12 @@ tbody tr:hover{background:rgba(255,255,255,0.025);}
 /* Topbar ghost buttons (cleaner than the old inline tutorial button) */
 .tb-ghost{background:rgba(255,255,255,0.05);border:1px solid var(--line-2);border-radius:var(--r-sm);padding:6px 13px;font-size:12px;color:var(--text-2);cursor:pointer;font-family:inherit;font-weight:500;transition:all .14s;}
 .tb-ghost:hover{background:rgba(255,255,255,0.09);color:var(--text);}
+/* Panel header action buttons (Refresh, Export, …) */
+.panel-actions{display:flex;gap:7px;align-items:center;}
+.panel-action{display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,0.05);border:1px solid var(--line-2);border-radius:var(--r-sm);padding:6px 12px;font-size:11.5px;color:var(--text-2);cursor:pointer;font-family:inherit;font-weight:600;transition:all .14s;}
+.panel-action:hover{background:rgba(255,255,255,0.09);color:var(--text);border-color:var(--line-2);}
+.panel-action.primary{background:var(--accent-12);border-color:var(--accent-30);color:var(--accent);}
+.panel-action.primary:hover{background:rgba(0,229,160,0.18);}
 @media(max-width:900px){
   .sidebar{position:sticky;top:55px;width:auto;height:auto;flex-direction:row;align-items:center;overflow-x:auto;overflow-y:hidden;border-right:none;border-bottom:1px solid var(--line);gap:6px;padding:10px 12px;}
   .sidebar .nav-label{display:none;}
@@ -12150,7 +12156,7 @@ tbody tr:hover{background:rgba(255,255,255,0.025);}
   <div class="section" id="sec-conversations">
     <div class="section-header" onclick="toggleSection('conversations')">
       <h3>&#x1F4AC; Conversations</h3>
-      <span class="arrow">&#x25B6;</span>
+      <div class="panel-actions"><button class="panel-action" onclick="event.stopPropagation();refreshPanel('conversations')">↻ Refresh</button></div>
     </div>
     <div class="section-body" id="body-conversations">
       <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
@@ -12168,7 +12174,7 @@ tbody tr:hover{background:rgba(255,255,255,0.025);}
   <div class="section" id="sec-leads">
     <div class="section-header" onclick="toggleSection('leads')">
       <h3>&#x1F464; Leads</h3>
-      <span class="arrow">&#x25B6;</span>
+      <div class="panel-actions"><button class="panel-action" onclick="event.stopPropagation();exportLeads()">↧ Export CSV</button><button class="panel-action" onclick="event.stopPropagation();refreshPanel('leads')">↻ Refresh</button></div>
     </div>
     <div class="section-body" id="body-leads"><div class="empty">Loading...</div></div>
   </div>
@@ -12177,7 +12183,7 @@ tbody tr:hover{background:rgba(255,255,255,0.025);}
   <div class="section" id="sec-customers">
     <div class="section-header" onclick="toggleSection('customers')">
       <h3>&#x1F465; Customers</h3>
-      <span class="arrow">&#x25B6;</span>
+      <div class="panel-actions"><button class="panel-action" onclick="event.stopPropagation();refreshPanel('customers')">↻ Refresh</button></div>
     </div>
     <div class="section-body" id="body-customers"><div class="empty">Loading...</div></div>
   </div>
@@ -12186,7 +12192,7 @@ tbody tr:hover{background:rgba(255,255,255,0.025);}
   <div class="section" id="sec-bookings">
     <div class="section-header" onclick="toggleSection('bookings')">
       <h3>&#x1F4C5; Upcoming Bookings</h3>
-      <span class="arrow">&#x25B6;</span>
+      <div class="panel-actions"><button class="panel-action" onclick="event.stopPropagation();refreshPanel('bookings')">↻ Refresh</button></div>
     </div>
     <div class="section-body" id="body-bookings"><div class="empty">Loading...</div></div>
   </div>
@@ -12673,6 +12679,30 @@ function showPanel(name) {
   window.scrollTo({ top: 0, behavior: 'instant' in window ? 'instant' : 'auto' });
 }
 
+// Re-fetch a panel's data on demand (the Refresh action in panel headers).
+function refreshPanel(name) {
+  const b = document.getElementById('body-' + name);
+  if (b) b.innerHTML = SKELETON_HTML;
+  loadSection(name);
+}
+
+// Export the lead list as a CSV the owner can open in Excel/Sheets.
+async function exportLeads() {
+  try {
+    const d = await api('/api/dashboard/leads');
+    const rows = (d && d.leads) || [];
+    if (!rows.length) { toast('No leads to export yet'); return; }
+    const esc = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+    const csv = 'Name,Email,Phone\\n' + rows.map(l => [l.name, l.email, l.phone].map(esc).join(',')).join('\\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+    a.download = 'aria-leads.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast('Exported ' + rows.length + ' lead' + (rows.length === 1 ? '' : 's'));
+  } catch (e) { toast('Export failed'); }
+}
+
 async function loadSection(name) {
   if (name === 'leads') await loadLeads();
   else if (name === 'bookings') await loadBookings();
@@ -12690,7 +12720,7 @@ async function loadCustomers() {
     const d = await api('/api/dashboard/customers');
     const list = d.customers || [];
     if (!list.length) {
-      body.innerHTML = '<div class="cta-card"><h4>No returning customers yet</h4><p>Aria builds this list automatically — whenever the same customer messages you 2+ times (matched by email, phone, or name), they show up here with their full history.</p></div>';
+      body.innerHTML = '<div class="empty-state"><div class="es-ic">👥</div><div class="es-t">No returning customers yet</div><div class="es-s">Aria builds this list automatically — whenever the same person messages you 2+ times (matched by email, phone, or name), they appear here with their full history.</div></div>';
       return;
     }
     const icons = { facebook: '📘', instagram: '📷', whatsapp: '💬', email: '📧', voice: '☎️' };
@@ -13586,7 +13616,7 @@ async function loadLeads() {
   try {
     const d = await api('/api/dashboard/leads');
     if (!d.leads.length) {
-      body.innerHTML = '<div class="cta-card"><h4>No leads yet</h4><p>Leads show up here when Aria captures contact info during a conversation. Make sure you have at least one channel connected.</p><button class="cta-btn" onclick="toggleSection(\\'channels\\');document.getElementById(\\'sec-channels\\').scrollIntoView({behavior:\\'smooth\\'})">Connect a channel →</button></div>';
+      body.innerHTML = '<div class="empty-state"><div class="es-ic">🎯</div><div class="es-t">No leads yet</div><div class="es-s">Leads appear here automatically when Aria captures a name, email, or phone during a conversation. Connect a channel to get started.</div><button class="cta-btn" style="margin-top:16px" onclick="showPanel(\\'channels\\')">Connect a channel →</button></div>';
       return;
     }
     let html = '<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th></tr></thead><tbody>';
@@ -13603,7 +13633,7 @@ async function loadBookings() {
   try {
     const d = await api('/api/dashboard/bookings');
     if (!d.bookings.length) {
-      body.innerHTML = '<div class="cta-card"><h4>No bookings yet</h4><p>When customers DM asking to book/hire, Aria collects the details (name, contact, when) and saves it here — plus emails you a calendar invite and the customer a confirmation.</p></div>';
+      body.innerHTML = '<div class="empty-state"><div class="es-ic">📅</div><div class="es-t">No bookings yet</div><div class="es-s">When a customer asks to book or hire, Aria collects the details (name, contact, time), checks for clashes, saves it here, emails you a calendar invite, and sends the customer a confirmation.</div></div>';
       return;
     }
     const icons = { email: '📧', facebook: '📘', instagram: '📷', whatsapp: '💬' };
