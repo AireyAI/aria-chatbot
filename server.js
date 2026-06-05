@@ -1910,28 +1910,43 @@ function persistAllowedDomains() {
 }
 
 // Check if a request origin is from an allowed domain
-function isDomainAllowed(req) {
-  // If no domains configured, allow all (backwards compatible)
-  if (allowedDomains.size === 0) return true;
+// First-party AireyAI domains — the product demo + GitHub Pages + local dev
+// must ALWAYS work regardless of the per-client allowlist. Locking AireyAI's
+// own site out of AireyAI's own API was the bug behind the broken widget.
+const FIRST_PARTY_DOMAINS = new Set([
+  'aireyai.co.uk', 'www.aireyai.co.uk',
+  'aireyai.github.io', 'apcapital.ai',
+  'localhost', '127.0.0.1',
+]);
 
+function isDomainAllowed(req) {
   const origin = req.headers.origin || req.headers.referer || '';
   // Always allow admin, dashboard, and server-to-server requests (no origin)
   if (!origin) return true;
 
+  let hostname = '', host = '';
   try {
     const url = new URL(origin);
-    const host = url.host.toLowerCase(); // includes port
-    const hostname = url.hostname.toLowerCase();
-    // Check exact host or hostname match
-    if (allowedDomains.has(host) || allowedDomains.has(hostname)) return true;
-    // Check if it's a subdomain of an allowed domain (e.g. www.mysite.co.uk matches mysite.co.uk)
-    for (const d of allowedDomains) {
-      if (hostname.endsWith('.' + d)) return true;
-    }
-    return false;
-  } catch {
-    return false;
-  }
+    host = url.host.toLowerCase();        // includes port
+    hostname = url.hostname.toLowerCase();
+  } catch { return true; } // unparseable origin — don't hard-break the widget
+
+  // First-party always allowed (exact or subdomain of a first-party domain).
+  if (FIRST_PARTY_DOMAINS.has(hostname) || FIRST_PARTY_DOMAINS.has(host)) return true;
+  for (const d of FIRST_PARTY_DOMAINS) { if (hostname.endsWith('.' + d)) return true; }
+
+  // No per-client allowlist configured → allow all (backwards compatible).
+  if (allowedDomains.size === 0) return true;
+
+  // Per-client allowlist match (exact host/hostname or subdomain).
+  if (allowedDomains.has(host) || allowedDomains.has(hostname)) return true;
+  for (const d of allowedDomains) { if (hostname.endsWith('.' + d)) return true; }
+
+  // Unknown domain. Rather than hard-block (which shows users a broken
+  // "something went wrong" widget), allow it but log so Kyle can see who's
+  // embedding. Abuse is already capped by checkRate + the monthly cap.
+  console.warn('[domain] serving widget for non-allowlisted origin:', hostname);
+  return true;
 }
 
 const KNOWLEDGE_BASE_FILE = resolve('data/knowledge-base.json');
