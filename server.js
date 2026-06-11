@@ -4175,6 +4175,14 @@ app.post('/disconnect/gmail', (req, res) => {
 });
 
 // ─── Chat endpoints ───────────────────────────────────────────────────────────
+
+// When the Anthropic account is unfunded or the key is bad, tell the widget to
+// degrade into its no-AI lead-capture form instead of showing a dead retry loop.
+const AI_UNAVAILABLE_PAYLOAD = { error: 'ai_unavailable', fallback: 'lead_form' };
+function isAiBillingError(e) {
+  return /credit balance|billing|invalid x-api-key|authentication_error|API key/i.test(String(e?.message || ''));
+}
+
 app.post('/api/chat', async (req, res) => {
   if (!checkRate(req.ip)) return res.status(429).json({ error:'Rate limited' });
   if (isOverCap()) return res.status(429).json({ error:'Monthly message limit reached — please try again next month.' });
@@ -4201,7 +4209,8 @@ app.post('/api/chat', async (req, res) => {
     res.json(r);
   } catch(e) {
     console.error('Chat error:', e.message);
-    res.status(500).json({ error: e.message?.includes('API key') ? 'Invalid API key' : 'AI error' });
+    if (isAiBillingError(e)) return res.status(503).json(AI_UNAVAILABLE_PAYLOAD);
+    res.status(500).json({ error: 'AI error' });
   }
 });
 
@@ -4656,6 +4665,7 @@ app.post('/api/chat/router', async (req, res) => {
     });
   } catch (e) {
     console.error('[aria/router] error:', e.message);
+    if (isAiBillingError(e)) return res.status(503).json(AI_UNAVAILABLE_PAYLOAD);
     res.status(500).json({ error: 'AI error' });
   }
 });
@@ -4785,7 +4795,7 @@ app.post('/api/chat/router/stream', async (req, res) => {
     }
   } catch (e) {
     console.error('[aria/router-stream] error:', e.message);
-    if (!aborted) { sse({ error: 'AI error' }); res.end(); }
+    if (!aborted) { sse(isAiBillingError(e) ? AI_UNAVAILABLE_PAYLOAD : { error: 'AI error' }); res.end(); }
   }
 });
 
@@ -4981,12 +4991,12 @@ app.post('/api/chat/stream', async (req, res) => {
     stream.on('error', e => {
       if (e.name === 'APIUserAbortError' || aborted) return;
       console.error('Stream error:', e.message);
-      if (!aborted) { sse({ error:'Stream error' }); res.end(); }
+      if (!aborted) { sse(isAiBillingError(e) ? AI_UNAVAILABLE_PAYLOAD : { error:'Stream error' }); res.end(); }
     });
     stream.on('abort', () => { /* expected on client disconnect, do nothing */ });
   } catch(e) {
     console.error('Stream setup error:', e.message);
-    if (!aborted) { sse({ error: 'AI error' }); res.end(); }
+    if (!aborted) { sse(isAiBillingError(e) ? AI_UNAVAILABLE_PAYLOAD : { error: 'AI error' }); res.end(); }
   }
 });
 

@@ -593,6 +593,17 @@
     padding:8px 15px;font-size:13px;cursor:pointer;font-family:inherit;font-weight:600;transition:background .15s;}
   #_ac-lead-sub:hover{background:var(--abd);}
 
+  /* Offline lead capture (AI unavailable) */
+  #_ac-ai-offline{background:var(--bot);border-radius:16px;padding:16px;align-self:flex-start;
+    box-shadow:0 2px 8px var(--sh);animation:_afad .25s ease;max-width:90%;}
+  #_ac-ai-offline p{font-size:13.5px;color:var(--text);line-height:1.5;margin:0 0 10px;}
+  #_ac-ai-offline input{width:100%;box-sizing:border-box;border:1.5px solid var(--border);border-radius:20px;
+    padding:8px 13px;font-size:13px;outline:none;background:var(--inp);color:var(--text);font-family:inherit;margin-bottom:6px;}
+  #_ac-ai-offline input:focus{border-color:var(--ab);}
+  #_ac-ai-offline button{width:100%;background:var(--ab);color:var(--abt);border:none;border-radius:20px;
+    padding:9px 15px;font-size:13px;cursor:pointer;font-family:inherit;font-weight:600;transition:background .15s;}
+  #_ac-ai-offline button:hover{background:var(--abd);}
+
   /* Rating */
   #_ac-rating{background:var(--bg);padding:18px;display:flex;flex-direction:column;
     align-items:center;gap:11px;border-top:1px solid var(--border);flex-shrink:0;animation:_afad .3s ease;}
@@ -1693,6 +1704,7 @@ Return JSON:
   let isOpen = false, isBusy = false, hasOpened = false;
   let botMsgs = 0, msgStreak = 0, leadDone = false, ratingShown = false, menuOpen = false, sessionConverted = false;
   let awaitingName = false, gdprConsented = !!localStorage.getItem(LS_GDPR);
+  let aiOffline = false; // set when the server reports ai_unavailable (unfunded key) — degrade to lead capture
   let userName = localStorage.getItem(LS_NAME) || '';
   let inactTimer = null, history = [];
   let abVariant = null, buyingIntentScore = 0, sentimentScore = 0;
@@ -2496,7 +2508,11 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
           } catch (e) { if (e.message && !e.message.includes('JSON')) throw e; }
         }
       }
-    } catch { bubble.classList.remove('stream'); bubble.remove(); return ''; }
+    } catch (e) {
+      bubble.classList.remove('stream'); bubble.remove();
+      if (e && e.message === 'ai_unavailable') throw e; // billing/key outage → offline lead form
+      return '';
+    }
     bubble.classList.remove('stream'); bubble.remove();
     return fullText;
   }
@@ -2511,7 +2527,10 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
         clientConfig: buildClientConfig(),
       }),
     });
-    if (!res.ok) throw new Error();
+    if (!res.ok) {
+      const j = await res.json().catch(() => null);
+      throw new Error(j && j.error === 'ai_unavailable' ? 'ai_unavailable' : '');
+    }
     const data = await res.json();
     persistRouterScore(data); // no-op on legacy /api/chat (no score field)
     // Non-streaming router returns toolEvents in the body — same dispatch.
@@ -2608,6 +2627,14 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
 
     // GDPR gate
     if (CONFIG.gdprEnabled && !gdprConsented) return;
+
+    // AI brain offline (unfunded key) — don't burn the visitor on a dead API;
+    // capture their message visually and point them at the lead form.
+    if (aiOffline) {
+      addUserMessage(text); el('_ac-inp').value = ''; el('_ac-inp').style.height = 'auto';
+      showOfflineLeadCard();
+      return;
+    }
 
     // Booking flow intercept
     if (bookingState) { el('_ac-inp').value = ''; el('_ac-inp').style.height = 'auto'; el('_ac-send').disabled = true; await handleBookingStep(text); el('_ac-send').disabled = !el('_ac-inp').value.trim(); return; }
@@ -2769,17 +2796,22 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
       } else {
         _pendingToolEvents = []; // failed/empty response — drop stale tool effects
       }
-    } catch {
+    } catch (err) {
       _pendingToolEvents = [];
       typ().classList.remove('show');
       // Remove the last user message from history so they can retry cleanly
       const failedMsg = (history[history.length - 1]?.role === 'user') ? history.pop()?.content : text;
-      const retryCard = document.createElement('div'); retryCard.className = 'ac-retry-card';
-      retryCard.innerHTML = `<p>Something went wrong — want to try again?</p>`;
-      const retryBtn = document.createElement('button'); retryBtn.className = 'ac-retry-btn'; retryBtn.textContent = '↻ Retry';
-      retryBtn.onclick = () => { retryCard.remove(); sendMessage(failedMsg); };
-      retryCard.appendChild(retryBtn);
-      insertBefore(retryCard); scrollBottom();
+      if (err && err.message === 'ai_unavailable') {
+        aiOffline = true;
+        showOfflineLeadCard();
+      } else {
+        const retryCard = document.createElement('div'); retryCard.className = 'ac-retry-card';
+        retryCard.innerHTML = `<p>Something went wrong — want to try again?</p>`;
+        const retryBtn = document.createElement('button'); retryBtn.className = 'ac-retry-btn'; retryBtn.textContent = '↻ Retry';
+        retryBtn.onclick = () => { retryCard.remove(); sendMessage(failedMsg); };
+        retryCard.appendChild(retryBtn);
+        insertBefore(retryCard); scrollBottom();
+      }
     }
 
     isBusy = false;
@@ -2928,6 +2960,47 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
   function maybeShowLead() {
     if (!CONFIG.leadCaptureEnabled || leadDone || botMsgs !== CONFIG.leadCaptureAfter) return;
     showLeadCard();
+  }
+
+  // AI brain unreachable (unfunded key / outage) — swap the dead chat for a
+  // no-AI lead form so the visit still converts. Posts to /api/chat/auto-lead,
+  // which ledgers the lead for the dashboard before trying owner alerts.
+  function showOfflineLeadCard() {
+    if (document.getElementById('_ac-ai-offline')) { scrollBottom(); return; }
+    const card = document.createElement('div'); card.id = '_ac-ai-offline';
+    const p = document.createElement('p');
+    p.textContent = `I can't chat right this moment — but leave your details and ${CONFIG.siteName || 'the team'} will get straight back to you.`;
+    const nameInp = document.createElement('input'); nameInp.type = 'text'; nameInp.placeholder = 'Your name';
+    nameInp.setAttribute('aria-label', 'Your name');
+    if (userName) nameInp.value = userName;
+    const contactInp = document.createElement('input'); contactInp.type = 'text'; contactInp.placeholder = 'Phone or email';
+    contactInp.setAttribute('aria-label', 'Phone or email');
+    const btn = document.createElement('button'); btn.textContent = 'Request a callback';
+    btn.onclick = async () => {
+      const contact = contactInp.value.trim();
+      const isEmail = contact.includes('@');
+      const isPhone = !isEmail && /^[+\d][\d\s()-]{6,}$/.test(contact);
+      if (!isEmail && !isPhone) { contactInp.style.borderColor = '#ff4757'; return; }
+      btn.disabled = true; btn.textContent = 'Sending…';
+      try {
+        await fetch(AUTOLEAD_URL, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
+          name: nameInp.value.trim() || userName,
+          email: isEmail ? contact : '',
+          phone: isPhone ? contact : '',
+          ownerEmail: CONFIG.ownerEmail,
+          siteName: CONFIG.siteName || document.title,
+          page: document.title,
+          sessionId: SESSION_ID,
+        }) });
+        card.remove();
+        const first = (nameInp.value.trim() || userName || '').split(' ')[0];
+        makeBotBubble(`Got it${first ? ', ' + first : ''} — the team will be in touch shortly.`);
+        trackEvent('offline_lead_captured', { page: document.title });
+        scrollBottom();
+      } catch { btn.disabled = false; btn.textContent = 'Request a callback'; }
+    };
+    card.appendChild(p); card.appendChild(nameInp); card.appendChild(contactInp); card.appendChild(btn);
+    insertBefore(card); scrollBottom();
   }
 
   // Direct form trigger — used by maybeShowLead's N-messages heuristic AND the
