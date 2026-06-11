@@ -149,3 +149,176 @@ describe('routeChat — safety cap (Rule #10: fail loud)', () => {
     expect(reply).toMatch(/team will be in touch/);
   });
 });
+
+describe('lookup_faq — server-side fallback (W4)', () => {
+  it('falls back to serverFns.lookupServerFaq when canned misses', async () => {
+    const lookupServerFaq = vi.fn(async ({ key, slug }) => ({
+      found: true, answer: 'We open at 9am.', source: 'server_faq',
+    }));
+    const claude = fakeClaude([
+      { content: [toolUseBlock('t1', 'lookup_faq', { key: 'opening_hours' })], stop_reason: 'tool_use' },
+      { content: [textBlock('We open at 9am.')], stop_reason: 'end_turn' },
+    ]);
+    const { toolEvents } = await routeChat({
+      claude, messages: [{ role: 'user', content: 'when do you open?' }],
+      systemPrompt: 'You are Aria.',
+      clientConfig: { slug: 'faq-site', handoffEmail: 'owner@example.com', canned: {} },
+      sessionId: 't6', serverFns: { lookupServerFaq },
+    });
+    expect(lookupServerFaq).toHaveBeenCalledWith({
+      key: 'opening_hours', slug: 'faq-site', ownerEmail: 'owner@example.com',
+    });
+    expect(toolEvents[0].result).toEqual({ found: true, answer: 'We open at 9am.', source: 'server_faq' });
+  });
+
+  it('canned answer still wins over the server lookup', async () => {
+    const lookupServerFaq = vi.fn();
+    const claude = fakeClaude([
+      { content: [toolUseBlock('t1', 'lookup_faq', { key: 'hours' })], stop_reason: 'tool_use' },
+      { content: [textBlock('9-5.')], stop_reason: 'end_turn' },
+    ]);
+    const { toolEvents } = await routeChat({
+      claude, messages: [{ role: 'user', content: 'hours?' }],
+      systemPrompt: 'You are Aria.',
+      clientConfig: { slug: 's', canned: { hours: '9-5' } },
+      sessionId: 't7', serverFns: { lookupServerFaq },
+    });
+    expect(lookupServerFaq).not.toHaveBeenCalled();
+    expect(toolEvents[0].result.found).toBe(true);
+    expect(toolEvents[0].result.answer).toBe('9-5');
+  });
+
+  it('reports not-found when canned misses and server lookup misses', async () => {
+    const claude = fakeClaude([
+      { content: [toolUseBlock('t1', 'lookup_faq', { key: 'parking' })], stop_reason: 'tool_use' },
+      { content: [textBlock('Let me check with the team.')], stop_reason: 'end_turn' },
+    ]);
+    const { toolEvents } = await routeChat({
+      claude, messages: [{ role: 'user', content: 'parking?' }],
+      systemPrompt: 'You are Aria.',
+      clientConfig: { slug: 's', canned: {} },
+      sessionId: 't8', serverFns: { lookupServerFaq: vi.fn(async () => ({ found: false })) },
+    });
+    expect(toolEvents[0].result.found).toBe(false);
+    expect(toolEvents[0].result.hint).toMatch(/system prompt/);
+  });
+});
+
+// ── W7: ::ACTION behaviors ported to real tools ─────────────────────────────
+
+describe('request_callback — ported ::CALLBACK (W7)', () => {
+  it('fires serverFns.requestCallback with owner routing and returns ok', async () => {
+    const requestCallback = vi.fn(async () => {});
+    const claude = fakeClaude([
+      { content: [toolUseBlock('t1', 'request_callback', {
+          name: 'Jord', phone: '07900111222', notes: 'leaky gutter',
+        })], stop_reason: 'tool_use' },
+      { content: [textBlock('Done — someone will call you shortly.')], stop_reason: 'end_turn' },
+    ]);
+    const { toolEvents } = await routeChat({
+      claude, messages: [{ role: 'user', content: 'can someone call me? 07900111222' }],
+      systemPrompt: 'You are Aria.',
+      clientConfig: { slug: 'ej-roofing', handoffEmail: 'owner@example.com', businessName: 'EJ Roofing' },
+      sessionId: 'cb1', serverFns: { requestCallback },
+    });
+    expect(requestCallback).toHaveBeenCalledTimes(1);
+    expect(requestCallback).toHaveBeenCalledWith({
+      name: 'Jord', phone: '07900111222', notes: 'leaky gutter',
+      ownerEmail: 'owner@example.com', siteName: 'EJ Roofing',
+    });
+    expect(toolEvents[0].result).toMatchObject({ ok: true, requested: true, phone: '07900111222' });
+  });
+
+  it('refuses without a phone number and does NOT notify the owner', async () => {
+    const requestCallback = vi.fn();
+    const claude = fakeClaude([
+      { content: [toolUseBlock('t1', 'request_callback', { name: 'Jord' })], stop_reason: 'tool_use' },
+      { content: [textBlock('What number should we call you on?')], stop_reason: 'end_turn' },
+    ]);
+    const { toolEvents } = await routeChat({
+      claude, messages: [{ role: 'user', content: 'call me back' }],
+      systemPrompt: 'You are Aria.',
+      clientConfig: { slug: 'ej', handoffEmail: 'owner@example.com' },
+      sessionId: 'cb2', serverFns: { requestCallback },
+    });
+    expect(toolEvents[0].result.error).toMatch(/phone/i);
+    expect(requestCallback).not.toHaveBeenCalled();
+  });
+});
+
+describe('request_quote — ported ::QUOTE (W7)', () => {
+  it('fires serverFns.requestQuote with details + contact and returns ok', async () => {
+    const requestQuote = vi.fn(async () => {});
+    const claude = fakeClaude([
+      { content: [toolUseBlock('t1', 'request_quote', {
+          name: 'Mrs Jenkins', email: 'mrs@example.com',
+          details: 'Flat roof repair, ~6m², photo shows cracked felt',
+        })], stop_reason: 'tool_use' },
+      { content: [textBlock('Quote request sent!')], stop_reason: 'end_turn' },
+    ]);
+    const { toolEvents } = await routeChat({
+      claude, messages: [{ role: 'user', content: 'how much to fix this?' }],
+      systemPrompt: 'You are Aria.',
+      clientConfig: { slug: 'ej-roofing', handoffEmail: 'owner@example.com' },
+      sessionId: 'q1', serverFns: { requestQuote },
+    });
+    expect(requestQuote).toHaveBeenCalledTimes(1);
+    expect(requestQuote.mock.calls[0][0]).toMatchObject({
+      details: 'Flat roof repair, ~6m², photo shows cracked felt',
+      email: 'mrs@example.com',
+      ownerEmail: 'owner@example.com',
+    });
+    expect(toolEvents[0].result).toMatchObject({ ok: true, requested: true });
+  });
+
+  it('refuses without details', async () => {
+    const requestQuote = vi.fn();
+    const claude = fakeClaude([
+      { content: [toolUseBlock('t1', 'request_quote', { name: 'x' })], stop_reason: 'tool_use' },
+      { content: [textBlock('What do you need quoted?')], stop_reason: 'end_turn' },
+    ]);
+    const { toolEvents } = await routeChat({
+      claude, messages: [{ role: 'user', content: 'quote please' }],
+      systemPrompt: 'You are Aria.',
+      clientConfig: { slug: 's' },
+      sessionId: 'q2', serverFns: { requestQuote },
+    });
+    expect(toolEvents[0].result.error).toMatch(/details/i);
+    expect(requestQuote).not.toHaveBeenCalled();
+  });
+});
+
+describe('client-effect tools — widget renders from the echoed result (W7)', () => {
+  it('show_quick_replies echoes trimmed suggestions capped at 3', async () => {
+    const claude = fakeClaude([
+      { content: [toolUseBlock('t1', 'show_quick_replies', {
+          suggestions: [' Book now ', 'Get a quote', '', 'Opening hours', 'Fourth one'],
+        })], stop_reason: 'tool_use' },
+      { content: [textBlock('Here are some options.')], stop_reason: 'end_turn' },
+    ]);
+    const { toolEvents } = await routeChat({
+      claude, messages: [{ role: 'user', content: 'hi' }],
+      systemPrompt: 'You are Aria.',
+      clientConfig: { slug: 's' },
+      sessionId: 'qr1', serverFns: {},
+    });
+    expect(toolEvents[0].result).toEqual({
+      shown: true,
+      suggestions: ['Book now', 'Get a quote', 'Opening hours'],
+    });
+  });
+
+  it('start_booking_flow echoes the availability flag for the widget', async () => {
+    const claude = fakeClaude([
+      { content: [toolUseBlock('t1', 'start_booking_flow', { show_availability: true })], stop_reason: 'tool_use' },
+      { content: [textBlock("Here's what's free.")], stop_reason: 'end_turn' },
+    ]);
+    const { toolEvents } = await routeChat({
+      claude, messages: [{ role: 'user', content: 'when are you free?' }],
+      systemPrompt: 'You are Aria.',
+      clientConfig: { slug: 's' },
+      sessionId: 'bk1', serverFns: {},
+    });
+    expect(toolEvents[0].result).toEqual({ started: true, show_availability: true });
+  });
+});

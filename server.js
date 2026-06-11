@@ -47,17 +47,17 @@ import { promises as fsp } from 'node:fs';
 import { routeChat }                    from './lib/lead_router.js';
 import { decideLeadAction, policyAddendum } from './lib/lead_policy.js';
 import { scoreChannelLead, categorizeChannelMessage } from './lib/channel_lead_scorer.js';
-import { retrieveRelevantChunks } from './lib/rag_retriever.js';
+import { retrieveRelevantChunks, tokenise } from './lib/rag_retriever.js';
 import { buildIcsEvent, parseBookingDateTime } from './lib/ics_builder.js';
 import { scheduleTask, cancelTask, listPending, bootstrapFromLedger, registerTaskHandler, startTickLoop } from './lib/outbound_scheduler.js';
 import { ltvScore, ltvTier } from './lib/customer_ltv.js';
-import { evaluateSchedule } from './lib/business_hours.js';
+import { evaluateSchedule, nextOpenTime } from './lib/business_hours.js';
 import { dispatchWebhook, readWebhookLog, signPayload as signWebhookPayload } from './lib/webhook_dispatcher.js';
 import { extractImageRefs, resolveImageRefsToBlocks } from './lib/image_intake.js';
 import { extractAudioRefs, transcribeAudioRef } from './lib/audio_intake.js';
 import { findBookingConflicts, describeConflictsForCustomer } from './lib/booking_conflicts.js';
 import { canBatch as digestCanBatch, shouldFireDigest, renderDigestHtml } from './lib/digest.js';
-import { verifyVapiSignature, buildAssistantConfig, extractCallReport, extractToolCall, provisionVapiNumber, releaseVapiNumber } from './lib/vapi_handler.js';
+import { verifyVapiSignature, buildAssistantConfig, extractCallReport, extractToolCall, provisionVapiNumber, releaseVapiNumber, isMissedCall } from './lib/vapi_handler.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 
@@ -269,7 +269,10 @@ app.options('*', cors(corsOpts));
 app.use('/api/shopify/webhook', express.raw({ type: 'application/json' }));
 app.use('/api/meta/webhook', express.raw({ type: 'application/json' }));
 app.use('/api/vapi/webhook', express.raw({ type: '*/*' })); // raw for HMAC signature verify
-app.use(express.json());
+// 8mb — W8: widget photo→quote sends base64 images inside the router chat
+// body (widget caps files at 5MB; base64 inflates ~1.37x). Default 100kb
+// would 413 every image upload.
+app.use(express.json({ limit: '8mb' }));
 app.use('/chatbot.js', (req, res, next) => {
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.set('Pragma', 'no-cache');
@@ -2236,6 +2239,112 @@ function buildBusinessContext() {
   return `\n\n--- BUSINESS INFORMATION ---\nYou work for this business. Use the information below to answer customer questions accurately. If asked something not covered here, say you'll check with the team rather than guessing.\n\n${lines.join('\n')}\n--- END BUSINESS INFORMATION ---`;
 }
 
+// W6 — language rule for the widget paths. The channel pipeline already
+// carries "reply in the customer's language" in its structured-reply prompt;
+// the widget prompt is built client-side, so the server appends the rule here.
+const WIDGET_LANGUAGE_RULE = '\n\nLANGUAGE: detect the language the visitor is writing in and WRITE YOUR REPLY IN THAT SAME LANGUAGE. If they switch language mid-conversation, follow them. Default to English when unclear.';
+
+// W8 — appended to the router prompt when the conversation carries image
+// blocks. Mirrors the channel pipeline's "LOOK at them" rule so widget photos
+// feed the quote pipeline instead of getting a generic reply.
+const WIDGET_PHOTO_RULE = '\n\nPHOTOS: the visitor has attached photo(s) in this conversation. LOOK at them carefully — describe what you actually see, point out anything relevant to the job (damage, size, materials, condition), and use it to give specific advice or gather what is needed for a quote (then call request_quote). Never answer generically when a photo is present.';
+
+// True when any message carries an Anthropic image content block.
+function messagesHaveImages(messages) {
+  return (messages || []).some(m => Array.isArray(m?.content) && m.content.some(b => b?.type === 'image'));
+}
+
+// W8 — keep base64 image payloads out of the persisted session store. The
+// model gets the real blocks on the live request; the session ledger only
+// needs a text note (mirrors how channels persist photo turns).
+function stripImageBlocks(messages) {
+  return (messages || []).map(m => {
+    if (!Array.isArray(m?.content) || !m.content.some(b => b?.type === 'image')) return m;
+    const text = m.content.filter(b => b?.type === 'text').map(b => b.text).join(' ').trim();
+    return { ...m, content: `[photo attached] ${text}`.trim() };
+  });
+}
+
+// Pull the most recent user-authored text out of an Anthropic messages array
+// (content may be a plain string or a block array). Used as the RAG query.
+function lastUserText(messages) {
+  for (let i = (messages?.length || 0) - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role !== 'user') continue;
+    if (typeof m.content === 'string') return m.content;
+    if (Array.isArray(m.content)) {
+      const t = m.content.filter(b => b?.type === 'text').map(b => b.text).join(' ');
+      if (t) return t;
+    }
+  }
+  return '';
+}
+
+// W4 — server-side knowledge injection for the legacy widget paths
+// (/api/chat + /api/chat/stream). Mirrors the channel pipeline's kbContext +
+// ragContext (server.js channel handler) so website visitors get the same
+// owner KB docs and approved learning-loop FAQs the channels use. Returns ''
+// when there is nothing to inject. knowledgeBase / knowledgeDocs / faqs are
+// module-level stores declared elsewhere — this runs at request time, after
+// they are initialised.
+function buildWidgetKnowledgeContext({ ownerEmail, slug, query }) {
+  let out = '';
+  // Owner's manual FAQ entries (same source as the channel kbContext) +
+  // approved FAQ map entries: legacy admin FAQs carry no slug (global by
+  // design — /api/faqs already serves them to every widget), learning-loop
+  // promotions are slug-scoped.
+  const kbEntries = ownerEmail ? (knowledgeBase.get(ownerEmail) || []) : [];
+  const approvedFaqs = [...faqs.values()].filter(f => f.approved && (!f.slug || !slug || f.slug === slug));
+  const faqLines = [
+    ...kbEntries.map(e => `Q: ${e.question}\nA: ${e.answer}`),
+    ...approvedFaqs.map(f => `Q: ${f.question}\nA: ${f.answer}`),
+  ];
+  if (faqLines.length) {
+    out += '\n\nFREQUENTLY ASKED QUESTIONS:\n' + faqLines.slice(0, 30).join('\n\n');
+  }
+  // RAG over the owner's uploaded knowledge docs — same retriever + shape as
+  // the channel pipeline's ragContext.
+  const ownerDocs = ownerEmail ? (knowledgeDocs.get(ownerEmail) || []) : [];
+  const ragChunks = (ownerDocs.length && query) ? retrieveRelevantChunks(query, ownerDocs, { topK: 3 }) : [];
+  if (ragChunks.length) {
+    out += '\n\nRELEVANT DOCUMENT EXCERPTS (cite these for accuracy — DO NOT make up details not in them):\n' +
+      ragChunks.map(c => `[from "${c.title}"] ${c.content}`).join('\n\n');
+  }
+  return out;
+}
+
+// W4 — server-side FAQ + knowledge-doc lookup backing the router brain's
+// lookup_faq tool (exposed to lib/tool_handlers.js via serverFns). Searches
+// the approved FAQ map (manual + learning-loop promotions) by token overlap,
+// then falls back to the owner's knowledge docs through the same RAG
+// retriever the channel pipeline uses.
+function lookupServerFaq({ key, slug, ownerEmail }) {
+  const query = String(key || '').replace(/_/g, ' ');
+  const qTokens = tokenise(query);
+  if (qTokens.length) {
+    let best = null;
+    for (const f of faqs.values()) {
+      if (!f.approved) continue;
+      if (f.slug && slug && f.slug !== slug) continue;
+      const fTokens = new Set(tokenise(f.question || ''));
+      const overlap = qTokens.filter(t => fTokens.has(t)).length;
+      if (overlap > 0 && (!best || overlap > best.overlap)) best = { overlap, f };
+    }
+    if (best) {
+      best.f.hits = (best.f.hits || 0) + 1;
+      return { found: true, answer: best.f.answer, question: best.f.question, source: 'server_faq' };
+    }
+  }
+  if (ownerEmail) {
+    const docs = knowledgeDocs.get(ownerEmail) || [];
+    const chunks = docs.length ? retrieveRelevantChunks(query, docs, { topK: 2 }) : [];
+    if (chunks.length) {
+      return { found: true, answer: chunks.map(c => `[from "${c.title}"] ${c.content}`).join('\n'), source: 'knowledge_docs' };
+    }
+  }
+  return { found: false };
+}
+
 function currentMonth() { return new Date().toISOString().slice(0, 7); }
 
 function trackUsage(inputTokens = 0, outputTokens = 0) {
@@ -2815,6 +2924,34 @@ async function createCalendarEvent(ownerEmail, booking) {
   }
 }
 
+// W2 — single-slot busy check against the owner's REAL Google Calendar.
+// Same freebusy path /api/calendar/availability uses, scoped to one window.
+// Returns false (not busy) when the calendar isn't connected or the time is
+// unparseable — the bookings[] conflict gate remains the backstop, so a
+// failed check degrades to today's behaviour instead of blocking bookings.
+async function isOwnerCalendarBusy(ownerEmail, datetime, durationMin = 60) {
+  const entry = gmailTokens.get(ownerEmail);
+  if (!entry) return false;
+  const start = new Date(datetime);
+  if (isNaN(start.getTime())) return false;
+  const end = new Date(start.getTime() + (Number(durationMin) > 0 ? Number(durationMin) : 60) * 60 * 1000);
+  try {
+    const calendar = google.calendar({ version: 'v3', auth: entry.auth });
+    const { data } = await calendar.freebusy.query({
+      requestBody: {
+        timeMin: start.toISOString(),
+        timeMax: end.toISOString(),
+        timeZone: 'Europe/London',
+        items: [{ id: 'primary' }],
+      },
+    });
+    return (data.calendars?.primary?.busy || []).length > 0;
+  } catch (e) {
+    console.warn(`[booking] calendar busy-check failed for ${ownerEmail}:`, e.message);
+    return false;
+  }
+}
+
 // ─── Gmail Connect Routes ─────────────────────────────────────────────────────
 
 // Connection page — owner visits this URL to connect their Gmail
@@ -2962,6 +3099,17 @@ app.post('/api/dashboard/login', (req, res) => {
   }
   const token = createSession(owner);
   res.json({ ok: true, token });
+});
+
+// Logout — invalidate the session token server-side. (The old inline dashboard
+// only dropped ?s= from the URL and left the token valid for 7 days.)
+app.post('/api/dashboard/logout', (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  const token = req.query.s || req.headers['x-session-token'];
+  dashboardSessions.delete(token);
+  persistSessions();
+  res.json({ ok: true });
 });
 
 // Reset password (requires current password)
@@ -4030,14 +4178,22 @@ app.post('/disconnect/gmail', (req, res) => {
 app.post('/api/chat', async (req, res) => {
   if (!checkRate(req.ip)) return res.status(429).json({ error:'Rate limited' });
   if (isOverCap()) return res.status(429).json({ error:'Monthly message limit reached — please try again next month.' });
-  const { system, messages, model, max_tokens, sessionId } = req.body;
+  const { system, messages, model, max_tokens, sessionId, clientConfig = {} } = req.body;
   if (!messages?.length) return res.status(400).json({ error:'Invalid messages' });
   if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error:'API key not configured' });
   try {
+    // W4 — owner KB docs + approved learning FAQs reach website visitors,
+    // not just channels. The widget already sends clientConfig on every
+    // request; single-tenant embeds without it degrade to '' silently.
+    const widgetKnowledge = buildWidgetKnowledgeContext({
+      ownerEmail: clientConfig.handoffEmail || clientConfig.ownerEmail || null,
+      slug: clientConfig.slug || deriveSlugFromRequest(req) || null,
+      query: lastUserText(messages),
+    });
     const r = await claude.messages.create({
       model:      model || 'claude-haiku-4-5-20251001',
       max_tokens: max_tokens || 500,
-      system:     (system || 'You are a helpful assistant.') + buildBusinessContext(),
+      system:     (system || 'You are a helpful assistant.') + buildBusinessContext() + widgetKnowledge + WIDGET_LANGUAGE_RULE,
       messages:   messages.slice(-24),
     });
     trackUsage(r.usage?.input_tokens || 0, r.usage?.output_tokens || 0);
@@ -4415,9 +4571,21 @@ app.post('/api/chat/router', async (req, res) => {
         + (clientConfig.isOutOfHours ? '- It is currently outside business hours — set expectations about response time.\n' : '')
       : '';
 
+    // W4 parity — the router prompt gets everything the legacy path gets:
+    // page-crawl context arrives inside `system` (built widget-side), and the
+    // owner KB docs + approved learning-loop FAQs are injected here, same as
+    // /api/chat + /api/chat/stream.
+    const widgetKnowledge = buildWidgetKnowledgeContext({
+      ownerEmail: clientConfig.handoffEmail || clientConfig.ownerEmail || null,
+      slug: clientConfig.slug || deriveSlugFromRequest(req) || null,
+      query: lastUserText(messages),
+    });
     const fullPrompt = (system || 'You are a helpful assistant.')
       + buildBusinessContext()
+      + widgetKnowledge
       + pageContext
+      + (messagesHaveImages(messages) ? WIDGET_PHOTO_RULE : '')
+      + WIDGET_LANGUAGE_RULE
       + '\n\n' + policyAddendum(action);
 
     const { reply, toolEvents, warning, stopReason, usage } = await routeChat({
@@ -4426,7 +4594,8 @@ app.post('/api/chat/router', async (req, res) => {
       systemPrompt: fullPrompt,
       clientConfig: { ...clientConfig, serverBaseUrl: `${req.protocol}://${req.get('host')}` },
       sessionId,
-      serverFns: { smartSend, sendWhatsAppMessage },
+      serverFns: { smartSend, sendWhatsAppMessage, lookupServerFaq,
+                   requestCallback: processCallbackRequest, requestQuote: processQuoteRequest },
       model: model || 'claude-sonnet-4-6',
       maxTokens: max_tokens || 800,
     });
@@ -4436,7 +4605,7 @@ app.post('/api/chat/router', async (req, res) => {
     // tool-use router silently bypassed the cap (Codex B2).
     if (usage) trackUsage(usage.inputTokens, usage.outputTokens);
     if (warning) console.warn('[aria/router]', warning); // Rule #10 — fail loud
-    if (sessionId) saveSession(sessionId, { messages: messages.slice(-24) });
+    if (sessionId) saveSession(sessionId, { messages: stripImageBlocks(messages.slice(-24)) });
 
     // Track the qualify_lead score back to clientConfig so the next turn can
     // re-evaluate policy with up-to-date info. Widget should persist this.
@@ -4538,9 +4707,19 @@ app.post('/api/chat/router/stream', async (req, res) => {
         + (clientConfig.isOutOfHours ? '- It is currently outside business hours — set expectations about response time.\n' : '')
       : '';
 
+    // W4 parity — same owner KB + approved-FAQ injection as /api/chat/stream,
+    // plus the photo rule when the conversation carries image blocks (W8).
+    const widgetKnowledge = buildWidgetKnowledgeContext({
+      ownerEmail: clientConfig.handoffEmail || clientConfig.ownerEmail || null,
+      slug: clientConfig.slug || deriveSlugFromRequest(req) || null,
+      query: lastUserText(messages),
+    });
     const fullPrompt = (system || 'You are a helpful assistant.')
       + buildBusinessContext()
+      + widgetKnowledge
       + pageContext
+      + (messagesHaveImages(messages) ? WIDGET_PHOTO_RULE : '')
+      + WIDGET_LANGUAGE_RULE
       + '\n\n' + policyAddendum(action);
 
     const { streamRouteChat } = await import('./lib/lead_router_stream.js');
@@ -4550,7 +4729,8 @@ app.post('/api/chat/router/stream', async (req, res) => {
       systemPrompt: fullPrompt,
       clientConfig: { ...clientConfig, serverBaseUrl: `${req.protocol}://${req.get('host')}` },
       sessionId,
-      serverFns: { smartSend, sendWhatsAppMessage },
+      serverFns: { smartSend, sendWhatsAppMessage, lookupServerFaq,
+                   requestCallback: processCallbackRequest, requestQuote: processQuoteRequest },
       onTextDelta: t => { if (!aborted) sse({ text: t }); },
       onToolEvent: e => { if (!aborted) sse({ tool: e.name, result: e.result }); },
       // Lets the router actually abort the upstream Anthropic stream + skip
@@ -4563,7 +4743,7 @@ app.post('/api/chat/router/stream', async (req, res) => {
     // Track usage even on aborted streams — tokens already crossed the wire.
     if (usage) trackUsage(usage.inputTokens, usage.outputTokens);
     if (warning) console.warn('[aria/router-stream]', warning);
-    if (sessionId) saveSession(sessionId, { messages: messages.slice(-24) });
+    if (sessionId) saveSession(sessionId, { messages: stripImageBlocks(messages.slice(-24)) });
 
     // Funnel analytics — same shape as non-streaming router. We don't record
     // aborts as `chat_message` because no full exchange occurred.
@@ -4683,18 +4863,69 @@ app.get('/api/pending/confirm', async (req, res) => {
         return res.status(502).send('WhatsApp send failed. Check server logs.');
       }
     } else if (row.kind === 'book_calendar_slot') {
-      // Each client's calendar auth is per-account — full calendar.events.insert
-      // wiring is a follow-up. For now: email the owner with the booking details
-      // so they confirm by hand. Visitor was told "we'll confirm within 1 hour".
+      // W2 — real booking confirm. Conflict-gate against Aria's own bookings
+      // ledger AND the owner's actual Google Calendar (same freebusy path
+      // /api/calendar/availability uses), then create the real calendar event
+      // via the existing createCalendarEvent and append to bookings[] — the
+      // same ledger the channel + voice pipelines write.
       const b = row.payload;
       const ownerEmail = row.owner?.handoffEmail || process.env.NOTIFY_EMAIL;
-      if (ownerEmail) {
+      if (!ownerEmail) {
+        console.error('[aria/pending] cannot book — no owner email on staged row', row.id);
+        return res.status(500).send('No owner email configured for this client');
+      }
+      const durationMin = Number(b.duration_minutes) > 0 ? Number(b.duration_minutes) : 60;
+      const ownerBookings = bookings.filter(x => x.ownerEmail === ownerEmail);
+      const ledgerConflicts = findBookingConflicts({ newDatetime: b.iso_start, durationMin, existing: ownerBookings, bufferMin: 0 });
+      const calendarBusy = ledgerConflicts.length === 0 && await isOwnerCalendarBusy(ownerEmail, b.iso_start, durationMin);
+      if (ledgerConflicts.length > 0 || calendarBusy) {
+        // Slot got taken between stage and confirm. Fail loud (Rule #10):
+        // tell the owner so they can offer the visitor a new time, and mark
+        // the row executed so the link can't be replayed into a double-book.
+        fireWebhookEvent(ownerEmail, 'booking_conflict_blocked', {
+          channel: 'web', senderName: b.visitor_name,
+          datetime: b.iso_start, service: b.service || null,
+          reason: ledgerConflicts.length > 0 ? 'existing_booking' : 'google_calendar_busy',
+        });
         await smartSend({
           ownerEmail, to: ownerEmail,
-          subject: `Aria booking request — ${b.visitor_name}`,
-          html: `<p>Tentative booking:</p><pre>${JSON.stringify(b, null, 2)}</pre>`
-        });
+          subject: `⚠️ Aria booking clash — ${b.visitor_name} (${b.iso_start})`,
+          html: `<p><b>${escapeHtml(b.visitor_name || 'A visitor')}</b> asked for <b>${escapeHtml(b.iso_start)}</b> but that slot is now taken${calendarBusy ? ' in your Google Calendar' : ''}.</p>
+                 <p>Contact them to offer an alternative: ${escapeHtml(b.visitor_contact || 'no contact captured')}</p>`,
+        }).catch(e => console.warn('[aria/pending] clash email failed:', e.message));
+        await fsp.appendFile(resolve('data', 'pending_actions.jsonl'),
+          JSON.stringify({ ...row, executed_at: new Date().toISOString(), result: 'conflict' }) + '\n');
+        return res.send('That slot is no longer free — the visitor needs a new time. Details emailed to you.');
       }
+      const calEvent = await createCalendarEvent(ownerEmail, {
+        name: b.visitor_name,
+        email: b.visitor_contact?.includes('@') ? b.visitor_contact : '',
+        datetime: b.iso_start,
+        notes: [b.service ? `Service: ${b.service}` : '', b.visitor_contact ? `Contact: ${b.visitor_contact}` : '', 'Booked via Aria (website chat)'].filter(Boolean).join('\n'),
+        siteName: row.owner?.slug || row.client || 'website chat',
+      });
+      const bookingRecord = {
+        name: b.visitor_name,
+        email: b.visitor_contact?.includes('@') ? b.visitor_contact : null,
+        contact: b.visitor_contact || null,
+        service: b.service || null,
+        datetime: b.iso_start,
+        durationMin,
+        channel: 'web', source: 'router_tool',
+        ownerEmail,
+        calendarLink: calEvent?.htmlLink || null,
+        ts: new Date().toISOString(),
+      };
+      bookings.push(bookingRecord);
+      save('bookings', bookings);
+      fireWebhookEvent(ownerEmail, 'new_booking', { channel: 'web', senderName: b.visitor_name, booking: bookingRecord });
+      await smartSend({
+        ownerEmail, to: ownerEmail,
+        subject: `📅 Aria booking confirmed — ${b.visitor_name}`,
+        html: `<p>Booking confirmed for <b>${escapeHtml(b.visitor_name || 'visitor')}</b> at <b>${escapeHtml(b.iso_start)}</b>${b.service ? ` (${escapeHtml(b.service)})` : ''}.</p>
+               ${calEvent?.htmlLink ? `<p><a href="${calEvent.htmlLink}">View in Google Calendar</a></p>` : '<p>⚠️ Google Calendar event could not be created — add it manually.</p>'}
+               <p>Visitor contact: ${escapeHtml(b.visitor_contact || 'not captured')}</p>`,
+      }).catch(e => console.warn('[aria/pending] booking email failed:', e.message));
     } else {
       return res.status(400).send(`Unknown pending kind: ${row.kind}`);
     }
@@ -4720,7 +4951,7 @@ app.post('/api/chat/stream', async (req, res) => {
   if (!checkRate(req.ip)) { sse({ error:'Rate limited' }); return res.end(); }
   if (isOverCap()) { sse({ error:'Monthly message limit reached — please try again next month.' }); return res.end(); }
   if (!process.env.ANTHROPIC_API_KEY) { sse({ error:'API key not configured — add ANTHROPIC_API_KEY to your .env file' }); return res.end(); }
-  const { system, messages, model, max_tokens, sessionId } = req.body;
+  const { system, messages, model, max_tokens, sessionId, clientConfig = {} } = req.body;
   if (!messages?.length) { sse({ error:'Invalid' }); return res.end(); }
   // res.on('close') — Node 24+ emits req 'close' when the body stream is
   // consumed (right after express.json()), which would falsely flag aborted=true
@@ -4728,10 +4959,16 @@ app.post('/api/chat/stream', async (req, res) => {
   let aborted = false;
   res.on('close', () => { aborted = true; });
   try {
+    // W4 — same owner KB + approved-FAQ injection as /api/chat.
+    const widgetKnowledge = buildWidgetKnowledgeContext({
+      ownerEmail: clientConfig.handoffEmail || clientConfig.ownerEmail || null,
+      slug: clientConfig.slug || deriveSlugFromRequest(req) || null,
+      query: lastUserText(messages),
+    });
     const stream = claude.messages.stream({
       model:      model || 'claude-haiku-4-5-20251001',
       max_tokens: max_tokens || 500,
-      system:     (system || 'You are a helpful assistant.') + buildBusinessContext(),
+      system:     (system || 'You are a helpful assistant.') + buildBusinessContext() + widgetKnowledge + WIDGET_LANGUAGE_RULE,
       messages:   messages.slice(-24),
     });
     res.on('close', () => { try { stream.abort(); } catch {} });
@@ -4952,6 +5189,36 @@ app.post('/api/booking', async (req, res) => {
     { type:'header', text:{ type:'plain_text', text:'📅 New Booking' + (calEvent ? ' — Added to Calendar ✓' : '') } },
     { type:'section', text:{ type:'mrkdwn', text:`*${b.name}* (${b.email}) — *${b.datetime}*\nSite: ${b.siteName||b.page}${calEvent?.htmlLink ? '\n<'+calEvent.htmlLink+'|View in Google Calendar>' : ''}` } },
   ], `Booking from ${b.name}`);
+
+  // 5. W5 — review-request parity: widget-form bookings get the same
+  //    post-visit review ask channel bookings do (confirmAndShipBooking).
+  //    Handler no-ops cleanly when the owner hasn't configured reviewRequest,
+  //    so always scheduling is safe. Email-only delivery (no channel senderId).
+  try {
+    const parsedReview = parseBookingDateTime(b.datetime);
+    if (parsedReview && b.email && alertTo) {
+      const ownerReviewCfg = getOwnerProfile(alertTo)?.profile?.reviewRequest
+                          || getOwnerProfile(alertTo)?.config?.reviewRequest
+                          || {};
+      const reviewDelayH = Number(ownerReviewCfg.delayHours) > 0 ? Number(ownerReviewCfg.delayHours) : 24;
+      const reviewAt = parsedReview.getTime() + reviewDelayH * 60 * 60 * 1000;
+      if (reviewAt > Date.now() + 60_000) {
+        scheduleTask({
+          type: 'review_request',
+          dueAt: reviewAt,
+          ownerEmail: alertTo,
+          payload: {
+            channel: 'web', senderId: null, senderName: b.name,
+            customerName: b.name,
+            customerEmail: b.email,
+            service: b.service || b.notes || null,
+            datetime: b.datetime,
+          },
+        });
+        console.log(`⭐ [booking] Review request scheduled (web form) for ${new Date(reviewAt).toISOString()}`);
+      }
+    }
+  } catch (e) { console.warn('[booking] schedule review request failed:', e.message); }
 
   res.json({ ok:true, calendarAdded: !!calEvent, calendarLink: b.calendarLink });
 });
@@ -5574,9 +5841,10 @@ app.get('/api/calendar/availability', async (req, res) => {
 });
 
 // Callback request — visitor wants a call back
-app.post('/api/chat/callback', async (req, res) => {
-  const { name, phone, ownerEmail, siteName, botName, notes } = req.body;
-  if (!phone) return res.status(400).json({ error: 'Phone number required' });
+// W7 — shared by POST /api/chat/callback (legacy widget ::CALLBACK tag) and
+// the router brain's request_callback tool, so both paths fire the exact same
+// owner notification + Slack alert + calendar entry.
+async function processCallbackRequest({ name, phone, ownerEmail, siteName, notes }) {
   const alertTo = ownerTo(ownerEmail);
 
   await smartSend({
@@ -5610,14 +5878,19 @@ app.post('/api/chat/callback', async (req, res) => {
       timezone: 'Europe/London',
     }).catch(() => {});
   }
+}
 
+app.post('/api/chat/callback', async (req, res) => {
+  const { name, phone, ownerEmail, siteName, notes } = req.body;
+  if (!phone) return res.status(400).json({ error: 'Phone number required' });
+  await processCallbackRequest({ name, phone, ownerEmail, siteName, notes });
   res.json({ ok: true });
 });
 
-// Quote request — visitor wants a quote
-app.post('/api/chat/quote', async (req, res) => {
-  const { name, email, phone, details, ownerEmail, siteName, botName } = req.body;
-  if (!details) return res.status(400).json({ error: 'Details required' });
+// W7 — shared by POST /api/chat/quote (legacy widget ::QUOTE tag) and the
+// router brain's request_quote tool. Owner email + lead record + Slack +
+// calendar, identical on both paths.
+async function processQuoteRequest({ name, email, phone, details, ownerEmail, siteName }) {
   const alertTo = ownerTo(ownerEmail);
 
   await smartSend({
@@ -5660,7 +5933,13 @@ app.post('/api/chat/quote', async (req, res) => {
       timezone: 'Europe/London',
     }).catch(() => {});
   }
+}
 
+// Quote request — visitor wants a quote
+app.post('/api/chat/quote', async (req, res) => {
+  const { name, email, phone, details, ownerEmail, siteName } = req.body;
+  if (!details) return res.status(400).json({ error: 'Details required' });
+  await processQuoteRequest({ name, email, phone, details, ownerEmail, siteName });
   res.json({ ok: true });
 });
 
@@ -6413,9 +6692,12 @@ app.get('/admin/analytics/:slug', (req, res) => {
 // Same data as /admin/analytics/:slug but behind the CLIENT's auth (X-Aria-Token)
 // so each owner can see their own funnel without master admin access. Slug is
 // derived from the verified token — clients can never see another client's data.
-app.get('/api/dashboard/analytics', (req, res) => {
+app.get('/api/dashboard/analytics', (req, res, next) => {
   const token = req.get('X-Aria-Token') || '';
   const slugQuery = String(req.query.slug || '').toLowerCase();
+  // Owner-session requests (?owner=&s=) belong to the client-dashboard handler
+  // registered later on this same path — fall through to it.
+  if (!slugQuery && req.query.owner && req.query.s) return next();
   if (!slugQuery) return res.status(400).json({ error: 'slug query param required' });
   const verified = verifyAdminToken(token, slugQuery);
   if (!verified) return res.status(401).json({ error: 'not authenticated' });
@@ -11742,6 +12024,16 @@ app.post('/api/dashboard/channel-disconnect', (req, res) => {
 });
 
 // GET /dashboard — Client Dashboard Page
+// Static dashboard app assets (no auth — the app authenticates via ?owner=&s=
+// and every API call re-validates server-side). Mounted on /dashboard/assets
+// so it can never shadow the auth-gated GET /dashboard below.
+app.use('/dashboard/assets', express.static(resolve('public/dashboard')));
+
+// Login page is intentionally unauthenticated — it IS the auth step.
+app.get('/dashboard/login.html', (req, res) => {
+  res.sendFile(resolve('public/dashboard/login.html'));
+});
+
 app.get('/dashboard', (req, res) => {
   const ownerEmail = req.query.owner || '';
   const sessionToken = req.query.s || '';
@@ -11757,52 +12049,8 @@ app.get('/dashboard', (req, res) => {
 
   // Has password but not authenticated → show login
   if (!isAuthenticated) {
-    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Aria — Login</title>
-    <style>
-      *{box-sizing:border-box;margin:0;padding:0}
-      body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d0d1f;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;color:#eee;}
-      .box{background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:36px;max-width:400px;width:100%;text-align:center;}
-      .logo span{font-size:28px;font-weight:800;color:#fff;letter-spacing:-0.5px;}
-      .logo span em{font-style:normal;color:#00e5a0;}
-      h2{font-size:18px;margin:24px 0 8px;}
-      p{font-size:13px;color:#9898b8;margin-bottom:20px;}
-      .email-badge{display:inline-block;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:5px 14px;font-size:13px;color:#fff;font-weight:600;margin-bottom:20px;}
-      input[type=password]{width:100%;padding:14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;font-size:15px;color:#eee;font-family:inherit;outline:none;text-align:center;letter-spacing:2px;margin-bottom:16px;}
-      input[type=password]:focus{border-color:rgba(0,229,160,0.4);}
-      .btn{display:block;width:100%;padding:14px;background:#00e5a0;color:#0d0d1f;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;}
-      .btn:hover{opacity:.88;}
-      .msg{padding:10px;border-radius:8px;font-size:13px;margin-bottom:14px;display:none;}
-      .msg.error{display:block;background:rgba(255,80,80,0.1);border:1px solid rgba(255,80,80,0.2);color:#ff6b6b;}
-      .footer{margin-top:24px;font-size:12px;color:#6b6b8a;}
-      .footer a{color:#00e5a0;text-decoration:none;}
-    </style>
-    </head><body>
-    <div class="box">
-      <div class="logo"><span>Aria<em>Ai</em></span></div>
-      <h2>Welcome back</h2>
-      <div class="email-badge">${ownerEmail}</div>
-      <div id="msg" class="msg"></div>
-      <input type="password" id="pw" placeholder="Enter your password" autofocus onkeydown="if(event.key==='Enter')login()">
-      <button class="btn" onclick="login()">Login</button>
-      <div class="footer">Powered by <a href="https://aireyai.co.uk">AireyAi</a></div>
-    </div>
-    <script>
-      async function login() {
-        const pw = document.getElementById('pw').value;
-        if (!pw) return;
-        const r = await fetch('/api/dashboard/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({owner:'${ownerEmail}',password:pw}) });
-        const data = await r.json();
-        if (data.ok) {
-          window.location.href = '/dashboard?owner=${encodeURIComponent(ownerEmail)}&s=' + data.token;
-        } else {
-          const el = document.getElementById('msg');
-          el.textContent = data.error || 'Wrong password';
-          el.className = 'msg error';
-        }
-      }
-    </script>
-    </body></html>`);
+    // Static login page — reads ?owner= client-side (public/dashboard/login.html).
+    return res.sendFile(resolve('public/dashboard/login.html'));
   }
 
   // Authenticated — route brand-new owners through the wizard.
@@ -11830,2638 +12078,10 @@ app.get('/dashboard', (req, res) => {
     return res.redirect(`/start?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}`);
   }
 
-  // Authenticated — serve the full dashboard
-  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Aria — Dashboard</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<style>
-/* ── Institutional design system — "AI Command Center" ───────────────── */
-:root{
-  /* surfaces (kept close to originals so inline-styled sections stay coherent) */
-  --bg:#0b0b16; --surface-1:#14142099; --surface-2:#161630; --surface-3:#1c1c34;
-  --line:rgba(255,255,255,0.07); --line-2:rgba(255,255,255,0.12);
-  /* one clean 3-step neutral text scale (replaces the 5 mismatched greys) */
-  --text:#f1f1f7; --text-2:#a6a6bf; --text-3:#6c6c85;
-  /* single accent + semantics */
-  --accent:#00e5a0; --accent-ink:#04130d;
-  --accent-06:rgba(0,229,160,0.06); --accent-12:rgba(0,229,160,0.12); --accent-30:rgba(0,229,160,0.30);
-  --danger:#ff6b6b; --warn:#fbbf24; --info:#38bdf8; --violet:#9d96ff;
-  /* radius + elevation scale */
-  --r-sm:9px; --r-md:13px; --r-lg:17px; --r-xl:22px; --r-full:999px;
-  --shadow-1:0 1px 2px rgba(0,0,0,0.3);
-  --shadow-2:0 8px 24px -8px rgba(0,0,0,0.5),0 2px 6px rgba(0,0,0,0.3);
-  --shadow-glow:0 0 0 1px var(--accent-30),0 8px 30px -10px rgba(0,229,160,0.25);
-  /* One disciplined grotesque across the board — institutional, systematic,
-     professional. Hierarchy comes from weight + size, not a second family. */
-  --font-display:'Geist',system-ui,-apple-system,sans-serif;
-  --font-body:'Geist',system-ui,-apple-system,sans-serif;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:var(--font-body);background:var(--bg);min-height:100vh;color:var(--text);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
-  /* layered atmosphere: two faint radial glows + a hairline grain — depth without noise */
-  background-image:radial-gradient(900px 500px at 12% -8%,rgba(0,229,160,0.06),transparent 60%),radial-gradient(800px 600px at 110% 0%,rgba(91,79,232,0.07),transparent 55%);
-  background-attachment:fixed;}
-h1,h2,h3,h4,.stat-card .value,.hero-metric .v,.hero-title{font-family:var(--font-display);letter-spacing:-0.02em;}
-a{color:var(--accent);text-decoration:none;}
-::selection{background:var(--accent-30);color:#fff;}
-:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px;}
-*::-webkit-scrollbar{width:10px;height:10px;}
-*::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.08);border-radius:99px;border:2px solid transparent;background-clip:padding-box;}
-*::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,0.16);background-clip:padding-box;}
-.topbar{position:sticky;top:0;z-index:100;background:rgba(11,11,22,0.82);backdrop-filter:blur(18px) saturate(1.4);border-bottom:1px solid var(--line);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;}
-.topbar .logo span{font-family:var(--font-display);font-size:22px;font-weight:800;color:#fff;letter-spacing:-0.4px;}
-.topbar .logo em{font-style:normal;color:var(--accent);}
-.topbar .right{display:flex;align-items:center;gap:12px;}
-.email-badge{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:4px 12px;font-size:12px;color:#ccc;font-weight:500;}
-/* Hero status */
-.hero{position:relative;background:linear-gradient(135deg,#15152e 0%,#191940 100%);border:1px solid var(--line-2);border-radius:var(--r-xl);padding:26px;margin-bottom:18px;display:grid;grid-template-columns:auto 1fr auto;gap:24px;align-items:center;box-shadow:var(--shadow-2);overflow:hidden;}
-.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(420px 180px at 88% -40%,var(--accent-12),transparent 70%);pointer-events:none;}
-.hero-status{display:flex;align-items:center;gap:14px;}
-.hero-dot{width:14px;height:14px;border-radius:50%;background:#00e5a0;box-shadow:0 0 12px rgba(0,229,160,0.6);animation:pulse 2.5s ease-in-out infinite;}
-.hero-dot.off{background:#ff6b6b;box-shadow:0 0 12px rgba(255,80,80,0.5);animation:none;}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
-.hero-title{font-size:18px;font-weight:700;color:#fff;line-height:1.2;}
-.hero-sub{font-size:12px;color:#9898b8;margin-top:3px;}
-.hero-metrics{display:flex;gap:28px;}
-.hero-metric{text-align:center;}
-.hero-metric .v{font-size:24px;font-weight:800;color:#00e5a0;line-height:1;}
-.hero-metric .l{font-size:10.5px;color:#8888aa;margin-top:4px;text-transform:uppercase;letter-spacing:0.6px;}
-.hero-actions{display:flex;flex-direction:column;gap:6px;align-items:flex-end;}
-.hero-toggle-row{display:flex;align-items:center;gap:8px;font-size:12px;color:#ccc;}
-/* Channel chip strip */
-.channel-strip{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px;}
-.channel-chip{display:flex;align-items:center;gap:8px;background:var(--surface-2);border:1px solid var(--line);border-radius:var(--r-full);padding:8px 15px;font-size:13px;color:var(--text-2);cursor:pointer;transition:all 0.15s;}
-.channel-chip:hover{border-color:var(--line-2);color:var(--text);transform:translateY(-1px);}
-.channel-chip.on{border-color:var(--accent-30);}
-.channel-chip .chip-dot{width:8px;height:8px;border-radius:50%;background:#6b6b8a;}
-.channel-chip.on .chip-dot{background:#00e5a0;box-shadow:0 0 8px rgba(0,229,160,0.5);}
-.channel-chip.off .chip-dot{background:#ff6b6b;}
-.channel-chip.disconnected{opacity:0.45;}
-/* Activity feed */
-.activity-feed{background:#161630;border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:18px;margin-bottom:18px;}
-.activity-feed h3{font-size:13px;color:#9898b8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:14px;font-weight:600;}
-.activity-row{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:13px;}
-.activity-row:last-child{border-bottom:none;}
-.activity-icon{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0;}
-.activity-icon.lead{background:rgba(0,229,160,0.12);}
-.activity-icon.booking{background:rgba(56,189,248,0.12);}
-.activity-icon.handoff{background:rgba(251,191,36,0.12);}
-.activity-icon.csat{background:rgba(155,89,182,0.12);}
-.activity-meta{flex:1;min-width:0;}
-.activity-label{color:#eee;font-weight:500;}
-.activity-detail{color:#8888aa;font-size:11.5px;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.activity-time{font-size:11px;color:#6b6b8a;flex-shrink:0;}
-.activity-channel{font-size:10px;background:rgba(255,255,255,0.06);color:#9898b8;padding:1px 7px;border-radius:10px;text-transform:capitalize;}
-/* Analytics */
-.analytics{background:#161630;border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:18px;margin-bottom:18px;}
-.analytics-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
-.analytics-head h3{font-size:13px;color:#9898b8;text-transform:uppercase;letter-spacing:0.5px;font-weight:600;}
-.analytics-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;}
-.ana-card{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.05);border-radius:12px;padding:14px;}
-.ana-card .ana-title{font-size:11.5px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;font-weight:600;}
-.ana-card svg{display:block;margin:0 auto;}
-.ana-legend{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;font-size:10.5px;color:#8888aa;}
-.ana-legend .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:middle;}
-.wow-pill{display:inline-flex;align-items:center;gap:4px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:3px 10px;font-size:11.5px;color:#9898b8;}
-.wow-pill.up{color:#00e5a0;border-color:rgba(0,229,160,0.3);background:rgba(0,229,160,0.06);}
-.wow-pill.down{color:#ff6b6b;border-color:rgba(255,107,107,0.3);background:rgba(255,107,107,0.06);}
-.ana-stack{display:flex;flex-direction:column;gap:6px;}
-.ana-row{display:flex;align-items:center;gap:8px;font-size:12px;color:#ccc;}
-.ana-row .bar{flex:1;height:6px;background:rgba(255,255,255,0.05);border-radius:4px;overflow:hidden;position:relative;}
-.ana-row .bar-fill{height:100%;background:#00e5a0;border-radius:4px;}
-.ana-row .label{min-width:90px;color:#aaa;text-transform:capitalize;}
-.ana-row .count{min-width:30px;text-align:right;font-weight:600;color:#fff;font-size:11.5px;}
-@media(max-width:700px){.analytics-grid{grid-template-columns:1fr;}}
-/* Section status badges */
-.section-header .badge-attn{background:rgba(251,191,36,0.15);color:#fbbf24;border:1px solid rgba(251,191,36,0.3);padding:2px 8px;border-radius:10px;font-size:10.5px;font-weight:600;margin-left:8px;}
-/* Drill-down modal */
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:500;display:none;align-items:center;justify-content:center;padding:20px;}
-.modal-overlay.show{display:flex;}
-.modal{background:#161630;border:1px solid rgba(255,255,255,0.1);border-radius:16px;max-width:640px;width:100%;max-height:80vh;overflow-y:auto;padding:24px;}
-.modal h3{font-size:16px;color:#fff;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;}
-.modal .close-x{background:none;border:none;color:#8888aa;font-size:22px;cursor:pointer;line-height:1;}
-.thread-msg{padding:10px 14px;margin-bottom:8px;border-radius:10px;font-size:13px;line-height:1.5;max-width:85%;}
-.thread-msg.them{background:#1f1f3a;color:#eee;}
-.thread-msg.us{background:rgba(0,229,160,0.12);color:#cfffe8;margin-left:auto;}
-.thread-msg.summary{background:rgba(155,89,182,0.08);border:1px dashed rgba(155,89,182,0.3);color:#c9a4dc;font-style:italic;}
-.thread-meta{font-size:10.5px;color:#6b6b8a;margin-bottom:4px;}
-/* CTAs */
-.cta-card{background:linear-gradient(135deg,rgba(0,229,160,0.08),rgba(0,229,160,0.02));border:1px dashed rgba(0,229,160,0.3);border-radius:12px;padding:18px 22px;text-align:center;margin:8px 0;}
-.cta-card h4{font-size:14px;color:#fff;margin-bottom:6px;font-weight:600;}
-.cta-card p{font-size:12.5px;color:#9898b8;margin-bottom:12px;}
-.cta-btn{display:inline-block;background:#00e5a0;color:#0d0d1f;padding:8px 18px;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none;border:none;cursor:pointer;font-family:inherit;}
-.btn-logout{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 14px;font-size:12px;color:#ff6b6b;cursor:pointer;font-family:inherit;font-weight:500;}
-.btn-logout:hover{background:rgba(255,80,80,0.1);}
-.container{max-width:960px;margin:0 auto;padding:24px 16px 60px;}
-.stats-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:28px;}
-.stat-card{background:var(--surface-2);border:1px solid var(--line);border-radius:var(--r-lg);padding:20px;text-align:center;box-shadow:var(--shadow-1);transition:transform .18s cubic-bezier(.2,.8,.2,1),border-color .18s;}
-.stat-card:hover{transform:translateY(-2px);border-color:var(--line-2);}
-.stat-card .value{font-size:34px;font-weight:800;color:var(--accent);line-height:1.05;font-variant-numeric:tabular-nums;}
-.stat-card .label{font-size:11.5px;color:var(--text-3);margin-top:7px;text-transform:uppercase;letter-spacing:0.7px;font-weight:600;}
-.stat-card .sub{font-size:11px;color:var(--text-3);margin-top:4px;}
-.stat-card.status-on .value{color:var(--accent);}
-.stat-card.status-off .value{color:var(--danger);}
-.section{background:var(--surface-2);border:1px solid var(--line);border-radius:var(--r-lg);margin-bottom:14px;overflow:hidden;box-shadow:var(--shadow-1);transition:border-color .18s;}
-.section.open{border-color:var(--line-2);}
-.section-header{padding:17px 20px;cursor:pointer;display:flex;align-items:center;justify-content:space-between;user-select:none;transition:background 0.15s;}
-.section-header:hover{background:rgba(255,255,255,0.025);}
-.section-header h3{font-size:15.5px;font-weight:600;display:flex;align-items:center;gap:9px;color:var(--text);}
-.section-header .arrow{font-size:12px;color:#6b6b8a;transition:transform 0.2s;}
-.section.open .arrow{transform:rotate(90deg);}
-.section-body{display:none;padding:0 20px 20px;animation:fadeIn 0.2s;}
-.section.open .section-body{display:block;}
-@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
-table{width:100%;border-collapse:collapse;font-size:13px;}
-th{text-align:left;padding:8px 10px;color:#6b6b8a;font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;border-bottom:1px solid rgba(255,255,255,0.06);}
-td{padding:10px;border-bottom:1px solid rgba(255,255,255,0.04);color:#ccc;}
-tr:last-child td{border-bottom:none;}
-.empty{text-align:center;padding:24px;color:#6b6b8a;font-size:13px;}
-.pagination{display:flex;justify-content:center;gap:8px;margin-top:12px;}
-.pagination button{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:6px 12px;color:#ccc;cursor:pointer;font-size:12px;font-family:inherit;}
-.pagination button:hover{background:rgba(0,229,160,0.1);border-color:rgba(0,229,160,0.3);}
-.pagination button.active{background:#00e5a0;color:#0d0d1f;border-color:#00e5a0;font-weight:600;}
-.form-group{margin-bottom:14px;}
-.form-group label{display:block;font-size:12px;color:#8888aa;margin-bottom:5px;font-weight:500;}
-.form-group input,.form-group select,.form-group textarea{width:100%;padding:11px 13px;background:rgba(255,255,255,0.035);border:1px solid var(--line-2);border-radius:var(--r-sm);font-size:14px;color:var(--text);font-family:inherit;outline:none;transition:border-color .15s,box-shadow .15s,background .15s;}
-.form-group input::placeholder,.form-group textarea::placeholder{color:var(--text-3);}
-.form-group input:focus,.form-group select:focus,.form-group textarea:focus{border-color:var(--accent);background:rgba(0,229,160,0.04);box-shadow:0 0 0 3px var(--accent-12);}
-.form-group textarea{resize:vertical;min-height:60px;}
-.form-group select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238888aa' d='M6 8L1 3h10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;}
-.btn-save{background:linear-gradient(180deg,#00f5ac,#00d492);color:var(--accent-ink);border:none;border-radius:var(--r-sm);padding:12px 28px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;box-shadow:0 6px 18px -6px rgba(0,229,160,0.5);transition:transform .15s,box-shadow .15s,filter .15s;}
-.btn-save:hover{transform:translateY(-1px);filter:brightness(1.05);box-shadow:0 10px 24px -8px rgba(0,229,160,0.6);}
-.btn-save:active{transform:translateY(0);}
-.toggle-row{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.04);}
-.toggle-row:last-child{border-bottom:none;}
-.toggle-row .info{font-size:13px;color:#ccc;}
-.toggle-row .info small{display:block;color:#6b6b8a;font-size:11px;margin-top:2px;}
-.toggle{position:relative;width:44px;height:24px;flex-shrink:0;}
-.toggle input{opacity:0;width:0;height:0;}
-.toggle .slider{position:absolute;inset:0;background:rgba(255,255,255,0.1);border-radius:24px;cursor:pointer;transition:background 0.2s;}
-.toggle .slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:transform 0.2s;}
-.toggle input:checked+.slider{background:#00e5a0;}
-.toggle input:checked+.slider:before{transform:translateX(20px);}
-.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#00e5a0;color:#0d0d1f;padding:10px 24px;border-radius:10px;font-size:13px;font-weight:600;opacity:0;transition:opacity 0.3s;pointer-events:none;z-index:200;}
-.toast.show{opacity:1;}
-.badge-on{display:inline-block;background:rgba(0,229,160,0.15);color:#00e5a0;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;}
-.badge-off{display:inline-block;background:rgba(255,80,80,0.15);color:#ff6b6b;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;}
-.gmail-link{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:16px;padding:14px 24px;background:#fff;border:1.5px solid #ddd;border-radius:12px;font-size:15px;font-weight:600;color:#333;text-decoration:none;transition:all .15s;}
-.gmail-link:hover{background:#f8f8f8;transform:translateY(-1px);}
-.gmail-link svg{width:20px;height:20px;}
-.gmail-card{background:linear-gradient(135deg,rgba(0,229,160,0.08),rgba(0,229,160,0.02));border:1px solid rgba(0,229,160,0.2);border-radius:14px;padding:20px;margin-bottom:16px;text-align:center;}
-.gmail-card p{font-size:13px;color:#9898b8;margin-bottom:14px;}
-/* ── Home greeting ──────────────────────────────────────────────────── */
-.home-greet{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:18px;}
-.greet-hi{font-family:var(--font-display);font-size:27px;font-weight:800;color:var(--text);letter-spacing:-0.03em;line-height:1.1;}
-.greet-sub{font-size:13px;color:var(--text-2);margin-top:4px;}
-.greet-date{font-size:12px;color:var(--text-3);text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;}
-@media(max-width:700px){.greet-hi{font-size:22px;}.greet-date{display:none;}}
-/* ── Sidebar navigation ─────────────────────────────────────────────── */
-.sidebar{position:fixed;top:55px;left:0;width:236px;height:calc(100vh - 55px);overflow-y:auto;padding:18px 12px 24px;border-right:1px solid var(--line);background:rgba(10,10,20,0.45);backdrop-filter:blur(10px);display:flex;flex-direction:column;gap:3px;z-index:50;}
-.nav-label{font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.9px;font-weight:700;padding:16px 12px 7px;}
-.nav-group{display:flex;flex-direction:column;gap:3px;}
-.nav-item{display:flex;align-items:center;gap:11px;padding:10px 12px;border:none;background:none;color:var(--text-2);font-family:inherit;font-size:13.5px;font-weight:500;border-radius:var(--r-sm);cursor:pointer;text-align:left;width:100%;transition:background .14s,color .14s,box-shadow .14s;}
-.nav-item .ni-ic{font-size:16px;width:20px;text-align:center;flex-shrink:0;}
-.nav-item:hover{background:rgba(255,255,255,0.05);color:var(--text);}
-.nav-item.active{background:var(--accent-12);color:var(--accent);font-weight:600;box-shadow:inset 3px 0 0 var(--accent);}
-.container{margin-left:236px;}
-/* In sidebar/panel mode the sections are full pages, not accordions */
-.section .arrow{display:none;}
-.section .section-header{cursor:default;padding:20px 22px 16px;}
-.section .section-header:hover{background:none;}
-.section .section-header h3{font-size:18px;letter-spacing:-0.02em;}
-/* Premium panel-switch entrance */
-@keyframes panelIn{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
-.panel-enter{animation:panelIn .28s cubic-bezier(.2,.8,.2,1);}
-/* Skeleton loaders — the institutional alternative to "Loading…" text */
-@keyframes shimmer{0%{background-position:-400px 0}100%{background-position:400px 0}}
-.skeleton{background:linear-gradient(90deg,rgba(255,255,255,0.04) 25%,rgba(255,255,255,0.09) 37%,rgba(255,255,255,0.04) 63%);background-size:800px 100%;animation:shimmer 1.4s ease-in-out infinite;border-radius:8px;}
-.sk-row{height:14px;margin:9px 0;}
-.sk-card{height:78px;border-radius:var(--r-lg);}
-.sk-wrap{display:flex;flex-direction:column;gap:2px;padding:4px 0;}
-/* Polished empty states */
-.empty-state{text-align:center;padding:38px 24px;}
-.empty-state .es-ic{font-size:34px;margin-bottom:10px;opacity:.9;}
-.empty-state .es-t{font-family:var(--font-display);font-size:15px;font-weight:700;color:var(--text);margin-bottom:5px;}
-.empty-state .es-s{font-size:12.5px;color:var(--text-2);line-height:1.6;max-width:340px;margin:0 auto;}
-/* Numbers don't jitter as they update */
-.stat-card .value,.hero-metric .v,.ana-row .count,td{font-variant-numeric:tabular-nums;}
-/* Row micro-interactions */
-tbody tr{transition:background .12s;}
-tbody tr:hover{background:rgba(255,255,255,0.025);}
-.activity-row{transition:background .12s;border-radius:8px;}
-.activity-row:hover{background:rgba(255,255,255,0.025);}
-/* Topbar ghost buttons (cleaner than the old inline tutorial button) */
-.tb-ghost{background:rgba(255,255,255,0.05);border:1px solid var(--line-2);border-radius:var(--r-sm);padding:6px 13px;font-size:12px;color:var(--text-2);cursor:pointer;font-family:inherit;font-weight:500;transition:all .14s;}
-.tb-ghost:hover{background:rgba(255,255,255,0.09);color:var(--text);}
-/* ⌘K command palette */
-.cmdk-overlay{position:fixed;inset:0;background:rgba(5,5,12,0.62);backdrop-filter:blur(5px);z-index:600;display:none;align-items:flex-start;justify-content:center;padding-top:13vh;}
-.cmdk-overlay.show{display:flex;}
-.cmdk-box{width:100%;max-width:560px;background:var(--surface-2);border:1px solid var(--line-2);border-radius:var(--r-lg);box-shadow:var(--shadow-2);overflow:hidden;animation:panelIn .18s ease;}
-.cmdk-input{width:100%;padding:17px 20px;background:none;border:none;border-bottom:1px solid var(--line);color:var(--text);font-family:var(--font-body);font-size:16px;outline:none;}
-.cmdk-input::placeholder{color:var(--text-3);}
-.cmdk-list{max-height:340px;overflow-y:auto;padding:8px;}
-.cmdk-item{display:flex;align-items:center;gap:12px;padding:11px 13px;border-radius:var(--r-sm);font-size:14px;color:var(--text-2);cursor:pointer;}
-.cmdk-item .cmdk-ic{font-size:16px;width:22px;text-align:center;flex-shrink:0;}
-.cmdk-item .cmdk-grp{margin-left:auto;font-size:10.5px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.6px;}
-.cmdk-item.sel{background:var(--accent-12);color:var(--accent);}
-.cmdk-item.sel .cmdk-grp{color:var(--accent);opacity:.7;}
-.cmdk-empty{padding:26px;text-align:center;color:var(--text-3);font-size:13px;}
-.cmdk-foot{display:flex;gap:18px;padding:10px 18px;border-top:1px solid var(--line);font-size:11px;color:var(--text-3);}
-.cmdk-foot b{color:var(--text-2);font-weight:600;}
-/* Panel header action buttons (Refresh, Export, …) */
-.panel-actions{display:flex;gap:7px;align-items:center;}
-.panel-action{display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,0.05);border:1px solid var(--line-2);border-radius:var(--r-sm);padding:6px 12px;font-size:11.5px;color:var(--text-2);cursor:pointer;font-family:inherit;font-weight:600;transition:all .14s;}
-.panel-action:hover{background:rgba(255,255,255,0.09);color:var(--text);border-color:var(--line-2);}
-.panel-action.primary{background:var(--accent-12);border-color:var(--accent-30);color:var(--accent);}
-.panel-action.primary:hover{background:rgba(0,229,160,0.18);}
-@media(max-width:900px){
-  .sidebar{position:sticky;top:55px;width:auto;height:auto;flex-direction:row;align-items:center;overflow-x:auto;overflow-y:hidden;border-right:none;border-bottom:1px solid var(--line);gap:6px;padding:10px 12px;}
-  .sidebar .nav-label{display:none;}
-  .nav-group{flex-direction:row;gap:6px;}
-  .nav-item{white-space:nowrap;padding:9px 13px;font-size:13px;}
-  .nav-item .ni-ic{display:none;}
-  .container{margin-left:0;}
-}
-@media(max-width:700px){
-  .topbar{padding:12px 16px;}
-  .topbar .logo span{font-size:18px;}
-  .email-badge{display:none;}
-  .hero{grid-template-columns:1fr;gap:14px;padding:18px;}
-  .hero-metrics{justify-content:flex-start;gap:18px;}
-  .hero-actions{align-items:flex-start;}
-  .stats-row{grid-template-columns:1fr 1fr;}
-  .stat-card .value{font-size:24px;}
-  table{font-size:12px;}
-  td,th{padding:8px 6px;}
-  .channel-strip{gap:6px;}
-  .channel-chip{padding:6px 10px;font-size:12px;}
-}
-</style>
-</head><body>
-
-<div class="topbar">
-  <div class="logo"><span>Aria<em>Ai</em></span></div>
-  <div class="right">
-    <div class="email-badge">${ownerEmail}</div>
-    <button class="tb-ghost" onclick="openPalette()" title="Search (⌘K)">⌘ K</button>
-    <button class="tb-ghost" onclick="localStorage.removeItem('_aria_tutorial_done');location.reload()">? Tutorial</button>
-    <button class="btn-logout" onclick="logout()">Logout</button>
-  </div>
-</div>
-
-<aside class="sidebar" id="sidebar">
-  <nav class="nav-group">
-    <button class="nav-item active" data-panel="home" onclick="showPanel('home')"><span class="ni-ic">🏠</span>Home</button>
-    <button class="nav-item" data-panel="conversations" onclick="showPanel('conversations')"><span class="ni-ic">💬</span>Conversations</button>
-    <button class="nav-item" data-panel="leads" onclick="showPanel('leads')"><span class="ni-ic">🎯</span>Leads</button>
-    <button class="nav-item" data-panel="customers" onclick="showPanel('customers')"><span class="ni-ic">👥</span>Customers</button>
-    <button class="nav-item" data-panel="bookings" onclick="showPanel('bookings')"><span class="ni-ic">📅</span>Bookings</button>
-  </nav>
-  <div class="nav-label">Manage</div>
-  <nav class="nav-group">
-    <button class="nav-item" data-panel="train" onclick="showPanel('train')"><span class="ni-ic">🧠</span>Train Aria</button>
-    <button class="nav-item" data-panel="channels" onclick="showPanel('channels')"><span class="ni-ic">🔗</span>Channels</button>
-    <button class="nav-item" data-panel="profile" onclick="showPanel('profile')"><span class="ni-ic">🏢</span>Business</button>
-    <button class="nav-item" data-panel="settings" onclick="showPanel('settings')"><span class="ni-ic">⚙️</span>Settings</button>
-  </nav>
-</aside>
-
-<div class="container">
-
-  <!-- Escalations banner (only when present) -->
-  <div id="escalations-banner" style="display:none;"></div>
-
-  <!-- HOME PANEL: overview (hero + channels + activity + analytics + stats) -->
-  <div id="panel-home">
-  <div class="home-greet">
-    <div>
-      <div class="greet-hi" id="greet-hi">Welcome back</div>
-      <div class="greet-sub" id="greet-sub">Here's how Aria is doing</div>
-    </div>
-    <div class="greet-date" id="greet-date"></div>
-  </div>
-  <!-- HERO STATUS BAR -->
-  <div class="hero" id="hero-status">
-    <div class="hero-status">
-      <div class="hero-dot" id="hero-dot"></div>
-      <div>
-        <div class="hero-title" id="hero-title">Aria is loading…</div>
-        <div class="hero-sub" id="hero-sub">—</div>
-      </div>
-    </div>
-    <div class="hero-metrics" id="hero-metrics">
-      <div class="hero-metric"><div class="v">—</div><div class="l">Today</div></div>
-    </div>
-    <div class="hero-actions" id="hero-actions"></div>
-  </div>
-
-  <!-- CHANNEL CHIPS (always visible, one row, on/off per channel) -->
-  <div class="channel-strip" id="channel-strip">
-    <div style="font-size:12px;color:#6b6b8a;">Loading channels…</div>
-  </div>
-
-  <!-- ACTIVITY FEED -->
-  <div class="activity-feed">
-    <h3>🕐 Recent Activity</h3>
-    <div id="activity-list"><div class="empty" style="padding:14px 0">Loading…</div></div>
-  </div>
-
-  <!-- ANALYTICS — 7-day rollup charts -->
-  <div class="analytics" id="analytics-panel">
-    <div class="analytics-head"><h3>📊 This week</h3><div id="ana-wow"></div></div>
-    <div class="analytics-grid" id="ana-grid">
-      <div class="empty" style="padding:14px 0">Loading…</div>
-    </div>
-  </div>
-
-  <!-- STATS GRID (compact, secondary) -->
-  <div class="stats-row" id="stats-row">
-    <div class="stat-card"><div class="value">—</div><div class="label">Loading...</div></div>
-  </div>
-
-  </div><!-- /panel-home -->
-
-  <!-- DRILL-DOWN SECTIONS (each shown as a full panel via the sidebar) -->
-
-  <!-- Conversations — merged inbox log + channel messages -->
-  <div class="section" id="sec-conversations">
-    <div class="section-header" onclick="toggleSection('conversations')">
-      <h3>&#x1F4AC; Conversations</h3>
-      <div class="panel-actions"><button class="panel-action" onclick="event.stopPropagation();refreshPanel('conversations')">↻ Refresh</button></div>
-    </div>
-    <div class="section-body" id="body-conversations">
-      <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
-        <button onclick="loadUnifiedConvs('all')" class="conv-filter active" data-filter="all" style="background:rgba(0,229,160,0.15);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">All</button>
-        <button onclick="loadUnifiedConvs('email')" class="conv-filter" data-filter="email" style="background:rgba(255,255,255,0.06);color:#ccc;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">📧 Email</button>
-        <button onclick="loadUnifiedConvs('facebook')" class="conv-filter" data-filter="facebook" style="background:rgba(255,255,255,0.06);color:#ccc;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">📘 Messenger</button>
-        <button onclick="loadUnifiedConvs('instagram')" class="conv-filter" data-filter="instagram" style="background:rgba(255,255,255,0.06);color:#ccc;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">📷 Instagram</button>
-        <button onclick="loadUnifiedConvs('whatsapp')" class="conv-filter" data-filter="whatsapp" style="background:rgba(255,255,255,0.06);color:#ccc;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;">💬 WhatsApp</button>
-      </div>
-      <div id="conversations-list"><div class="empty">Loading...</div></div>
-    </div>
-  </div>
-
-  <!-- Leads -->
-  <div class="section" id="sec-leads">
-    <div class="section-header" onclick="toggleSection('leads')">
-      <h3>&#x1F464; Leads</h3>
-      <div class="panel-actions"><button class="panel-action" onclick="event.stopPropagation();exportLeads()">↧ Export CSV</button><button class="panel-action" onclick="event.stopPropagation();refreshPanel('leads')">↻ Refresh</button></div>
-    </div>
-    <div class="section-body" id="body-leads"><div class="empty">Loading...</div></div>
-  </div>
-
-  <!-- Customers — repeat-customer profile drill-down -->
-  <div class="section" id="sec-customers">
-    <div class="section-header" onclick="toggleSection('customers')">
-      <h3>&#x1F465; Customers</h3>
-      <div class="panel-actions"><button class="panel-action" onclick="event.stopPropagation();refreshPanel('customers')">↻ Refresh</button></div>
-    </div>
-    <div class="section-body" id="body-customers"><div class="empty">Loading...</div></div>
-  </div>
-
-  <!-- Bookings -->
-  <div class="section" id="sec-bookings">
-    <div class="section-header" onclick="toggleSection('bookings')">
-      <h3>&#x1F4C5; Upcoming Bookings</h3>
-      <div class="panel-actions"><button class="panel-action" onclick="event.stopPropagation();refreshPanel('bookings')">↻ Refresh</button></div>
-    </div>
-    <div class="section-body" id="body-bookings"><div class="empty">Loading...</div></div>
-  </div>
-
-  <!-- Train Aria (new — KB + Knowledge docs + Services + Scope) -->
-  <div class="section" id="sec-train">
-    <div class="section-header" onclick="toggleSection('train')">
-      <h3>&#x1F9E0; Train Aria</h3>
-      <span class="arrow">&#x25B6;</span>
-    </div>
-    <div class="section-body" id="body-train"><div class="empty">Loading...</div></div>
-  </div>
-
-  <!-- Channels (now a deeper drill-down — chips up top handle quick toggle) -->
-  <div class="section" id="sec-channels">
-    <div class="section-header" onclick="toggleSection('channels')">
-      <h3>&#x1F517; Manage Channels</h3>
-      <span class="arrow">&#x25B6;</span>
-    </div>
-    <div class="section-body" id="body-channels">
-      <div style="padding:8px 0;">
-        <p style="font-size:13px;color:#9898b8;margin-bottom:16px;">Connect Aria to your channels. Once connected they <b>stay connected</b> — you won't need to do this again.</p>
-
-        <a href="/connect/meta?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}" id="meta-connect-btn" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:13px;background:#1877F2;color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;margin-bottom:6px;">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg>
-          <span>Connect Facebook (Page + Messenger)</span>
-        </a>
-        <p style="font-size:11.5px;color:#8888aa;margin:0 0 14px;padding:0 4px;line-height:1.5;">🔒 You'll log in with your personal Facebook so Meta can verify you're a Page admin — but Aria <b>only connects to the Business Page you select</b>. She never sees your personal DMs, posts, or friends. If you admin multiple Pages, you'll get to pick which one.</p>
-
-        <a href="/connect/instagram?owner=${encodeURIComponent(ownerEmail)}&s=${encodeURIComponent(sessionToken)}" id="ig-connect-btn" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:13px;background:linear-gradient(45deg,#FED373 0%,#F15245 35%,#D92E7F 65%,#9B36B7 100%);color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;margin-bottom:20px;box-shadow:0 4px 14px rgba(217,46,127,0.25);">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg>
-          <span>Connect Instagram (DMs)</span>
-        </a>
-
-        <a class="gmail-link" id="gmail-connect-btn" href="/connect/gmail?owner=\${encodeURIComponent(OWNER)}&s=\${encodeURIComponent(TOKEN)}" style="margin-top:0;margin-bottom:20px;">
-          <svg viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
-          Connect Gmail (Inbox + Auto-reply)
-        </a>
-
-        <div id="gmail-status-row" style="margin-bottom:12px;"></div>
-        <div id="channel-cards" style="display:flex;flex-direction:column;gap:12px;"></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Business Profile -->
-  <div class="section" id="sec-profile">
-    <div class="section-header" onclick="toggleSection('profile')">
-      <h3>&#x1F3E2; Business Profile</h3>
-      <span class="arrow">&#x25B6;</span>
-    </div>
-    <div class="section-body" id="body-profile"><div class="empty">Loading...</div></div>
-  </div>
-
-  <!-- Settings (small at bottom) -->
-  <div class="section" id="sec-settings">
-    <div class="section-header" onclick="toggleSection('settings')">
-      <h3>&#x2699;&#xFE0F; Settings</h3>
-      <span class="arrow">&#x25B6;</span>
-    </div>
-    <div class="section-body" id="body-settings"><div class="empty">Loading...</div></div>
-  </div>
-
-</div>
-
-<!-- Drill-down modal for conversation threads + CSAT detail -->
-<div class="modal-overlay" id="modal-overlay" onclick="if(event.target.id==='modal-overlay')closeModal()">
-  <div class="modal" id="modal-content"></div>
-</div>
-
-<div class="toast" id="toast"></div>
-
-<!-- ⌘K command palette -->
-<div class="cmdk-overlay" id="cmdk" onclick="if(event.target.id==='cmdk')closePalette()">
-  <div class="cmdk-box">
-    <input id="cmdk-input" class="cmdk-input" placeholder="Search panels &amp; actions…" oninput="renderPalette(this.value)" autocomplete="off" spellcheck="false">
-    <div class="cmdk-list" id="cmdk-list"></div>
-    <div class="cmdk-foot"><span><b>↑↓</b> navigate</span><span><b>↵</b> open</span><span><b>esc</b> close</span></div>
-  </div>
-</div>
-
-<script>
-const OWNER = '${ownerEmail}';
-const TOKEN = '${sessionToken}';
-const Q = 'owner=' + encodeURIComponent(OWNER) + '&s=' + encodeURIComponent(TOKEN);
-const loaded = {};
-// Sidebar panel names — declared at top so showPanel() (called during init,
-// further down) never hits a temporal-dead-zone on this const. Browser-side
-// TDZ is invisible to node --check, which is why this broke every button.
-const PANEL_NAMES = ['conversations','leads','customers','bookings','train','channels','profile','settings'];
-const SKELETON_HTML = '<div class="sk-wrap">' + ['60%','85%','72%','90%','50%'].map(function(w){ return '<div class="skeleton sk-row" style="width:' + w + '"></div>'; }).join('') + '</div>';
-
-function api(path) { return fetch(path + (path.includes('?') ? '&' : '?') + Q).then(r => r.json()); }
-function apiPost(path, body) {
-  return fetch(path + (path.includes('?') ? '&' : '?') + Q, {
-    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
-  }).then(r => r.json());
-}
-
-function toast(msg) {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 2500);
-}
-
-function logout() {
-  window.location.href = '/dashboard?owner=' + encodeURIComponent(OWNER);
-}
-
-function timeAgo(dateStr) {
-  if (!dateStr) return '—';
-  const diff = Date.now() - new Date(dateStr).getTime();
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return mins + 'm ago';
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return hrs + 'h ago';
-  const days = Math.floor(hrs / 24);
-  return days + 'd ago';
-}
-
-function escH(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-
-// Load stats + hero + chips + activity immediately
-async function loadStats() {
-  try {
-    const [d, ch] = await Promise.all([
-      api('/api/dashboard/stats'),
-      api('/api/dashboard/channel-stats'),
-    ]);
-    const chTotal = ch.stats?.total || 0;
-    const channels = ch.channels || {};
-    const csat = d.csat || { total: 0, scorePct: null };
-
-    // ─── HERO STATUS ───────────────────────────────────────────────────
-    // Aria's overall status: ON if any auto-reply channel is enabled, OFF otherwise
-    const anyChannelOn = ['facebook','instagram','whatsapp'].some(c => channels[c]?.enabled);
-    const anyChannelConnected = ['facebook','instagram','whatsapp'].some(c => channels[c]?.accessToken);
-    const isLive = d.autoReplyEnabled || anyChannelOn;
-    const lastActivity = chTotal ? (channels.facebook?.lastReply || channels.instagram?.lastReply || channels.whatsapp?.lastReply) : null;
-    const heroDot = document.getElementById('hero-dot');
-    heroDot.classList.toggle('off', !isLive);
-    document.getElementById('hero-title').textContent = isLive ? 'Aria is working for you' : 'Aria is paused';
-    document.getElementById('hero-sub').textContent = lastActivity
-      ? 'Last reply ' + timeAgo(lastActivity)
-      : (anyChannelConnected ? 'Waiting for the first message…' : 'No channels connected yet — scroll down to connect one');
-    document.getElementById('hero-metrics').innerHTML =
-      '<div class="hero-metric"><div class="v">' + chTotal + '</div><div class="l">Replies</div></div>' +
-      '<div class="hero-metric"><div class="v">' + d.leads.total + '</div><div class="l">Leads</div></div>' +
-      '<div class="hero-metric"><div class="v">' + d.bookings.total + '</div><div class="l">Bookings</div></div>' +
-      (csat.scorePct != null ? '<div class="hero-metric" style="cursor:pointer" onclick="showCsatDetail()" title="Click to see negative ratings"><div class="v" style="color:' + (csat.scorePct >= 80 ? '#00e5a0' : csat.scorePct >= 50 ? '#fbbf24' : '#ff6b6b') + '">' + csat.scorePct + '%</div><div class="l">CSAT</div></div>' : '');
-    // Hero actions: master pause/resume (visual only — channel-toggle is per-channel via chips)
-    document.getElementById('hero-actions').innerHTML =
-      '<div style="font-size:11px;color:#6b6b8a;">' + d.emailsReplied.week + ' emails / ' + d.bookings.week + ' bookings this week</div>';
-
-    // ─── CHANNEL CHIPS ─────────────────────────────────────────────────
-    const channelDefs = [
-      { key: 'facebook', name: 'Messenger', icon: '📘' },
-      { key: 'instagram', name: 'Instagram', icon: '📷' },
-      { key: 'whatsapp', name: 'WhatsApp', icon: '💬' },
-      { key: 'email', name: 'Email', icon: '📧' },
-    ];
-    const stripEl = document.getElementById('channel-strip');
-    stripEl.innerHTML = channelDefs.map(def => {
-      let connected, enabled, label;
-      if (def.key === 'email') {
-        connected = d.gmailConnected;
-        enabled = d.autoReplyEnabled;
-        label = connected ? (enabled ? 'On' : 'Paused') : 'Not connected';
-      } else {
-        const ch = channels[def.key];
-        connected = !!ch?.accessToken;
-        enabled = !!ch?.enabled;
-        label = connected ? (enabled ? 'On' : 'Paused') : 'Not connected';
-      }
-      const cls = connected ? (enabled ? 'on' : 'off') : 'disconnected';
-      const action = connected
-        ? (def.key === 'email' ? 'toggleSetting("autoReplyEnabled",' + !enabled + ')' : 'toggleChannel("' + def.key + '",' + !enabled + ')')
-        : 'toggleSection("channels")';
-      return '<div class="channel-chip ' + cls + '" onclick=\\'' + action + '\\'>' +
-        '<div class="chip-dot"></div>' +
-        '<span>' + def.icon + ' ' + def.name + '</span>' +
-        '<span style="font-size:11px;color:#8888aa;">' + label + '</span>' +
-      '</div>';
-    }).join('');
-
-    // ─── ACTIVITY FEED ─────────────────────────────────────────────────
-    try {
-      const act = await api('/api/dashboard/activity?limit=12');
-      const list = document.getElementById('activity-list');
-      if (!act.events?.length) {
-        list.innerHTML = '<div class="empty" style="padding:14px 0">Nothing here yet — once Aria starts handling messages, recent activity will show up here.</div>';
-      } else {
-        const iconFor = (t) => ({ lead: '🎯', booking: '📅', handoff: '🤝', csat: '⭐' }[t] || '•');
-        list.innerHTML = act.events.map(e => {
-          return '<div class="activity-row">' +
-            '<div class="activity-icon ' + e.type + '">' + iconFor(e.type) + '</div>' +
-            '<div class="activity-meta">' +
-              '<div class="activity-label">' + escH(e.label || '') + '</div>' +
-              (e.detail ? '<div class="activity-detail">' + escH(e.detail) + '</div>' : '') +
-            '</div>' +
-            (e.channel ? '<div class="activity-channel">' + escH(e.channel) + '</div>' : '') +
-            '<div class="activity-time">' + timeAgo(e.ts) + '</div>' +
-          '</div>';
-        }).join('');
-      }
-    } catch {}
-
-    // ─── COMPACT STATS GRID (secondary, breakdowns) ────────────────────
-    document.getElementById('stats-row').innerHTML = \`
-      <div class="stat-card">
-        <div class="value" style="color:#ff6b6b">\${d.leads.hot}</div>
-        <div class="label">Hot Leads</div>
-        <div class="sub">last 30 days</div>
-      </div>
-      <div class="stat-card">
-        <div class="value" style="color:#fbbf24">\${d.leads.warm}</div>
-        <div class="label">Warm Leads</div>
-        <div class="sub">last 30 days</div>
-      </div>
-      <div class="stat-card">
-        <div class="value">\${d.bookings.week}</div>
-        <div class="label">Bookings This Week</div>
-      </div>
-      <div class="stat-card">
-        <div class="value">\${d.emailsReplied.week}</div>
-        <div class="label">Emails This Week</div>
-      </div>
-    \`;
-    // Escalations banner — if any conv is paused waiting for owner takeover
-    // Also adds an "attention" badge on the Conversations section header.
-    try {
-      const esc = await api('/api/dashboard/escalations');
-      const escDiv = document.getElementById('escalations-banner');
-      const convHeader = document.querySelector('#sec-conversations .section-header h3');
-      // Strip any previous attention badge
-      const oldBadge = convHeader?.querySelector('.badge-attn');
-      if (oldBadge) oldBadge.remove();
-      if (escDiv) {
-        if (esc.items?.length) {
-          const rows = esc.items.slice(0, 5).map(e => '<li>' + escH(e.channel) + ' · ' + escH(e.senderId) + ' · <i>' + escH(e.reason || 'human requested') + '</i> <button onclick="resumeConv(\\'' + e.memKey + '\\')" style="margin-left:8px;background:#00e5a0;color:#0d0d1f;border:none;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;">Resume</button></li>').join('');
-          escDiv.innerHTML = '<div style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);border-radius:12px;padding:14px 18px;margin-bottom:20px;"><b style="color:#fbbf24;">🤝 ' + esc.items.length + ' conversation(s) handed to you</b><ul style="margin:8px 0 0 0;padding-left:18px;font-size:13px;color:#ccc;line-height:1.7;">' + rows + '</ul></div>';
-          escDiv.style.display = 'block';
-          if (convHeader) {
-            const b = document.createElement('span');
-            b.className = 'badge-attn';
-            b.textContent = esc.items.length + ' need attention';
-            convHeader.appendChild(b);
-          }
-        } else {
-          escDiv.style.display = 'none';
-        }
-      }
-    } catch {}
-  } catch (e) {
-    document.getElementById('stats-row').innerHTML = '<div class="stat-card"><div class="value">!</div><div class="label">Failed to load stats</div></div>';
-  }
-}
-// ─── SVG mini-chart helpers (zero-dep, ~100 lines for 4 chart types) ────
-// All return SVG strings. Sized to fit inside an .ana-card.
-function svgSparkline(values, { w = 240, h = 50, color = '#00e5a0', fill = true } = {}) {
-  if (!values || !values.length) return '<svg width="' + w + '" height="' + h + '"></svg>';
-  const max = Math.max(1, ...values.filter(v => v != null));
-  const step = w / (values.length - 1 || 1);
-  let pts = '';
-  values.forEach((v, i) => {
-    if (v == null) return;
-    const x = i * step;
-    const y = h - (v / max) * (h - 4) - 2;
-    pts += (pts ? ' L ' : 'M ') + x.toFixed(1) + ',' + y.toFixed(1);
-  });
-  const area = fill && pts ? '<path d="' + pts + ' L ' + w + ',' + h + ' L 0,' + h + ' Z" fill="' + color + '" opacity="0.12" />' : '';
-  const line = pts ? '<path d="' + pts + '" fill="none" stroke="' + color + '" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />' : '';
-  // Day labels along bottom (7 dots = mon-sun style relative)
-  const labels = values.map((_, i) => {
-    const daysAgo = values.length - 1 - i;
-    const d = new Date(Date.now() - daysAgo * 86400000);
-    return '<text x="' + (i * step).toFixed(1) + '" y="' + (h + 10) + '" font-size="8" fill="#6b6b8a" text-anchor="middle">' + d.toLocaleDateString('en-GB', { weekday: 'short' }).slice(0, 2) + '</text>';
-  }).join('');
-  return '<svg width="' + w + '" height="' + (h + 14) + '">' + area + line + labels + '</svg>';
-}
-function svgDonut(parts, { size = 80, colors = ['#ff6b6b', '#fbbf24', '#9898b8'] } = {}) {
-  // parts: [{label, value}], renders concentric donut + middle total
-  const total = parts.reduce((s, p) => s + (p.value || 0), 0) || 1;
-  const radius = size / 2 - 6;
-  const circ = 2 * Math.PI * radius;
-  let offset = 0;
-  const segments = parts.map((p, i) => {
-    const fraction = (p.value || 0) / total;
-    const dash = circ * fraction;
-    const seg = '<circle cx="' + (size / 2) + '" cy="' + (size / 2) + '" r="' + radius + '" fill="none" stroke="' + (colors[i] || '#666') + '" stroke-width="10" stroke-dasharray="' + dash + ' ' + (circ - dash) + '" stroke-dashoffset="-' + offset + '" transform="rotate(-90 ' + (size / 2) + ' ' + (size / 2) + ')" />';
-    offset += dash;
-    return seg;
-  }).join('');
-  return '<svg width="' + size + '" height="' + size + '">' +
-    '<circle cx="' + (size / 2) + '" cy="' + (size / 2) + '" r="' + radius + '" fill="none" stroke="rgba(255,255,255,0.05)" stroke-width="10" />' +
-    segments +
-    '<text x="' + (size / 2) + '" y="' + (size / 2 + 4) + '" font-size="16" font-weight="700" fill="#fff" text-anchor="middle">' + total + '</text>' +
-    '</svg>';
-}
-function renderHorizontalBars(items, { maxBars = 5 } = {}) {
-  if (!items?.length) return '<div class="empty" style="padding:8px 0;font-size:12px;">No data yet</div>';
-  const max = Math.max(...items.map(i => i.count || 0), 1);
-  return '<div class="ana-stack">' + items.slice(0, maxBars).map(it => {
-    const pct = ((it.count / max) * 100).toFixed(0);
-    return '<div class="ana-row">' +
-      '<div class="label">' + escH(it.name) + '</div>' +
-      '<div class="bar"><div class="bar-fill" style="width:' + pct + '%"></div></div>' +
-      '<div class="count">' + it.count + '</div>' +
-    '</div>';
-  }).join('') + '</div>';
-}
-
-async function loadAnalytics() {
-  const grid = document.getElementById('ana-grid');
-  const wowEl = document.getElementById('ana-wow');
-  try {
-    const d = await api('/api/dashboard/analytics');
-    // Week-over-week pill
-    const wow = d.weekOverWeek || {};
-    if (wow.convs != null && wow.convsAbs != null) {
-      const dir = wow.convs > 0 ? 'up' : (wow.convs < 0 ? 'down' : '');
-      const arrow = wow.convs > 0 ? '↑' : (wow.convs < 0 ? '↓' : '→');
-      wowEl.innerHTML = '<span class="wow-pill ' + dir + '">' + arrow + ' ' + Math.abs(wow.convs) + '% vs last week</span>';
-    } else { wowEl.innerHTML = ''; }
-
-    const colours = { facebook: '#1877F2', instagram: '#E1306C', whatsapp: '#25D366', email: '#fbbf24' };
-    const channelTotals = Object.entries(d.volumeByChannel || {})
-      .map(([k, vs]) => ({ key: k, total: vs.reduce((s, v) => s + v, 0), vs }));
-    const totalAll = channelTotals.reduce((s, c) => s + c.total, 0);
-
-    // 1. Volume card — combined sparkline + per-channel legend
-    const combinedVs = (d.volumeByChannel.facebook || []).map((_, i) =>
-      ['facebook','instagram','whatsapp','email'].reduce((s, k) => s + (d.volumeByChannel[k]?.[i] || 0), 0)
-    );
-    const volCard = '<div class="ana-card">' +
-      '<div class="ana-title">💬 Conversations (' + totalAll + ' this week)</div>' +
-      svgSparkline(combinedVs) +
-      '<div class="ana-legend">' +
-        channelTotals.filter(c => c.total > 0).map(c =>
-          '<span><span class="dot" style="background:' + (colours[c.key] || '#888') + '"></span>' + c.key + ' ' + c.total + '</span>'
-        ).join('') +
-        (channelTotals.every(c => c.total === 0) ? '<span style="color:#6b6b8a">No conversations yet this week</span>' : '') +
-      '</div>' +
-    '</div>';
-
-    // 2. Leads donut
-    const lb = d.leadsBreakdown || { hot: 0, warm: 0, cold: 0 };
-    const leadsCard = '<div class="ana-card">' +
-      '<div class="ana-title">🎯 Leads (' + (lb.hot + lb.warm + lb.cold) + ' this week)</div>' +
-      svgDonut([
-        { label: 'Hot', value: lb.hot },
-        { label: 'Warm', value: lb.warm },
-        { label: 'Cold', value: lb.cold },
-      ], { colors: ['#ff6b6b', '#fbbf24', '#6b6b8a'] }) +
-      '<div class="ana-legend">' +
-        '<span><span class="dot" style="background:#ff6b6b"></span>Hot ' + lb.hot + '</span>' +
-        '<span><span class="dot" style="background:#fbbf24"></span>Warm ' + lb.warm + '</span>' +
-        '<span><span class="dot" style="background:#6b6b8a"></span>Cold ' + lb.cold + '</span>' +
-      '</div>' +
-    '</div>';
-
-    // 3. CSAT trend — sparkline with null gaps
-    const csatVs = d.csatTrend || [];
-    const hasCsat = csatVs.some(v => v != null);
-    const csatCard = '<div class="ana-card">' +
-      '<div class="ana-title">⭐ CSAT trend (last 7 days)</div>' +
-      (hasCsat ? svgSparkline(csatVs.map(v => v == null ? null : v), { color: '#9d96ff' }) +
-        '<div class="ana-legend"><span style="color:#9898b8">Higher is better — based on 👍/👎 ratings</span></div>'
-        : '<div class="empty" style="padding:14px 0;font-size:12px;">No ratings yet this week</div>') +
-    '</div>';
-
-    // 4. Top categories
-    const cats = d.topCategories || [];
-    const catsCard = '<div class="ana-card">' +
-      '<div class="ana-title">🏷️ Top topics</div>' +
-      renderHorizontalBars(cats) +
-    '</div>';
-
-    grid.innerHTML = volCard + leadsCard + csatCard + catsCard;
-  } catch (e) {
-    grid.innerHTML = '<div class="empty">Failed to load analytics.</div>';
-  }
-}
-// Fire on page load
-loadAnalytics();
-
-async function resumeConv(memKey) {
-  if (!confirm('Hand this conversation back to Aria? She\\'ll start auto-replying again.')) return;
-  try {
-    const r = await apiPost('/api/dashboard/resume-conversation', { memKey });
-    if (r.ok) { toast('Conversation resumed'); loadStats(); }
-  } catch (e) { toast('Resume failed'); }
-}
-loadStats();
-
-// Home greeting — time-aware + today's date.
-(function(){
-  const h = new Date().getHours();
-  const g = h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
-  const hi = document.getElementById('greet-hi');
-  if (hi) hi.textContent = g + ' 👋';
-  const d = document.getElementById('greet-date');
-  if (d) { try { d.textContent = new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' }); } catch (e) {} }
-})();
-
-// Sidebar init — open the last-viewed panel (or Home). This also hides the
-// non-active section panels so the dashboard opens as one clean view
-// instead of a long accordion scroll.
-(function(){
-  let p = 'home';
-  try { p = localStorage.getItem('aria_panel') || 'home'; } catch (e) {}
-  if (p !== 'home' && !document.getElementById('sec-' + p)) p = 'home';
-  showPanel(p);
-})();
-
-// Welcome tutorial — show on first visit
-if (!localStorage.getItem('_aria_tutorial_done')) {
-  const overlay = document.createElement('div');
-  overlay.id = 'tutorial-overlay';
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;';
-  const steps = [
-    { title: 'Welcome to Aria 👋', text: 'Aria is your 24/7 AI receptionist. She replies to messages and emails in your voice — across Facebook, Instagram, WhatsApp, and Gmail.' },
-    { title: 'The green dot 🟢', text: 'At the top of the dashboard, a green pulsing dot means Aria is live and replying. Red means she is paused — flip channel chips to control her.' },
-    { title: 'Channels — tap to pause 📡', text: 'The chips under the hero show every channel. Tap one to pause/resume Aria on just that channel. Need to add a new one? Open the "Manage Channels" section.' },
-    { title: 'Activity feed 🕐', text: 'The Recent Activity feed shows what Aria has been up to — new leads, bookings, handoffs, and customer ratings. Hot leads are 🎯, bookings are 📅, takeovers are 🤝.' },
-    { title: 'Train Aria 🧠', text: 'Open the "Train Aria" section to upload knowledge documents, set up a services carousel, and tell Aria what topics she should + should not handle.' },
-    { title: 'You\\'re set 🎉', text: 'Aria is ready. If anything ever needs your attention, you\\'ll see a banner at the top of the dashboard AND get an email.' },
-  ];
-  let stepIdx = 0;
-  function showTutorialStep() {
-    const s = steps[stepIdx];
-    overlay.innerHTML = '<div style="background:#161630;border-radius:20px;padding:32px;max-width:420px;width:100%;text-align:center;">' +
-      '<h2 style="font-size:20px;margin-bottom:12px;">' + s.title + '</h2>' +
-      '<p style="font-size:14px;color:#9898b8;line-height:1.7;margin-bottom:24px;">' + s.text + '</p>' +
-      '<div style="display:flex;gap:8px;justify-content:center;">' +
-      (stepIdx > 0 ? '<button onclick="prevStep()" style="padding:10px 20px;background:rgba(255,255,255,0.06);color:#eee;border:1px solid rgba(255,255,255,0.1);border-radius:10px;cursor:pointer;font-size:13px;">← Back</button>' : '') +
-      '<button onclick="nextStep()" style="padding:10px 24px;background:#00e5a0;color:#0d0d1f;border:none;border-radius:10px;cursor:pointer;font-size:14px;font-weight:600;">' + (stepIdx === steps.length - 1 ? 'Get Started →' : 'Next →') + '</button>' +
-      '</div>' +
-      '<div style="margin-top:16px;display:flex;gap:6px;justify-content:center;">' + steps.map((_, i) => '<div style="width:8px;height:8px;border-radius:50%;background:' + (i === stepIdx ? '#00e5a0' : '#333') + '"></div>').join('') + '</div>' +
-      '</div>';
-  }
-  window.nextStep = () => { stepIdx++; if (stepIdx >= steps.length) { overlay.remove(); localStorage.setItem('_aria_tutorial_done', '1'); } else showTutorialStep(); };
-  window.prevStep = () => { if (stepIdx > 0) { stepIdx--; showTutorialStep(); } };
-  showTutorialStep();
-  document.body.appendChild(overlay);
-}
-
-// One-click test button (already in topbar)
-
-// In sidebar/panel mode each section is a full page, not a collapsible
-// accordion — so this only ever OPENS + lazy-loads, never collapses.
-function toggleSection(name) {
-  const sec = document.getElementById('sec-' + name);
-  if (!sec) return;
-  if (!sec.classList.contains('open')) {
-    sec.classList.add('open');
-    if (!loaded[name]) { loaded[name] = true; loadSection(name); }
-  }
-}
-
-// Sidebar navigation — show one panel at a time. 'home' = the overview
-// (hero + activity + analytics); everything else maps to a section.
-// (PANEL_NAMES is declared at the top of this script to avoid a TDZ on init.)
-function showPanel(name) {
-  const home = document.getElementById('panel-home');
-  if (home) home.style.display = (name === 'home') ? 'block' : 'none';
-  PANEL_NAMES.forEach(p => {
-    const s = document.getElementById('sec-' + p);
-    if (s) s.style.display = (p === name) ? 'block' : 'none';
-  });
-  if (name !== 'home') {
-    const s = document.getElementById('sec-' + name);
-    if (s) {
-      s.classList.add('open');
-      if (!loaded[name]) {
-        loaded[name] = true;
-        // Show a skeleton shimmer in the panel body while its data loads
-        // (institutional touch — beats a "Loading…" string). loadSection
-        // replaces it with real content.
-        const b = document.getElementById('body-' + name);
-        if (b) b.innerHTML = SKELETON_HTML;
-        loadSection(name);
-      }
-    }
-  }
-  document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.panel === name));
-  // Premium entrance — retrigger the fade/slide on the panel now shown.
-  const shown = (name === 'home') ? home : document.getElementById('sec-' + name);
-  if (shown) { shown.classList.remove('panel-enter'); void shown.offsetWidth; shown.classList.add('panel-enter'); }
-  try { localStorage.setItem('aria_panel', name); } catch (e) {}
-  window.scrollTo({ top: 0, behavior: 'instant' in window ? 'instant' : 'auto' });
-}
-
-// Re-fetch a panel's data on demand (the Refresh action in panel headers).
-function refreshPanel(name) {
-  const b = document.getElementById('body-' + name);
-  if (b) b.innerHTML = SKELETON_HTML;
-  loadSection(name);
-}
-
-// Export the lead list as a CSV the owner can open in Excel/Sheets.
-async function exportLeads() {
-  try {
-    const d = await api('/api/dashboard/leads');
-    const rows = (d && d.leads) || [];
-    if (!rows.length) { toast('No leads to export yet'); return; }
-    const esc = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
-    const csv = 'Name,Email,Phone\\n' + rows.map(l => [l.name, l.email, l.phone].map(esc).join(',')).join('\\n');
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
-    a.download = 'aria-leads.csv';
-    a.click();
-    URL.revokeObjectURL(a.href);
-    toast('Exported ' + rows.length + ' lead' + (rows.length === 1 ? '' : 's'));
-  } catch (e) { toast('Export failed'); }
-}
-
-// ─── ⌘K command palette ──────────────────────────────────────────────────
-// Press Cmd/Ctrl+K anywhere → fuzzy-search to any panel or action. The
-// signature "power product" feature. Self-contained: one overlay + keymap.
-const CMDS = [
-  { ic: '🏠', label: 'Home',             grp: 'Go', run: function(){ showPanel('home'); } },
-  { ic: '💬', label: 'Conversations',    grp: 'Go', run: function(){ showPanel('conversations'); } },
-  { ic: '🎯', label: 'Leads',            grp: 'Go', run: function(){ showPanel('leads'); } },
-  { ic: '👥', label: 'Customers',        grp: 'Go', run: function(){ showPanel('customers'); } },
-  { ic: '📅', label: 'Bookings',         grp: 'Go', run: function(){ showPanel('bookings'); } },
-  { ic: '🧠', label: 'Train Aria',       grp: 'Go', run: function(){ showPanel('train'); } },
-  { ic: '🔗', label: 'Channels',         grp: 'Go', run: function(){ showPanel('channels'); } },
-  { ic: '🏢', label: 'Business Profile', grp: 'Go', run: function(){ showPanel('profile'); } },
-  { ic: '⚙️', label: 'Settings',         grp: 'Go', run: function(){ showPanel('settings'); } },
-  { ic: '↧', label: 'Export leads as CSV', grp: 'Do', run: function(){ exportLeads(); } },
-  { ic: '↻', label: 'Refresh current panel', grp: 'Do', run: function(){ var p; try{ p = localStorage.getItem('aria_panel'); }catch(e){} if (p && p !== 'home') refreshPanel(p); } },
-  { ic: '🚪', label: 'Log out',          grp: 'Do', run: function(){ logout(); } },
-];
-let _palItems = [], _palSel = 0;
-function openPalette(){ const o = document.getElementById('cmdk'); o.classList.add('show'); const i = document.getElementById('cmdk-input'); i.value = ''; renderPalette(''); setTimeout(function(){ i.focus(); }, 20); }
-function closePalette(){ document.getElementById('cmdk').classList.remove('show'); }
-function renderPalette(q){
-  q = (q || '').toLowerCase().trim();
-  _palItems = CMDS.map(function(c, i){ return { c: c, i: i }; }).filter(function(x){ return !q || x.c.label.toLowerCase().indexOf(q) >= 0; });
-  _palSel = 0;
-  const list = document.getElementById('cmdk-list');
-  if (!_palItems.length) { list.innerHTML = '<div class="cmdk-empty">No matching commands</div>'; return; }
-  list.innerHTML = _palItems.map(function(x, idx){
-    return '<div class="cmdk-item' + (idx === 0 ? ' sel' : '') + '" data-idx="' + idx + '" onclick="runPalette(' + idx + ')"><span class="cmdk-ic">' + x.c.ic + '</span>' + escH(x.c.label) + '<span class="cmdk-grp">' + x.c.grp + '</span></div>';
-  }).join('');
-}
-function movePalette(d){
-  const items = document.querySelectorAll('.cmdk-item');
-  if (!items.length) return;
-  _palSel = (_palSel + d + items.length) % items.length;
-  items.forEach(function(el, i){ el.classList.toggle('sel', i === _palSel); });
-  items[_palSel].scrollIntoView({ block: 'nearest' });
-}
-function runPalette(idx){ const x = _palItems[idx != null ? idx : _palSel]; if (x) { closePalette(); x.c.run(); } }
-document.addEventListener('keydown', function(e){
-  if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
-    e.preventDefault();
-    const o = document.getElementById('cmdk');
-    if (o.classList.contains('show')) closePalette(); else openPalette();
-    return;
-  }
-  if (!document.getElementById('cmdk').classList.contains('show')) return;
-  if (e.key === 'Escape') closePalette();
-  else if (e.key === 'ArrowDown') { e.preventDefault(); movePalette(1); }
-  else if (e.key === 'ArrowUp') { e.preventDefault(); movePalette(-1); }
-  else if (e.key === 'Enter') { e.preventDefault(); runPalette(); }
-});
-
-async function loadSection(name) {
-  if (name === 'leads') await loadLeads();
-  else if (name === 'bookings') await loadBookings();
-  else if (name === 'profile') await loadProfile();
-  else if (name === 'settings') await loadSettings();
-  else if (name === 'conversations') await loadUnifiedConvs('all');
-  else if (name === 'train') await loadTrainAria();
-  else if (name === 'customers') await loadCustomers();
-}
-
-// ─── Customers — repeat-customer profile drill-down ──────────────────────
-async function loadCustomers() {
-  const body = document.getElementById('body-customers');
-  try {
-    const d = await api('/api/dashboard/customers');
-    const list = d.customers || [];
-    if (!list.length) {
-      body.innerHTML = '<div class="empty-state"><div class="es-ic">👥</div><div class="es-t">No returning customers yet</div><div class="es-s">Aria builds this list automatically — whenever the same person messages you 2+ times (matched by email, phone, or name), they appear here with their full history.</div></div>';
-      return;
-    }
-    const icons = { facebook: '📘', instagram: '📷', whatsapp: '💬', email: '📧', voice: '☎️' };
-    let html = '<div style="display:flex;flex-direction:column;gap:8px;">';
-    for (const c of list.slice(0, 100)) {
-      const chans = (c.channels || []).map(ch => icons[ch] || '·').join(' ');
-      html += '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:12px 14px;display:flex;align-items:center;gap:12px;cursor:pointer;transition:all 0.15s;" onmouseover="this.style.borderColor=\\'rgba(255,255,255,0.15)\\'" onmouseout="this.style.borderColor=\\'rgba(255,255,255,0.06)\\'" onclick="showCustomerProfile(\\'' + encodeURIComponent(c.key) + '\\')">' +
-        '<div style="flex:1;min-width:0;">' +
-          '<div style="font-size:13.5px;color:#fff;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH(c.name || c.key.split(':')[1]) + '</div>' +
-          '<div style="font-size:11.5px;color:#8888aa;margin-top:3px;">' + chans + ' · ' + c.touches + ' touch' + (c.touches !== 1 ? 'es' : '') + ' · last seen ' + timeAgo(c.lastSeen) + '</div>' +
-        '</div>' +
-        '<div style="font-size:11px;color:#9d96ff;flex-shrink:0;">View →</div>' +
-      '</div>';
-    }
-    html += '</div>';
-    body.innerHTML = html;
-  } catch (e) { body.innerHTML = '<div class="empty">Failed to load customers.</div>'; }
-}
-
-async function showCustomerProfile(contactKey) {
-  openModal('<div style="color:#8888aa;text-align:center;padding:24px">Loading customer profile…</div>');
-  try {
-    const d = await api('/api/dashboard/customer/' + contactKey);
-    if (d.error) { openModal('<h3>Not found<button class="close-x" onclick="closeModal()">×</button></h3><p style="color:#9898b8">' + escH(d.error) + '</p>'); return; }
-    const ltv = d.ltv || 0;
-    const tier = ltv >= 60 ? {l:'VIP',c:'#00e5a0'} : ltv >= 30 ? {l:'Engaged',c:'#fbbf24'} : ltv >= 10 ? {l:'Active',c:'#9d96ff'} : {l:'New',c:'#8888aa'};
-    const icons = { facebook: '📘', instagram: '📷', whatsapp: '💬', email: '📧' };
-    const channels = (d.channels || []).map(ch => icons[ch] || '·').join(' ');
-
-    // Sentiment timeline as a tiny inline visual
-    const sentBuckets = { positive: 0, neutral: 0, negative: 0, angry: 0 };
-    (d.sentimentTimeline || []).forEach(s => { if (sentBuckets[s.sentiment] !== undefined) sentBuckets[s.sentiment]++; });
-    const sentTotal = Object.values(sentBuckets).reduce((a, b) => a + b, 0);
-    const sentBar = sentTotal ? Object.entries(sentBuckets).filter(([, v]) => v > 0).map(([k, v]) => {
-      const w = (v / sentTotal * 100).toFixed(0);
-      const colorMap = { positive: '#00e5a0', neutral: '#9898b8', negative: '#fbbf24', angry: '#ff6b6b' };
-      return '<div style="flex:' + w + ';background:' + colorMap[k] + ';height:6px;" title="' + k + ': ' + v + '"></div>';
-    }).join('') : '<div style="background:rgba(255,255,255,0.05);height:6px;border-radius:3px;flex:1;"></div>';
-
-    // Lead history rows
-    const leadRows = (d.leadHistory || []).slice(0, 10).map(l => {
-      const scoreColor = l.leadScore === 'hot' ? '#ff6b6b' : l.leadScore === 'warm' ? '#fbbf24' : '#9898b8';
-      return '<div style="padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05);font-size:12px;">' +
-        '<div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;">' +
-          '<span style="background:' + scoreColor + '20;color:' + scoreColor + ';padding:1px 8px;border-radius:10px;font-size:10.5px;font-weight:600;text-transform:uppercase;">' + (l.leadScore || 'unscored') + '</span>' +
-          '<span style="font-size:10.5px;color:#8888aa;">' + (icons[l.channel] || '·') + ' ' + (l.category || 'general') + '</span>' +
-          '<span style="font-size:10.5px;color:#6b6b8a;margin-left:auto;">' + timeAgo(l.ts) + '</span>' +
-        '</div>' +
-        (l.preview ? '<div style="color:#bbb;font-style:italic;line-height:1.5;">"' + escH(l.preview.slice(0, 200)) + '"</div>' : '') +
-      '</div>';
-    }).join('') || '<div class="empty" style="padding:14px 0;font-size:12px;">No lead history</div>';
-
-    // Bookings
-    const bookingRows = (d.bookings || []).slice(0, 5).map(b =>
-      '<div style="background:rgba(0,229,160,0.05);border-radius:8px;padding:10px;margin-bottom:6px;font-size:12.5px;">' +
-        '<div style="color:#fff;font-weight:600;">📅 ' + escH(b.service || 'Booking') + '</div>' +
-        '<div style="color:#00e5a0;font-size:11.5px;margin-top:3px;">' + escH(b.datetime || '—') + '</div>' +
-      '</div>'
-    ).join('') || '<div class="empty" style="padding:14px 0;font-size:12px;">No bookings yet</div>';
-
-    // Conversation threads
-    const convRows = (d.conversations || []).slice(0, 5).map(c =>
-      '<div onclick="closeModal();setTimeout(() => showThread(\\'' + c.memKey + '\\'), 100)" style="background:rgba(255,255,255,0.03);border-radius:8px;padding:10px;margin-bottom:6px;font-size:12.5px;cursor:pointer;border:1px solid rgba(255,255,255,0.06);" onmouseover="this.style.borderColor=\\'rgba(157,150,255,0.4)\\'" onmouseout="this.style.borderColor=\\'rgba(255,255,255,0.06)\\'">' +
-        '<div style="color:#fff;">' + (icons[c.channel] || '·') + ' ' + c.msgCount + ' messages</div>' +
-        '<div style="color:#8888aa;font-size:11px;margin-top:3px;">Last: ' + timeAgo(c.lastMsgTs) + ' — click to view →</div>' +
-      '</div>'
-    ).join('') || '<div class="empty" style="padding:14px 0;font-size:12px;">No conversation threads found</div>';
-
-    openModal(
-      '<div style="display:flex;align-items:start;justify-content:space-between;margin-bottom:18px;gap:12px;">' +
-        '<div style="flex:1;min-width:0;">' +
-          '<h3 style="font-size:18px;color:#fff;margin:0 0 4px;">' + escH(d.name || contactKey.split(':')[1]) + '</h3>' +
-          '<div style="font-size:11.5px;color:#8888aa;">' + channels + ' · ' + d.touches + ' touch' + (d.touches !== 1 ? 'es' : '') + ' · first seen ' + timeAgo(d.lastSeen) + '</div>' +
-        '</div>' +
-        '<div style="text-align:right;flex-shrink:0;">' +
-          '<div style="background:' + tier.c + '20;color:' + tier.c + ';padding:3px 12px;border-radius:14px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;display:inline-block;">' + tier.l + '</div>' +
-          '<div style="font-size:20px;font-weight:800;color:' + tier.c + ';margin-top:6px;">' + ltv + '</div>' +
-          '<div style="font-size:10px;color:#6b6b8a;text-transform:uppercase;letter-spacing:0.5px;">LTV score</div>' +
-        '</div>' +
-        '<button class="close-x" onclick="closeModal()" style="margin-left:8px;">×</button>' +
-      '</div>' +
-      (sentTotal ? '<div style="margin-bottom:18px;"><div style="font-size:11px;color:#8888aa;text-transform:uppercase;margin-bottom:6px;letter-spacing:0.5px;">Sentiment over time</div><div style="display:flex;gap:0;border-radius:3px;overflow:hidden;">' + sentBar + '</div></div>' : '') +
-      '<div style="margin-bottom:18px;"><div style="font-size:11px;color:#8888aa;text-transform:uppercase;margin-bottom:8px;letter-spacing:0.5px;">📅 Bookings (' + (d.bookings?.length || 0) + ')</div>' + bookingRows + '</div>' +
-      '<div style="margin-bottom:18px;"><div style="font-size:11px;color:#8888aa;text-transform:uppercase;margin-bottom:8px;letter-spacing:0.5px;">💬 Conversation threads</div>' + convRows + '</div>' +
-      '<div><div style="font-size:11px;color:#8888aa;text-transform:uppercase;margin-bottom:8px;letter-spacing:0.5px;">🎯 Lead history (' + (d.leadHistory?.length || 0) + ')</div>' + leadRows + '</div>'
-    );
-  } catch (e) { openModal('<div style="color:#ff6b6b">Failed to load profile: ' + e.message + '</div>'); }
-}
-
-// ─── Modal + drill-down helpers ─────────────────────────────────────────
-function openModal(html) {
-  document.getElementById('modal-content').innerHTML = html;
-  document.getElementById('modal-overlay').classList.add('show');
-}
-function closeModal() {
-  document.getElementById('modal-overlay').classList.remove('show');
-}
-
-async function showThread(memKey) {
-  openModal('<div style="color:#8888aa;text-align:center;padding:24px">Loading conversation…</div>');
-  try {
-    const d = await api('/api/dashboard/conversation/' + encodeURIComponent(memKey));
-    const rows = (d.history || []).map(h => {
-      const cls = h.role === 'sender' ? 'them' : (h.role === 'summary' ? 'summary' : 'us');
-      const label = h.role === 'sender' ? 'Customer' : (h.role === 'summary' ? 'Earlier summary' : 'Aria');
-      return '<div>' +
-        '<div class="thread-meta">' + escH(label) + ' · ' + timeAgo(h.date) + '</div>' +
-        '<div class="thread-msg ' + cls + '">' + escH(h.preview || '') + '</div>' +
-      '</div>';
-    }).join('');
-    const pauseChip = d.state?.paused
-      ? '<span style="background:rgba(251,191,36,0.15);color:#fbbf24;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;margin-left:8px;">PAUSED · ' + escH(d.state.reason || 'human takeover') + '</span>'
-      : '';
-    openModal(
-      '<h3>💬 ' + escH(d.channel || 'channel') + ' conversation' + pauseChip +
-        '<button class="close-x" onclick="closeModal()">×</button></h3>' +
-      '<div style="font-size:11.5px;color:#6b6b8a;margin-bottom:14px;">With ' + escH(d.senderId) + '</div>' +
-      (rows || '<div class="empty" style="padding:14px 0">No messages stored.</div>') +
-      (d.state?.paused ? '<div style="margin-top:16px;text-align:center;"><button class="cta-btn" onclick="resumeConv(\\'' + memKey + '\\');closeModal()">Resume Aria on this conversation</button></div>' : '')
-    );
-  } catch (e) { openModal('<div style="color:#ff6b6b">Failed to load conversation: ' + e.message + '</div>'); }
-}
-
-async function showCsatDetail() {
-  openModal('<div style="color:#8888aa;text-align:center;padding:24px">Loading 👎 ratings…</div>');
-  try {
-    const d = await api('/api/dashboard/csat-detail');
-    if (!d.items?.length) {
-      openModal('<h3>⭐ CSAT details<button class="close-x" onclick="closeModal()">×</button></h3>' +
-        '<div class="empty" style="padding:24px 0">No 👎 ratings yet — Aria\\'s been doing well!</div>');
-      return;
-    }
-    const rows = d.items.map(item => {
-      const recent = (item.history || []).slice(-3).map(h =>
-        '<div class="thread-meta">' + (h.role === 'sender' ? 'Customer' : 'Aria') + ' · ' + timeAgo(h.date) + '</div>' +
-        '<div class="thread-msg ' + (h.role === 'sender' ? 'them' : 'us') + '">' + escH(h.preview || '') + '</div>'
-      ).join('');
-      return '<div style="border-bottom:1px solid rgba(255,255,255,0.06);padding:14px 0;">' +
-        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">' +
-          '<div style="color:#fff;font-weight:600;font-size:13px;">👎 ' + escH(item.senderName || item.senderId) + ' <span style="font-weight:400;color:#8888aa;font-size:11px;">on ' + escH(item.channel) + '</span></div>' +
-          '<div style="font-size:11px;color:#8888aa;">' + timeAgo(item.ts) + '</div>' +
-        '</div>' +
-        (item.raw ? '<div style="font-size:12px;color:#8888aa;font-style:italic;margin-bottom:8px;">"' + escH(item.raw) + '"</div>' : '') +
-        (recent || '<div style="font-size:12px;color:#6b6b8a;">No conversation history retained.</div>') +
-      '</div>';
-    }).join('');
-    openModal(
-      '<h3>👎 Negative ratings — last 30<button class="close-x" onclick="closeModal()">×</button></h3>' +
-      '<p style="font-size:12px;color:#8888aa;margin-bottom:14px;">Customers who rated Aria\\'s replies negatively. Use these to improve your Knowledge Documents or Topic Scope.</p>' +
-      rows
-    );
-  } catch (e) { openModal('<div style="color:#ff6b6b">Failed: ' + e.message + '</div>'); }
-}
-
-// Quick-toggle helper used by channel chips for email auto-reply
-async function toggleSetting(key, value) {
-  try {
-    const body = { owner: OWNER };
-    body[key] = value;
-    const r = await apiPost('/api/dashboard/settings', body);
-    if (r.ok) { toast(value ? 'Auto-reply ON' : 'Auto-reply paused'); loadStats(); }
-  } catch (e) { toast('Failed to toggle'); }
-}
-
-// ─── Unified Conversations ─────────────────────────────────────────────
-let convFilter = 'all';
-async function loadUnifiedConvs(filter) {
-  convFilter = filter || 'all';
-  // Update filter button styles
-  document.querySelectorAll('.conv-filter').forEach(btn => {
-    const isActive = btn.dataset.filter === convFilter;
-    btn.classList.toggle('active', isActive);
-    btn.style.background = isActive ? 'rgba(0,229,160,0.15)' : 'rgba(255,255,255,0.06)';
-    btn.style.color = isActive ? '#00e5a0' : '#ccc';
-    btn.style.borderColor = isActive ? 'rgba(0,229,160,0.3)' : 'rgba(255,255,255,0.1)';
-  });
-  const container = document.getElementById('conversations-list');
-  try {
-    const items = [];
-    // Channel messages (FB/IG/WA)
-    if (convFilter === 'all' || convFilter === 'facebook' || convFilter === 'instagram' || convFilter === 'whatsapp') {
-      const chFilter = convFilter === 'all' ? 'all' : convFilter;
-      const d = await api('/api/dashboard/messages?channel=' + chFilter + '&page=1');
-      for (const m of (d.items || [])) {
-        items.push({
-          channel: m.channel,
-          from: m.senderName || m.senderId,
-          senderId: m.senderId,
-          msg: m.message, reply: m.reply, ts: m.timestamp,
-        });
-      }
-    }
-    // Email inbox
-    if (convFilter === 'all' || convFilter === 'email') {
-      const d = await api('/api/dashboard/inbox-log?page=1');
-      for (const r of (d.items || [])) {
-        items.push({
-          channel: 'email', from: r.senderEmail, msg: r.subject,
-          reply: r.replyPreview, ts: r.sentAt,
-        });
-      }
-    }
-    items.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
-    if (!items.length) {
-      container.innerHTML = '<div class="empty">No conversations yet on this channel.</div>';
-      return;
-    }
-    const icons = { email: '📧', facebook: '📘', instagram: '📷', whatsapp: '💬' };
-    let html = '<table><thead><tr><th></th><th>From</th><th>Message</th><th>Aria\\'s reply</th><th>When</th></tr></thead><tbody>';
-    for (const it of items.slice(0, 50)) {
-      // Channel messages get a memKey we can use for thread drill-down.
-      // Email entries don't yet (separate ledger) — clicking does nothing for email.
-      const memKey = it.channel !== 'email' && it.senderId
-        ? OWNER + '::' + it.channel + '::' + it.senderId
-        : null;
-      const clickAttr = memKey ? ' onclick="showThread(\\'' + memKey + '\\')" style="cursor:pointer"' : '';
-      html += '<tr' + clickAttr + '>' +
-        '<td style="width:24px">' + (icons[it.channel] || '') + '</td>' +
-        '<td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH(it.from || '—') + '</td>' +
-        '<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH((it.msg || '').substring(0, 100)) + '</td>' +
-        '<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH((it.reply || '').substring(0, 100)) + '</td>' +
-        '<td style="width:80px;font-size:11.5px;color:#8888aa">' + timeAgo(it.ts) + '</td>' +
-      '</tr>';
-    }
-    html += '</tbody></table>';
-    container.innerHTML = html;
-  } catch (e) { container.innerHTML = '<div class="empty">Failed to load conversations.</div>'; }
-}
-
-// ─── Train Aria (KB + Knowledge docs + Services + Scope) ────────────────
-async function loadTrainAria() {
-  const body = document.getElementById('body-train');
-  body.innerHTML = '<div style="padding:8px 0;">' +
-    '<p style="font-size:13px;color:#9898b8;margin-bottom:18px;">Teach Aria your business — answers, documents, services, hours, and what topics she should + shouldn\\'t handle.</p>' +
-    '<div id="train-test" style="margin-bottom:28px;"></div>' +
-    '<div id="train-gaps" style="margin-bottom:28px;"></div>' +
-    '<div id="train-quick" style="margin-bottom:28px;"></div>' +
-    '<div id="train-knowledge" style="margin-bottom:28px;"></div>' +
-    '<div id="train-services" style="margin-bottom:28px;"></div>' +
-    '<div id="train-hours" style="margin-bottom:28px;"></div>' +
-    '<div id="train-scope" style="margin-bottom:8px;"></div>' +
-  '</div>';
-  renderTestAriaCard();
-  renderQuickTrainCard();
-  await Promise.all([loadKnowledgeDocs(), loadServicesEditor(), loadScopeEditor(), loadKnowledgeGaps(), loadBusinessHoursEditor()]);
-}
-
-// ─── Test Aria sandbox ────────────────────────────────────────────────────
-function renderTestAriaCard() {
-  const el = document.getElementById('train-test');
-  el.innerHTML =
-    '<div style="background:rgba(0,229,160,0.04);border:1px solid rgba(0,229,160,0.2);border-radius:14px;padding:18px;">' +
-      '<h4 style="font-size:14px;color:#fff;margin-bottom:6px;display:flex;align-items:center;gap:8px;">🧪 Test Aria <span style="font-size:11px;font-weight:400;color:#9898b8;">— ask her anything, see how she\\'d reply</span></h4>' +
-      '<p style="font-size:12.5px;color:#9898b8;margin-bottom:12px;line-height:1.6;">Type a question a real customer might ask. Aria will reply using your current knowledge + scope settings. Test things before real customers hit them.</p>' +
-      '<div style="display:flex;gap:8px;margin-bottom:12px;">' +
-        '<input id="ta-q" placeholder="e.g. Do you do same-day bookings?" style="flex:1;" onkeydown="if(event.key===\\'Enter\\')testAria()">' +
-        '<button class="cta-btn" onclick="testAria()" id="ta-btn">Ask Aria</button>' +
-      '</div>' +
-      '<div id="ta-result"></div>' +
-    '</div>';
-}
-
-async function testAria() {
-  const q = document.getElementById('ta-q').value.trim();
-  if (!q) { toast('Type a question first'); return; }
-  const btn = document.getElementById('ta-btn');
-  const result = document.getElementById('ta-result');
-  btn.disabled = true;
-  btn.textContent = '⏳';
-  result.innerHTML = '';
-  try {
-    const r = await apiPost('/api/dashboard/test-aria', { message: q });
-    if (r.error) { toast(r.error); btn.disabled = false; btn.textContent = 'Ask Aria'; return; }
-    const reply = r.reply;
-    const badges = [];
-    if (reply.sentiment) badges.push('Sentiment: <b>' + reply.sentiment + '</b>');
-    if (reply.urgency)   badges.push('Urgency: <b>' + reply.urgency + '</b>');
-    if (reply.language && reply.language !== 'en') badges.push('Language: <b>' + reply.language + '</b>');
-    if (reply.outOfScope) badges.push('<span style="color:#ff6b6b">⚠️ OUT OF SCOPE</span>');
-    if (reply.needsHuman) badges.push('<span style="color:#fbbf24">🤝 NEEDS HUMAN</span>');
-    if (reply.booking)    badges.push('<span style="color:#00e5a0">📅 BOOKING DETECTED</span>');
-    if (reply.showServicesCarousel) badges.push('<span style="color:#9d96ff">🎠 SHOWS CAROUSEL</span>');
-    result.innerHTML =
-      '<div style="background:rgba(255,255,255,0.03);border-radius:10px;padding:14px;">' +
-        '<div style="font-size:11.5px;color:#8888aa;margin-bottom:6px;">Aria\\'s reply:</div>' +
-        '<div style="color:#eee;font-size:13.5px;line-height:1.6;white-space:pre-wrap;margin-bottom:10px;">' + escH(reply.text) + '</div>' +
-        (reply.suggestedReplies?.length ? '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">' + reply.suggestedReplies.map(s => '<span style="background:rgba(0,229,160,0.1);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:20px;padding:4px 12px;font-size:11.5px;">' + escH(s) + '</span>').join('') + '</div>' : '') +
-        (badges.length ? '<div style="font-size:11px;color:#8888aa;margin-top:8px;">' + badges.join(' · ') + '</div>' : '') +
-        (r.citedChunks?.length ? '<div style="margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.06);"><div style="font-size:11px;color:#8888aa;margin-bottom:6px;">📚 Cited from your knowledge:</div>' + r.citedChunks.map(c => '<div style="font-size:11.5px;color:#aaa;margin:3px 0;"><b>' + escH(c.title) + '</b>: ' + escH(c.preview) + '…</div>').join('') + '</div>' : '') +
-      '</div>';
-    btn.disabled = false;
-    btn.textContent = 'Ask Aria';
-  } catch (e) { toast('Test failed: ' + e.message); btn.disabled = false; btn.textContent = 'Ask Aria'; }
-}
-
-// ─── Knowledge Gaps panel ────────────────────────────────────────────────
-async function loadKnowledgeGaps() {
-  const el = document.getElementById('train-gaps');
-  try {
-    const d = await api('/api/dashboard/channel-gaps');
-    if (!d.clusters?.length) {
-      el.innerHTML =
-        '<div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:16px;">' +
-          '<h4 style="font-size:14px;color:#fff;margin-bottom:4px;">🕳️ Knowledge Gaps</h4>' +
-          '<p style="font-size:12px;color:#8888aa;">No gaps in the last 30 days — Aria is answering everything customers ask. Nice.</p>' +
-        '</div>';
-      return;
-    }
-    // Bulk-bootstrap banner — only show if there are 3+ clusters (worthwhile)
-    const bootstrapBanner = d.clusters.length >= 3
-      ? '<div style="background:linear-gradient(135deg,rgba(0,229,160,0.08),rgba(157,150,255,0.08));border:1px solid rgba(0,229,160,0.3);border-radius:14px;padding:18px;margin-bottom:14px;">' +
-          '<div style="display:flex;align-items:center;justify-content:space-between;gap:16px;">' +
-            '<div style="flex:1;">' +
-              '<h4 style="font-size:14px;color:#fff;margin:0 0 4px;display:flex;align-items:center;gap:8px;">🚀 Bootstrap Aria\\'s knowledge base in 1 click</h4>' +
-              '<p style="font-size:12px;color:#9898b8;margin:0;line-height:1.5;">She\\'ll draft answers to your top ' + Math.min(10, d.clusters.length) + ' unanswered questions in ~5 seconds. Review and accept the lot in one go.</p>' +
-            '</div>' +
-            '<button onclick="bootstrapFaqs()" id="bootstrap-btn" style="background:#00e5a0;color:#0d0d1f;border:none;border-radius:8px;padding:8px 18px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;flex-shrink:0;">✨ Draft all answers</button>' +
-          '</div>' +
-          '<div id="bootstrap-results" style="margin-top:14px;"></div>' +
-        '</div>'
-      : '';
-
-    el.innerHTML =
-      bootstrapBanner +
-      '<div style="background:rgba(251,191,36,0.04);border:1px solid rgba(251,191,36,0.25);border-radius:14px;padding:18px;">' +
-        '<h4 style="font-size:14px;color:#fff;margin-bottom:6px;display:flex;align-items:center;gap:8px;">🕳️ Knowledge Gaps <span style="background:rgba(251,191,36,0.2);color:#fbbf24;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;">' + d.clusters.length + '</span></h4>' +
-        '<p style="font-size:12.5px;color:#9898b8;margin-bottom:14px;line-height:1.6;">Customers asked these questions but Aria fell back to vague answers. Click any to have her draft a knowledge entry that\\'ll fix it.</p>' +
-        '<div style="display:flex;flex-direction:column;gap:8px;">' +
-          d.clusters.map((c, i) => '<div style="background:rgba(255,255,255,0.04);border-radius:10px;padding:12px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;">' +
-            '<div style="flex:1;min-width:0;">' +
-              '<div style="font-size:13px;color:#eee;overflow:hidden;text-overflow:ellipsis;">' + escH(c.sampleQuestion) + '</div>' +
-              '<div style="font-size:11px;color:#8888aa;margin-top:3px;">' + c.count + ' time' + (c.count > 1 ? 's' : '') + ' · last asked ' + timeAgo(c.lastSeen) + '</div>' +
-            '</div>' +
-            '<button onclick="draftGapKb(' + i + ')" style="background:rgba(251,191,36,0.15);color:#fbbf24;border:1px solid rgba(251,191,36,0.3);border-radius:6px;padding:4px 12px;font-size:11.5px;cursor:pointer;font-family:inherit;flex-shrink:0;">✨ Draft answer</button>' +
-          '</div>').join('') +
-        '</div>' +
-        '<div id="gap-draft" style="margin-top:14px;"></div>' +
-      '</div>';
-    window._gaps = d.clusters;
-  } catch (e) {
-    el.innerHTML = '<div class="empty">Failed to load knowledge gaps.</div>';
-  }
-}
-
-async function draftGapKb(idx) {
-  const cluster = window._gaps?.[idx];
-  if (!cluster) return;
-  const draftEl = document.getElementById('gap-draft');
-  draftEl.innerHTML = '<div style="background:rgba(255,255,255,0.03);padding:14px;border-radius:10px;color:#8888aa;font-size:13px;">⏳ Aria is drafting a knowledge entry from these questions…</div>';
-  try {
-    const questions = cluster.examples.map(e => e.question);
-    const r = await apiPost('/api/dashboard/gap-to-kb', { questions });
-    if (r.error) { draftEl.innerHTML = '<div style="color:#ff6b6b">' + r.error + '</div>'; return; }
-    const draft = r.draft;
-    const placeholderWarning = draft.needsOwnerInput?.length
-      ? '<div style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);border-radius:8px;padding:10px;margin-bottom:10px;font-size:12px;color:#fbbf24;"><b>⚠️ You need to fill in these placeholders before it\\'s useful:</b><br>' + draft.needsOwnerInput.map(p => '· ' + escH(p)).join('<br>') + '</div>'
-      : '';
-    draftEl.innerHTML =
-      '<div style="background:rgba(0,229,160,0.05);border:1px solid rgba(0,229,160,0.3);border-radius:12px;padding:14px;">' +
-        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">' +
-          '<b style="color:#00e5a0;font-size:13px;">📝 Aria\\'s draft</b>' +
-          '<div style="display:flex;gap:8px;">' +
-            '<button onclick="document.getElementById(\\'gap-draft\\').innerHTML=\\'\\'" style="background:rgba(255,255,255,0.06);color:#8888aa;border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:4px 12px;font-size:11px;cursor:pointer;font-family:inherit;">Discard</button>' +
-            '<button onclick="acceptGapDraft()" style="background:#00e5a0;color:#0d0d1f;border:none;border-radius:6px;padding:4px 14px;font-size:11.5px;font-weight:600;cursor:pointer;font-family:inherit;">+ Add to knowledge</button>' +
-          '</div>' +
-        '</div>' +
-        placeholderWarning +
-        '<div class="form-group" style="margin-bottom:10px;"><label>Title</label><input id="gap-title" value="' + escH(draft.title) + '"></div>' +
-        '<div class="form-group"><label>Content (edit before accepting)</label><textarea id="gap-content" rows="8">' + escH(draft.content) + '</textarea></div>' +
-      '</div>';
-    window._gapDraft = draft;
-  } catch (e) { draftEl.innerHTML = '<div style="color:#ff6b6b">Draft failed: ' + e.message + '</div>'; }
-}
-
-async function bootstrapFaqs() {
-  const btn = document.getElementById('bootstrap-btn');
-  const out = document.getElementById('bootstrap-results');
-  if (!btn || !out) return;
-  btn.disabled = true; btn.textContent = '⏳ Drafting…';
-  out.innerHTML = '<div style="background:rgba(255,255,255,0.03);padding:14px;border-radius:10px;color:#8888aa;font-size:12.5px;">Aria is drafting answers in parallel. This takes ~5 seconds for 10 clusters…</div>';
-  try {
-    const r = await apiPost('/api/dashboard/faq-bootstrap', { limit: 10 });
-    btn.disabled = false; btn.textContent = '✨ Re-draft';
-    const drafts = (r.drafts || []).filter(d => d.draft);
-    if (drafts.length === 0) {
-      out.innerHTML = '<div class="empty" style="padding:14px;">No drafts came back — try again or use per-question drafting below.</div>';
-      return;
-    }
-    window._bootstrapDrafts = drafts;
-    const cards = drafts.map((d, i) => {
-      const placeholderWarn = d.draft.needsOwnerInput?.length
-        ? '<div style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.25);border-radius:6px;padding:6px 10px;margin:8px 0;font-size:11px;color:#fbbf24;">⚠️ Fill placeholders: ' + d.draft.needsOwnerInput.map(escH).join(' · ') + '</div>'
-        : '';
-      return '<div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:12px 14px;margin-bottom:10px;">' +
-        '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;">' +
-          '<div style="font-size:11px;color:#8888aa;">' +
-            '<label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">' +
-              '<input type="checkbox" class="bs-pick" data-idx="' + i + '" checked style="margin:0;">' +
-              '<span>Asked ' + d.count + '× · ' + escH(d.sampleQuestion.slice(0, 70)) + (d.sampleQuestion.length > 70 ? '…' : '') + '</span>' +
-            '</label>' +
-          '</div>' +
-        '</div>' +
-        '<div class="form-group" style="margin-bottom:8px;"><label style="font-size:10.5px;">Title</label><input class="bs-title" data-idx="' + i + '" value="' + escH(d.draft.title) + '" style="font-size:13px;"></div>' +
-        '<div class="form-group" style="margin-bottom:0;"><label style="font-size:10.5px;">Content</label><textarea class="bs-content" data-idx="' + i + '" rows="5" style="font-size:12.5px;">' + escH(d.draft.content) + '</textarea></div>' +
-        placeholderWarn +
-      '</div>';
-    }).join('');
-    out.innerHTML =
-      '<div style="font-size:11.5px;color:#8888aa;margin:8px 0 10px;">Uncheck any you don\\'t want. Edit content freely. Then save the lot.</div>' +
-      cards +
-      '<div style="display:flex;justify-content:flex-end;gap:8px;">' +
-        '<button onclick="document.getElementById(\\'bootstrap-results\\').innerHTML=\\'\\'" style="background:rgba(255,255,255,0.06);color:#8888aa;border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:8px 14px;font-size:12px;cursor:pointer;font-family:inherit;">Discard all</button>' +
-        '<button onclick="bulkAcceptFaqs()" style="background:#00e5a0;color:#0d0d1f;border:none;border-radius:8px;padding:8px 18px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;">+ Save all to KB</button>' +
-      '</div>';
-  } catch (e) {
-    btn.disabled = false; btn.textContent = '✨ Draft all answers';
-    out.innerHTML = '<div style="color:#ff6b6b;font-size:12px;">Bootstrap failed: ' + escH(e.message || 'unknown') + '</div>';
-  }
-}
-
-async function bulkAcceptFaqs() {
-  const picks = Array.from(document.querySelectorAll('.bs-pick:checked')).map(c => Number(c.getAttribute('data-idx')));
-  if (picks.length === 0) { toast('Nothing selected'); return; }
-  const accepted = picks.map(idx => ({
-    title:   document.querySelector('.bs-title[data-idx="' + idx + '"]').value.trim(),
-    content: document.querySelector('.bs-content[data-idx="' + idx + '"]').value.trim(),
-  })).filter(a => a.title && a.content);
-  try {
-    const r = await apiPost('/api/dashboard/faq-bootstrap/accept', { accepted });
-    if (r.ok) {
-      toast('✓ Saved ' + r.saved + ' to knowledge base' + (r.skipped ? ' (' + r.skipped + ' skipped)' : ''));
-      document.getElementById('bootstrap-results').innerHTML = '';
-      loadKnowledgeDocs();
-      loadKnowledgeGaps();
-    } else { toast(r.error || 'Save failed'); }
-  } catch (e) { toast('Bulk save failed'); }
-}
-
-async function acceptGapDraft() {
-  const title = document.getElementById('gap-title').value.trim();
-  const content = document.getElementById('gap-content').value.trim();
-  if (!title || !content) { toast('Title + content required'); return; }
-  try {
-    const r = await apiPost('/api/dashboard/knowledge', { title, content });
-    if (r.ok) {
-      toast('✓ Added — Aria will use this next time customers ask');
-      document.getElementById('gap-draft').innerHTML = '';
-      loadKnowledgeDocs();
-    } else toast(r.error || 'Save failed');
-  } catch (e) { toast('Save failed'); }
-}
-
-// ─── Quick Train wizard — one-line input → full draft via Claude ─────────
-function renderQuickTrainCard() {
-  const el = document.getElementById('train-quick');
-  el.innerHTML =
-    '<div style="background:linear-gradient(135deg,rgba(108,99,255,0.12),rgba(108,99,255,0.03));border:1px dashed rgba(108,99,255,0.4);border-radius:14px;padding:20px;">' +
-      '<h4 style="font-size:14px;color:#fff;margin-bottom:6px;display:flex;align-items:center;gap:8px;">✨ Quick Train <span style="font-size:11px;font-weight:400;color:#9898b8;">— let Aria draft everything for you</span></h4>' +
-      '<p style="font-size:12.5px;color:#9898b8;margin-bottom:14px;line-height:1.6;">Paste your website URL or describe your business in a sentence. Aria will read it and draft your knowledge doc, services carousel, and topic scope — you just review + accept.</p>' +
-      '<div class="form-group" style="margin-bottom:10px;"><label>Your website URL (optional)</label><input id="qt-url" type="text" placeholder="https://your-business.co.uk"></div>' +
-      '<div class="form-group" style="margin-bottom:12px;"><label>Or describe your business in 1-3 sentences</label><textarea id="qt-desc" rows="3" placeholder="e.g. I run How High Scaffolding in Carlisle. We do domestic and commercial scaffolding, all NASC-compliant. Free quotes within 24 hours."></textarea></div>' +
-      '<button class="cta-btn" onclick="runQuickTrain()" id="qt-btn">✨ Generate draft</button>' +
-      '<div id="qt-result" style="margin-top:16px;"></div>' +
-    '</div>';
-}
-
-async function runQuickTrain() {
-  const url = document.getElementById('qt-url').value.trim();
-  const desc = document.getElementById('qt-desc').value.trim();
-  if (!url && !desc) { toast('Enter a URL or description'); return; }
-  const btn = document.getElementById('qt-btn');
-  const result = document.getElementById('qt-result');
-  btn.disabled = true;
-  btn.textContent = '⏳ Aria is reading…';
-  result.innerHTML = '';
-  try {
-    const r = await apiPost('/api/dashboard/ai-train', { websiteUrl: url, description: desc });
-    if (r.error) { toast(r.error); btn.disabled = false; btn.textContent = '✨ Generate draft'; return; }
-    window._qtDraft = r;
-    renderQuickTrainResult(r);
-  } catch (e) { toast('Draft failed: ' + e.message); btn.disabled = false; btn.textContent = '✨ Generate draft'; }
-}
-
-function renderQuickTrainResult(r) {
-  const el = document.getElementById('qt-result');
-  const btn = document.getElementById('qt-btn');
-  btn.disabled = false;
-  btn.textContent = '✨ Re-generate draft';
-  const kd = r.knowledgeDoc;
-  const services = r.services || [];
-  const topics = r.allowedTopics || [];
-  el.innerHTML =
-    '<div style="background:rgba(0,229,160,0.05);border:1px solid rgba(0,229,160,0.3);border-radius:12px;padding:16px;margin-top:14px;">' +
-      '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">' +
-        '<b style="color:#00e5a0;font-size:13px;">📝 Aria\\'s draft — review + accept what you want</b>' +
-        '<button onclick="acceptAllQt()" style="background:#00e5a0;color:#0d0d1f;border:none;border-radius:8px;padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;">+ Accept ALL</button>' +
-      '</div>' +
-      (kd ? '<div style="background:rgba(255,255,255,0.03);border-radius:10px;padding:12px;margin-bottom:12px;">' +
-        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">' +
-          '<b style="color:#fff;font-size:12.5px;">📚 ' + escH(kd.title || 'Knowledge document') + '</b>' +
-          '<button onclick="acceptQtDoc()" style="background:rgba(0,229,160,0.15);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:6px;padding:3px 12px;font-size:11px;cursor:pointer;font-family:inherit;">+ Accept</button>' +
-        '</div>' +
-        '<div style="font-size:12px;color:#bbb;white-space:pre-wrap;max-height:160px;overflow-y:auto;line-height:1.6;">' + escH(kd.content || '') + '</div>' +
-      '</div>' : '') +
-      (services.length ? '<div style="background:rgba(255,255,255,0.03);border-radius:10px;padding:12px;margin-bottom:12px;">' +
-        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">' +
-          '<b style="color:#fff;font-size:12.5px;">🎠 Services (' + services.length + ')</b>' +
-          '<button onclick="acceptQtServices()" style="background:rgba(0,229,160,0.15);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:6px;padding:3px 12px;font-size:11px;cursor:pointer;font-family:inherit;">+ Accept all</button>' +
-        '</div>' +
-        services.map(s => '<div style="font-size:12px;color:#bbb;padding:4px 0;"><b>' + escH(s.title) + '</b> · ' + escH(s.subtitle || '') + '</div>').join('') +
-      '</div>' : '') +
-      (topics.length ? '<div style="background:rgba(255,255,255,0.03);border-radius:10px;padding:12px;">' +
-        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">' +
-          '<b style="color:#fff;font-size:12.5px;">🚦 Topic Scope (' + topics.length + ')</b>' +
-          '<button onclick="acceptQtTopics()" style="background:rgba(0,229,160,0.15);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:6px;padding:3px 12px;font-size:11px;cursor:pointer;font-family:inherit;">+ Accept all</button>' +
-        '</div>' +
-        '<div style="display:flex;flex-wrap:wrap;gap:5px;">' +
-          topics.map(t => '<span style="background:rgba(255,255,255,0.06);color:#ccc;padding:3px 10px;border-radius:12px;font-size:11.5px;">' + escH(t) + '</span>').join('') +
-        '</div>' +
-      '</div>' : '') +
-    '</div>';
-}
-
-async function acceptQtDoc() {
-  const kd = window._qtDraft?.knowledgeDoc;
-  if (!kd) return;
-  const r = await apiPost('/api/dashboard/knowledge', { title: kd.title, content: kd.content });
-  if (r.ok) { toast('Knowledge doc added'); loadKnowledgeDocs(); }
-}
-async function acceptQtServices() {
-  const services = window._qtDraft?.services;
-  if (!services?.length) return;
-  // Merge with any existing
-  const existing = window._services || [];
-  window._services = existing.concat(services).slice(0, 10);
-  const r = await apiPost('/api/dashboard/profile', { owner: OWNER, servicesCarousel: window._services });
-  if (r.ok) { toast('Services added'); loadServicesEditor(); }
-}
-async function acceptQtTopics() {
-  const topics = window._qtDraft?.allowedTopics;
-  if (!topics?.length) return;
-  const existing = window._scopeTopics || [];
-  const merged = [...new Set([...existing, ...topics])];
-  const r = await apiPost('/api/dashboard/profile', { owner: OWNER, allowedTopics: merged });
-  if (r.ok) { toast('Topics added'); loadScopeEditor(); }
-}
-async function acceptAllQt() {
-  if (!window._qtDraft) return;
-  toast('Accepting all 3 — one moment…');
-  await acceptQtDoc();
-  await acceptQtServices();
-  await acceptQtTopics();
-  document.getElementById('qt-result').innerHTML = '<div style="text-align:center;color:#00e5a0;padding:16px;font-size:13px;">✓ All accepted. Aria is now trained on your business.</div>';
-}
-
-async function loadKnowledgeDocs() {
-  const el = document.getElementById('train-knowledge');
-  try {
-    const d = await api('/api/dashboard/knowledge');
-    const rows = (d.docs || []).map((doc, i) => {
-      return '<div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:12px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;">' +
-        '<div style="min-width:0;flex:1;">' +
-          '<div style="font-size:13px;color:#fff;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH(doc.title) + '</div>' +
-          '<div style="font-size:11px;color:#8888aa;margin-top:2px;">' + (doc.charCount || 0).toLocaleString() + ' chars · uploaded ' + timeAgo(doc.uploadedAt) + '</div>' +
-        '</div>' +
-        '<button onclick="deleteKnowledgeDoc(' + i + ')" style="background:rgba(255,80,80,0.1);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit;flex-shrink:0;">Remove</button>' +
-      '</div>';
-    }).join('');
-    el.innerHTML =
-      '<h4 style="font-size:13px;color:#fff;margin-bottom:10px;">📚 Knowledge Documents <span style="font-size:11px;font-weight:400;color:#8888aa;">— Aria cites these for accurate answers (no hallucination)</span></h4>' +
-      (rows ? '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">' + rows + '</div>' : '<div class="empty" style="padding:14px 0">No documents yet. Paste your services, prices, FAQ, policies — anything Aria should know.</div>') +
-      '<div style="background:rgba(0,229,160,0.05);border:1px solid rgba(0,229,160,0.15);border-radius:10px;padding:14px;">' +
-        '<div class="form-group" style="margin-bottom:10px;"><label>Document title</label><input id="kd-title" type="text" placeholder="e.g. Service prices, Booking policy, Care instructions"></div>' +
-        '<div class="form-group" style="margin-bottom:12px;">' +
-          '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;">' +
-            '<label style="margin-bottom:0;">Content (paste any plain text — services, prices, FAQ, policies, etc.)</label>' +
-            '<button onclick="improveKnowledge()" style="background:rgba(108,99,255,0.15);color:#9d96ff;border:1px solid rgba(108,99,255,0.3);border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit;" title="Polish + structure this text with AI">✨ Improve with AI</button>' +
-          '</div>' +
-          '<textarea id="kd-content" rows="6" placeholder="Hair colour: £85-150 depending on length. Cuts: £35. Open Tue-Sat 9am-6pm. Cancellation: 24hr notice required..."></textarea>' +
-        '</div>' +
-        '<button class="btn-save" onclick="uploadKnowledgeDoc()">+ Add to Aria\\'s knowledge</button>' +
-      '</div>';
-  } catch (e) {
-    el.innerHTML = '<div class="empty">Failed to load knowledge docs.</div>';
-  }
-}
-
-async function uploadKnowledgeDoc() {
-  const title = document.getElementById('kd-title').value.trim();
-  const content = document.getElementById('kd-content').value.trim();
-  if (!title || !content) { toast('Title + content required'); return; }
-  try {
-    const r = await apiPost('/api/dashboard/knowledge', { title, content });
-    if (r.ok) { toast('Document added — Aria will cite it from now on'); loadKnowledgeDocs(); }
-    else toast(r.error || 'Upload failed');
-  } catch (e) { toast('Upload failed'); }
-}
-
-// AI polish for the knowledge content textarea — owner writes a rough
-// draft, clicks ✨ Improve, gets it back structured + warmer.
-async function improveKnowledge() {
-  const ta = document.getElementById('kd-content');
-  const current = ta.value.trim();
-  if (!current) { toast('Write something first, then I can improve it'); return; }
-  const instruction = prompt('How should Aria improve this? (Examples: "polish for clarity", "add headers + structure", "make it warmer", "shorten by half")', 'Polish for clarity + add structure');
-  if (instruction === null) return; // cancelled
-  toast('⏳ Improving…');
-  try {
-    const r = await apiPost('/api/dashboard/ai-improve', { current, instruction, kind: 'knowledge' });
-    if (r.improved) {
-      ta.value = r.improved;
-      toast('✓ Improved — review before saving');
-    } else { toast(r.error || 'Improve failed'); }
-  } catch (e) { toast('Improve failed: ' + e.message); }
-}
-
-async function deleteKnowledgeDoc(idx) {
-  if (!confirm('Remove this document from Aria\\'s knowledge?')) return;
-  try {
-    const r = await fetch('/api/dashboard/knowledge/' + idx + '?' + Q, { method: 'DELETE' });
-    const d = await r.json();
-    if (d.ok) { toast('Removed'); loadKnowledgeDocs(); }
-  } catch (e) { toast('Remove failed'); }
-}
-
-async function loadServicesEditor() {
-  const el = document.getElementById('train-services');
-  try {
-    const d = await api('/api/dashboard/profile');
-    const services = (d.profile?.servicesCarousel) || [];
-    el.innerHTML =
-      '<h4 style="font-size:13px;color:#fff;margin-bottom:10px;">🎠 Services Carousel <span style="font-size:11px;font-weight:400;color:#8888aa;">— shown when customers ask "what do you offer"</span></h4>' +
-      '<div id="services-list" style="display:flex;flex-direction:column;gap:10px;margin-bottom:12px;"></div>' +
-      '<button class="btn-save" onclick="addServiceCard()" style="background:rgba(255,255,255,0.06);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);">+ Add service card</button>';
-    window._services = services.length ? services : [];
-    renderServicesList();
-  } catch (e) { el.innerHTML = '<div class="empty">Failed to load services.</div>'; }
-}
-
-function renderServicesList() {
-  const list = document.getElementById('services-list');
-  if (!list) return;
-  if (!window._services?.length) {
-    list.innerHTML = '<div class="empty" style="padding:14px 0">No services yet. Add 2-5 of your most-asked-for services with photos.</div>';
-    return;
-  }
-  list.innerHTML = window._services.map((s, i) =>
-    '<div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:14px;">' +
-      '<div style="display:flex;align-items:start;gap:12px;">' +
-        (s.image ? '<img src="' + escH(s.image) + '" style="width:60px;height:60px;border-radius:8px;object-fit:cover;flex-shrink:0;" onerror="this.style.display=\\'none\\'">' : '') +
-        '<div style="flex:1;display:grid;grid-template-columns:1fr 1fr;gap:8px;">' +
-          '<input placeholder="Title" value="' + escH(s.title || '') + '" oninput="window._services[' + i + '].title=this.value">' +
-          '<input placeholder="Subtitle (price, duration, etc)" value="' + escH(s.subtitle || '') + '" oninput="window._services[' + i + '].subtitle=this.value">' +
-          '<input placeholder="Image URL (optional)" value="' + escH(s.image || '') + '" oninput="window._services[' + i + '].image=this.value" style="grid-column:span 2">' +
-          '<input placeholder="Link URL (optional)" value="' + escH(s.link || '') + '" oninput="window._services[' + i + '].link=this.value">' +
-          '<input placeholder="Button text (e.g. Book now)" value="' + escH(s.btn_text || '') + '" oninput="window._services[' + i + '].btn_text=this.value">' +
-        '</div>' +
-        '<button onclick="removeService(' + i + ')" style="background:rgba(255,80,80,0.1);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit;flex-shrink:0;">×</button>' +
-      '</div>' +
-    '</div>').join('') +
-    '<button class="btn-save" onclick="saveServices()" style="margin-top:8px;">Save services</button>';
-}
-
-function addServiceCard() {
-  window._services = window._services || [];
-  if (window._services.length >= 10) { toast('Max 10 service cards'); return; }
-  window._services.push({ title: '', subtitle: '', image: '', link: '', btn_text: 'Learn more' });
-  renderServicesList();
-}
-
-function removeService(i) {
-  window._services.splice(i, 1);
-  renderServicesList();
-}
-
-async function saveServices() {
-  try {
-    const r = await apiPost('/api/dashboard/profile', { owner: OWNER, servicesCarousel: window._services });
-    if (r.ok) toast('Services saved — Aria will show these when asked');
-  } catch (e) { toast('Save failed'); }
-}
-
-// ─── Business Hours editor ───────────────────────────────────────────────
-async function loadBusinessHoursEditor() {
-  const el = document.getElementById('train-hours');
-  try {
-    const d = await api('/api/dashboard/profile');
-    const sched = d.profile?.schedule || { mode: 'always' };
-    window._schedule = JSON.parse(JSON.stringify(sched)); // editable copy
-    renderHoursEditor();
-  } catch (e) { el.innerHTML = '<div class="empty">Failed to load hours.</div>'; }
-}
-
-function renderHoursEditor() {
-  const el = document.getElementById('train-hours');
-  const sched = window._schedule || { mode: 'always' };
-  const mode = sched.mode || 'always';
-  const tz = sched.timezone || 'Europe/London';
-  const hours = sched.businessHours || { mon: '9-18', tue: '9-18', wed: '9-18', thu: '9-18', fri: '9-18', sat: 'closed', sun: 'closed' };
-  const ooh = sched.outOfHoursMode || 'auto_reply';
-  const oohMsg = sched.outOfHoursMessage || 'Thanks for getting in touch! We are currently closed but will reply as soon as we are open.';
-
-  // Live status — uses the SAME logic the server uses
-  const liveBadge = computeLiveScheduleBadge(sched);
-
-  const days = [
-    { key: 'mon', label: 'Mon' }, { key: 'tue', label: 'Tue' }, { key: 'wed', label: 'Wed' },
-    { key: 'thu', label: 'Thu' }, { key: 'fri', label: 'Fri' }, { key: 'sat', label: 'Sat' }, { key: 'sun', label: 'Sun' },
-  ];
-
-  el.innerHTML =
-    '<h4 style="font-size:13px;color:#fff;margin-bottom:6px;display:flex;align-items:center;gap:8px;">🕐 Business Hours <span style="font-size:11px;font-weight:400;color:#9898b8;">— when Aria is allowed to auto-reply</span></h4>' +
-    '<p style="font-size:12px;color:#8888aa;margin-bottom:14px;">' + liveBadge + '</p>' +
-    '<div class="form-group" style="margin-bottom:14px;">' +
-      '<label>Mode</label>' +
-      '<select onchange="updateSchedule(\\'mode\\',this.value)" style="width:auto;min-width:240px;">' +
-        '<option value="always" ' + (mode === 'always' ? 'selected' : '') + '>Always on (24/7)</option>' +
-        '<option value="business_hours" ' + (mode === 'business_hours' ? 'selected' : '') + '>Business hours only</option>' +
-      '</select>' +
-    '</div>' +
-    (mode === 'business_hours' ? (
-      '<div class="form-group" style="margin-bottom:14px;">' +
-        '<label>Timezone</label>' +
-        '<input type="text" value="' + escH(tz) + '" oninput="updateSchedule(\\'timezone\\',this.value)" placeholder="Europe/London" style="max-width:240px;">' +
-      '</div>' +
-      '<div style="display:flex;flex-direction:column;gap:6px;margin-bottom:18px;">' +
-        days.map(d => {
-          const val = hours[d.key] || 'closed';
-          return '<div style="display:flex;align-items:center;gap:10px;background:rgba(255,255,255,0.03);padding:8px 12px;border-radius:8px;">' +
-            '<div style="min-width:40px;font-size:12px;color:#aaa;text-transform:uppercase;font-weight:600;">' + d.label + '</div>' +
-            '<input type="text" value="' + escH(val) + '" oninput="updateHoursDay(\\'' + d.key + '\\',this.value)" placeholder="closed" style="flex:1;font-size:12.5px;background:rgba(255,255,255,0.04);">' +
-          '</div>';
-        }).join('') +
-      '</div>' +
-      '<p style="font-size:11px;color:#6b6b8a;margin-top:-10px;margin-bottom:14px;">Format: "9-18" or "9:30-17:30" · "closed" · "24h"</p>' +
-      '<div class="form-group" style="margin-bottom:14px;">' +
-        '<label>Outside-hours behaviour</label>' +
-        '<select onchange="updateSchedule(\\'outOfHoursMode\\',this.value)" style="width:auto;min-width:240px;">' +
-          '<option value="auto_reply" ' + (ooh === 'auto_reply' ? 'selected' : '') + '>Send polite "we are closed" reply</option>' +
-          '<option value="silent" ' + (ooh === 'silent' ? 'selected' : '') + '>Silent (log message, no reply)</option>' +
-        '</select>' +
-      '</div>' +
-      (ooh === 'auto_reply' ? (
-        '<div class="form-group" style="margin-bottom:14px;">' +
-          '<label>Out-of-hours message</label>' +
-          '<textarea rows="3" oninput="updateSchedule(\\'outOfHoursMessage\\',this.value)" placeholder="Thanks for getting in touch! We are currently closed...">' + escH(oohMsg) + '</textarea>' +
-        '</div>'
-      ) : '')
-    ) : '') +
-    '<button class="btn-save" onclick="saveSchedule()">Save business hours</button>';
-}
-
-function computeLiveScheduleBadge(sched) {
-  if (!sched || sched.mode === 'always' || !sched.mode) {
-    return '<span style="background:rgba(0,229,160,0.1);color:#00e5a0;padding:2px 10px;border-radius:10px;font-weight:600;">🟢 Aria is always on</span>';
-  }
-  // Approximate the server-side check client-side (same logic, in browser TZ)
-  try {
-    const tz = sched.timezone || 'Europe/London';
-    const now = new Date();
-    const fmt = new Intl.DateTimeFormat('en-GB', { timeZone: tz, weekday: 'short', hour: 'numeric', minute: 'numeric', hour12: false });
-    const parts = fmt.formatToParts(now);
-    const wd = parts.find(p => p.type === 'weekday').value.toLowerCase().slice(0, 3);
-    const hour = Number(parts.find(p => p.type === 'hour').value);
-    const min = Number(parts.find(p => p.type === 'minute').value);
-    const minutes = hour * 60 + min;
-    const today = (sched.businessHours || {})[wd] || 'closed';
-    const m = String(today).match(/^\s*(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?\s*$/);
-    let inHours = today === '24h';
-    if (m) {
-      const startMin = Number(m[1]) * 60 + Number(m[2] || 0);
-      const endMin = Number(m[3]) * 60 + Number(m[4] || 0);
-      inHours = minutes >= startMin && minutes < endMin;
-    }
-    return inHours
-      ? '<span style="background:rgba(0,229,160,0.1);color:#00e5a0;padding:2px 10px;border-radius:10px;font-weight:600;">🟢 Aria is ON right now (' + wd + ' ' + String(hour).padStart(2,'0') + ':' + String(min).padStart(2,'0') + ' ' + tz + ')</span>'
-      : '<span style="background:rgba(251,191,36,0.1);color:#fbbf24;padding:2px 10px;border-radius:10px;font-weight:600;">🌙 Aria is OFF right now (' + wd + ' ' + String(hour).padStart(2,'0') + ':' + String(min).padStart(2,'0') + ' ' + tz + ' — outside business hours)</span>';
-  } catch { return ''; }
-}
-
-function updateSchedule(key, value) {
-  window._schedule = window._schedule || {};
-  if (key === 'mode' && value === 'always') {
-    // Switching to always-on — keep stored hours but rerender simpler view
-    window._schedule.mode = 'always';
-  } else {
-    window._schedule[key] = value;
-    if (key === 'mode' && value === 'business_hours' && !window._schedule.businessHours) {
-      window._schedule.businessHours = { mon: '9-18', tue: '9-18', wed: '9-18', thu: '9-18', fri: '9-18', sat: 'closed', sun: 'closed' };
-    }
-  }
-  renderHoursEditor();
-}
-
-function updateHoursDay(day, value) {
-  window._schedule = window._schedule || {};
-  window._schedule.businessHours = window._schedule.businessHours || {};
-  window._schedule.businessHours[day] = value;
-  // Don't full-re-render — just update the live badge so cursor doesn't jump in input
-  const liveDiv = document.querySelector('#train-hours p');
-  if (liveDiv) liveDiv.innerHTML = computeLiveScheduleBadge(window._schedule);
-}
-
-async function saveSchedule() {
-  try {
-    const r = await apiPost('/api/dashboard/profile', { owner: OWNER, schedule: window._schedule });
-    if (r.ok) toast('Business hours saved');
-    loadBusinessHoursEditor(); // refresh badge
-  } catch (e) { toast('Save failed'); }
-}
-
-async function loadScopeEditor() {
-  const el = document.getElementById('train-scope');
-  try {
-    const d = await api('/api/dashboard/profile');
-    const topics = d.profile?.allowedTopics || [];
-    window._scopeTopics = topics.slice();
-    el.innerHTML =
-      '<h4 style="font-size:13px;color:#fff;margin-bottom:10px;">🚦 Topic Scope <span style="font-size:11px;font-weight:400;color:#8888aa;">— what Aria should answer (everything else gets a polite redirect)</span></h4>' +
-      '<p style="font-size:12px;color:#8888aa;margin-bottom:10px;">Leave empty if Aria can answer anything. Otherwise add topics like "scaffolding hire", "hair colouring", "garden design".</p>' +
-      '<div id="scope-chips" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;min-height:32px;"></div>' +
-      '<div style="display:flex;gap:8px;">' +
-        '<input id="scope-input" placeholder="e.g. plumbing repairs" style="flex:1;" onkeydown="if(event.key===\\'Enter\\'){event.preventDefault();addScopeTopic()}">' +
-        '<button class="btn-save" onclick="addScopeTopic()" style="padding:10px 18px;">Add</button>' +
-      '</div>' +
-      '<button class="btn-save" onclick="saveScope()" style="margin-top:12px;">Save topics</button>';
-    renderScopeChips();
-  } catch (e) { el.innerHTML = '<div class="empty">Failed to load scope.</div>'; }
-}
-
-function renderScopeChips() {
-  const chips = document.getElementById('scope-chips');
-  if (!chips) return;
-  if (!window._scopeTopics?.length) {
-    chips.innerHTML = '<div style="font-size:12px;color:#6b6b8a;">No topics set — Aria will answer anything in scope of her general business prompt.</div>';
-    return;
-  }
-  chips.innerHTML = window._scopeTopics.map((t, i) =>
-    '<span style="background:rgba(0,229,160,0.1);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:20px;padding:5px 12px;font-size:12px;display:inline-flex;align-items:center;gap:6px;">' +
-      escH(t) +
-      '<button onclick="removeScopeTopic(' + i + ')" style="background:none;border:none;color:#00e5a0;cursor:pointer;font-size:14px;padding:0;line-height:1;">×</button>' +
-    '</span>').join('');
-}
-
-function addScopeTopic() {
-  const inp = document.getElementById('scope-input');
-  const t = inp.value.trim();
-  if (!t) return;
-  window._scopeTopics = window._scopeTopics || [];
-  if (window._scopeTopics.includes(t)) { toast('Already added'); return; }
-  window._scopeTopics.push(t);
-  inp.value = '';
-  renderScopeChips();
-}
-
-function removeScopeTopic(i) {
-  window._scopeTopics.splice(i, 1);
-  renderScopeChips();
-}
-
-async function saveScope() {
-  try {
-    const r = await apiPost('/api/dashboard/profile', { owner: OWNER, allowedTopics: window._scopeTopics });
-    if (r.ok) toast('Scope saved — Aria will stay on-topic');
-  } catch (e) { toast('Save failed'); }
-}
-
-let inboxPage = 1;
-async function loadInbox(page) {
-  inboxPage = page;
-  const body = document.getElementById('body-inbox');
-  try {
-    const d = await api('/api/dashboard/inbox-log?page=' + page);
-    if (!d.items.length) { body.innerHTML = '<div class="empty">No emails replied yet.</div>'; return; }
-    let html = '<table><thead><tr><th>From</th><th>Subject</th><th>When</th></tr></thead><tbody>';
-    for (const r of d.items) {
-      html += '<tr><td>' + escH(r.senderEmail) + '</td><td>' + escH(r.subject) + '</td><td>' + timeAgo(r.sentAt) + '</td></tr>';
-    }
-    html += '</tbody></table>';
-    if (d.totalPages > 1) {
-      html += '<div class="pagination">';
-      for (let i = 1; i <= d.totalPages; i++) {
-        html += '<button class="' + (i === page ? 'active' : '') + '" onclick="loadInbox(' + i + ')">' + i + '</button>';
-      }
-      html += '</div>';
-    }
-    body.innerHTML = html;
-  } catch (e) { body.innerHTML = '<div class="empty">Failed to load inbox log.</div>'; }
-}
-
-async function loadLeads() {
-  const body = document.getElementById('body-leads');
-  try {
-    const d = await api('/api/dashboard/leads');
-    if (!d.leads.length) {
-      body.innerHTML = '<div class="empty-state"><div class="es-ic">🎯</div><div class="es-t">No leads yet</div><div class="es-s">Leads appear here automatically when Aria captures a name, email, or phone during a conversation. Connect a channel to get started.</div><button class="cta-btn" style="margin-top:16px" onclick="showPanel(\\'channels\\')">Connect a channel →</button></div>';
-      return;
-    }
-    let html = '<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th></tr></thead><tbody>';
-    for (const l of d.leads) {
-      html += '<tr><td>' + escH(l.name || '—') + '</td><td>' + escH(l.email) + '</td><td>' + escH(l.phone || '—') + '</td></tr>';
-    }
-    html += '</tbody></table>';
-    body.innerHTML = html;
-  } catch (e) { body.innerHTML = '<div class="empty">Failed to load leads.</div>'; }
-}
-
-async function loadBookings() {
-  const body = document.getElementById('body-bookings');
-  try {
-    const d = await api('/api/dashboard/bookings');
-    if (!d.bookings.length) {
-      body.innerHTML = '<div class="empty-state"><div class="es-ic">📅</div><div class="es-t">No bookings yet</div><div class="es-s">When a customer asks to book or hire, Aria collects the details (name, contact, time), checks for clashes, saves it here, emails you a calendar invite, and sends the customer a confirmation.</div></div>';
-      return;
-    }
-    const icons = { email: '📧', facebook: '📘', instagram: '📷', whatsapp: '💬' };
-    let html = '<div style="display:flex;flex-direction:column;gap:10px;">';
-    for (const b of d.bookings) {
-      const when = b.datetime || b.date || '—';
-      const channel = b.channel || 'email';
-      const icsBtn = b.icsFilename
-        ? '<a href="/api/dashboard/booking-ics/' + encodeURIComponent(b.icsFilename) + '?' + Q + '" download style="background:rgba(0,229,160,0.15);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:6px;padding:4px 10px;font-size:11px;text-decoration:none;flex-shrink:0;">📅 .ics</a>'
-        : '';
-      html += '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:12px 14px;display:flex;align-items:center;gap:12px;">' +
-        '<div style="font-size:18px;flex-shrink:0;">' + (icons[channel] || '📅') + '</div>' +
-        '<div style="flex:1;min-width:0;">' +
-          '<div style="font-size:13px;color:#fff;font-weight:600;">' + escH(b.name || '—') + (b.service ? ' <span style="color:#8888aa;font-weight:400;">— ' + escH(b.service) + '</span>' : '') + '</div>' +
-          '<div style="font-size:11.5px;color:#00e5a0;margin-top:2px;">📅 ' + escH(when) + '</div>' +
-          (b.contact ? '<div style="font-size:11.5px;color:#8888aa;margin-top:2px;">' + escH(b.contact) + '</div>' : '') +
-          (b.notes ? '<div style="font-size:11px;color:#6b6b8a;margin-top:4px;font-style:italic;">' + escH(b.notes) + '</div>' : '') +
-        '</div>' +
-        icsBtn +
-      '</div>';
-    }
-    html += '</div>';
-    body.innerHTML = html;
-  } catch (e) { body.innerHTML = '<div class="empty">Failed to load bookings.</div>'; }
-}
-
-async function loadProfile() {
-  const body = document.getElementById('body-profile');
-  try {
-    const d = await api('/api/dashboard/profile');
-    const p = d.profile || {};
-    body.innerHTML = \`
-      <div class="form-group"><label>Business Name</label><input type="text" id="pf-name" value="\${escH(p.businessName || '')}"></div>
-      <div class="form-group"><label>Services</label><textarea id="pf-services">\${escH(p.services || '')}</textarea></div>
-      <div class="form-group"><label>Location</label><input type="text" id="pf-location" value="\${escH(p.location || '')}"></div>
-      <div class="form-group"><label>Phone</label><input type="text" id="pf-phone" value="\${escH(p.phone || '')}"></div>
-      <div class="form-group"><label>Email</label><input type="text" id="pf-email" value="\${escH(p.email || OWNER)}"></div>
-      <div class="form-group"><label>Hours</label><input type="text" id="pf-hours" value="\${escH(p.hours || '')}"></div>
-      <div class="form-group"><label>Tone</label>
-        <select id="pf-tone">
-          <option value="friendly" \${p.tone==='friendly'?'selected':''}>Friendly</option>
-          <option value="professional" \${p.tone==='professional'?'selected':''}>Professional</option>
-          <option value="casual" \${p.tone==='casual'?'selected':''}>Casual</option>
-          <option value="formal" \${p.tone==='formal'?'selected':''}>Formal</option>
-        </select>
-      </div>
-      <button class="btn-save" onclick="saveProfile()">Save Profile</button>
-    \`;
-  } catch (e) { body.innerHTML = '<div class="empty">Failed to load profile.</div>'; }
-}
-
-async function saveProfile() {
-  const data = {
-    owner: OWNER,
-    businessName: document.getElementById('pf-name').value,
-    services: document.getElementById('pf-services').value,
-    location: document.getElementById('pf-location').value,
-    phone: document.getElementById('pf-phone').value,
-    email: document.getElementById('pf-email').value,
-    hours: document.getElementById('pf-hours').value,
-    tone: document.getElementById('pf-tone').value
-  };
-  try {
-    const r = await apiPost('/api/dashboard/profile', data);
-    if (r.ok) toast('Profile saved!');
-    else toast('Failed to save');
-  } catch (e) { toast('Error saving profile'); }
-}
-
-async function loadSettings() {
-  const body = document.getElementById('body-settings');
-  try {
-    const [d, profile] = await Promise.all([api('/api/dashboard/settings'), api('/api/dashboard/profile')]);
-    const ob = profile?.profile?.outbound || {};
-    const leadFu = ob.leadFollowup !== false; // default ON
-    const bookRem = ob.bookingReminder !== false;
-    const convRec = ob.convRecovery !== false;
-    body.innerHTML = \`
-      <h4 style="font-size:13px;color:#fff;margin:4px 0 12px;">Email auto-reply</h4>
-      <div class="toggle-row">
-        <div class="info">Auto-Reply<small>Automatically reply to incoming emails using AI</small></div>
-        <label class="toggle"><input type="checkbox" id="tog-autoreply" \${d.autoReplyEnabled?'checked':''} onchange="saveSetting('autoReplyEnabled',this.checked)"><span class="slider"></span></label>
-      </div>
-      <div class="toggle-row">
-        <div class="info">Approval Mode<small>Review AI drafts before they are sent</small></div>
-        <label class="toggle"><input type="checkbox" id="tog-approval" \${d.approvalMode?'checked':''} onchange="saveSetting('approvalMode',this.checked)"><span class="slider"></span></label>
-      </div>
-      <div class="toggle-row">
-        <div class="info">Follow-Ups<small>Send automatic follow-up emails if no response</small></div>
-        <label class="toggle"><input type="checkbox" id="tog-followups" \${d.followUpsEnabled?'checked':''} onchange="saveSetting('followUpsEnabled',this.checked)"><span class="slider"></span></label>
-      </div>
-
-      <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">Outbound nudges from Aria</h4>
-      <div class="toggle-row">
-        <div class="info">Lead follow-up email<small>~3 min after a hot lead with email captured, Aria sends a personalised "thanks for getting in touch" email</small></div>
-        <label class="toggle"><input type="checkbox" id="ob-lead" \${leadFu?'checked':''} onchange="saveOutbound('leadFollowup',this.checked)"><span class="slider"></span></label>
-      </div>
-      <div class="toggle-row">
-        <div class="info">Booking reminders<small>24h before each booking, Aria reminds the customer via the channel they booked on + email</small></div>
-        <label class="toggle"><input type="checkbox" id="ob-book" \${bookRem?'checked':''} onchange="saveOutbound('bookingReminder',this.checked)"><span class="slider"></span></label>
-      </div>
-      <div class="toggle-row">
-        <div class="info">Conversation recovery<small>If a 3+ exchange conv goes quiet 24-72h, Aria sends a friendly nudge with "Yes still keen / Not right now" buttons</small></div>
-        <label class="toggle"><input type="checkbox" id="ob-conv" \${convRec?'checked':''} onchange="saveOutbound('convRecovery',this.checked)"><span class="slider"></span></label>
-      </div>
-
-      <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">Connections</h4>
-      <div class="toggle-row">
-        <div class="info">Gmail Status<small>\${d.gmailConnected ? 'Connected and active' : 'Not connected'}</small></div>
-        <div>\${d.gmailConnected ? '<span class="badge-on">Connected</span>' : '<span class="badge-off">Disconnected</span>'}</div>
-      </div>
-      <a class="gmail-link" href="/connect/gmail?owner=\${encodeURIComponent(OWNER)}&s=\${encodeURIComponent(TOKEN)}">
-        <svg viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
-        Gmail Settings
-      </a>
-
-      <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">📞 Phone receptionist <span style="font-size:11px;font-weight:400;color:#9898b8;">— Aria answers your phone, books + quotes by voice</span></h4>
-      <div id="phone-panel"><div class="empty" style="padding:14px 0;font-size:12px;">Loading…</div></div>
-
-      <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">📋 Notification digest <span style="font-size:11px;font-weight:400;color:#9898b8;">— batch informational alerts into one daily email</span></h4>
-      <div id="digest-panel"><div class="empty" style="padding:14px 0;font-size:12px;">Loading…</div></div>
-
-      <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">⭐ Review requests <span style="font-size:11px;font-weight:400;color:#9898b8;">— Aria auto-asks for a Google review 24h after each booking</span></h4>
-      <div id="reviews-panel"><div class="empty" style="padding:14px 0;font-size:12px;">Loading…</div></div>
-
-      <h4 style="font-size:13px;color:#fff;margin:24px 0 12px;">🔗 Webhooks <span style="font-size:11px;font-weight:400;color:#9898b8;">— pipe Aria events to Zapier, Slack, your CRM</span></h4>
-      <div id="webhooks-panel"><div class="empty" style="padding:14px 0;font-size:12px;">Loading…</div></div>
-    \`;
-    loadWebhooks();
-    loadReviewSettings();
-    loadDigestSettings();
-    loadPhoneSettings();
-  } catch (e) { body.innerHTML = '<div class="empty">Failed to load settings.</div>'; }
-}
-
-// ─── Phone receptionist settings panel ──────────────────────────────────
-async function loadPhoneSettings() {
-  const el = document.getElementById('phone-panel');
-  if (!el) return;
-  try {
-    const d = await api('/api/dashboard/phone/settings');
-    const s = d.settings || {};
-
-    // PLAN GATE — Lite owners see an upsell, not the controls. Drives the
-    // upgrade without exposing any voice surface they aren't paying for.
-    if (!d.planAllowed) {
-      el.innerHTML =
-        '<div style="background:linear-gradient(135deg,rgba(157,150,255,0.1),rgba(0,229,160,0.08));border:1px solid rgba(157,150,255,0.3);border-radius:12px;padding:20px;text-align:center;">' +
-          '<div style="font-size:28px;margin-bottom:8px;">📞</div>' +
-          '<div style="font-size:15px;color:#fff;font-weight:700;margin-bottom:6px;">Add a phone receptionist</div>' +
-          '<p style="font-size:12.5px;color:#9898b8;margin:0 auto 14px;max-width:380px;line-height:1.6;">Upgrade to the <b style="color:#9d96ff;">Receptionist</b> plan and Aria answers your phone 24/7 — booking appointments, taking quote requests, and texting callers a follow-up. Everything your inbox Aria does, now by voice.</p>' +
-          '<div style="font-size:11.5px;color:#6b6b8a;">You\\'re on the <b>Lite</b> plan (Instagram + Facebook DMs + email). Contact us to upgrade.</div>' +
-        '</div>';
-      return;
-    }
-
-    const calls = (await api('/api/dashboard/calls')).calls || [];
-
-    const intentEmoji = { booking: '📅', quote: '💷', enquiry: '💬', complaint: '⚠️', message: '✉️', other: '📞' };
-    const callRows = calls.length ? calls.slice(0, 6).map(c =>
-      '<div style="display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:12px;">' +
-        '<span style="font-size:14px;">' + (intentEmoji[c.intent] || '📞') + '</span>' +
-        '<span style="color:#ddd;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH(c.summary || c.intent || 'Call') + '</span>' +
-        (c.recordingUrl ? '<a href="' + escH(c.recordingUrl) + '" target="_blank" style="color:#00e5a0;font-size:11px;">▶</a>' : '') +
-        '<span style="color:#6b6b8a;font-size:10.5px;">' + (c.durationSec ? c.durationSec + 's · ' : '') + timeAgo(c.ts) + '</span>' +
-      '</div>'
-    ).join('') : '<div class="empty" style="padding:10px 0;font-size:11.5px;">No calls yet. Once your Vapi number is live, calls appear here.</div>';
-
-    // Number block: three states —
-    //  (1) has a number we provisioned → show it + forwarding tip + release
-    //  (2) no number, one-click available → "Get my Aria number" button
-    //  (3) no number, no provisioning → BYO paste fallback (+ webhook URL)
-    let numberBlock;
-    if (s.phoneNumber && s.provisioned) {
-      numberBlock =
-        '<div style="background:rgba(0,229,160,0.06);border:1px solid rgba(0,229,160,0.25);border-radius:8px;padding:12px 14px;margin-bottom:10px;">' +
-          '<div style="font-size:10.5px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Your Aria number</div>' +
-          '<div style="font-size:18px;color:#00e5a0;font-weight:700;font-family:monospace;">' + escH(s.phoneNumber) + '</div>' +
-          '<p style="font-size:11px;color:#9898b8;margin:8px 0 0;line-height:1.5;">📣 Put this on your website + Google listing, OR keep your current number and set it to <b>forward calls</b> to this one (your phone provider can do this — we\\'ll guide you).</p>' +
-          '<button onclick="releasePhoneNumber()" style="margin-top:10px;background:rgba(255,80,80,0.1);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);border-radius:6px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;">Release number</button>' +
-        '</div>';
-    } else if (d.canProvision) {
-      numberBlock =
-        '<div style="background:rgba(157,150,255,0.06);border:1px solid rgba(157,150,255,0.25);border-radius:8px;padding:14px;margin-bottom:10px;text-align:center;">' +
-          '<div style="font-size:13px;color:#fff;font-weight:600;margin-bottom:4px;">📲 Get a new Aria phone number</div>' +
-          '<p style="font-size:11.5px;color:#9898b8;margin:0 0 12px;line-height:1.5;">One click and Aria gets a brand-new number, ready to answer. Use it directly or forward your existing line to it.</p>' +
-          '<button onclick="provisionPhoneNumber(this)" class="btn-save" style="width:auto;padding:10px 20px;">Get my number →</button>' +
-        '</div>' +
-        // OR — connect a number the client already has
-        '<div style="display:flex;align-items:center;gap:10px;margin:12px 0;"><div style="flex:1;height:1px;background:rgba(255,255,255,0.08);"></div><span style="font-size:11px;color:#6b6b8a;">OR</span><div style="flex:1;height:1px;background:rgba(255,255,255,0.08);"></div></div>' +
-        '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:14px;margin-bottom:10px;">' +
-          '<div style="font-size:13px;color:#fff;font-weight:600;margin-bottom:4px;">📞 Use a number you already have</div>' +
-          '<p style="font-size:11px;color:#9898b8;margin:0 0 10px;line-height:1.5;">Enter your existing business number. To make Aria answer it, you\\'ll either point that number\\'s call-routing at Aria, or forward its calls to an Aria number — we\\'ll guide you after you save.</p>' +
-          '<div style="display:flex;gap:8px;">' +
-            '<input id="ph-own-number" value="' + escH(s.phoneNumber || '') + '" placeholder="+44 7700 900123" style="flex:1;font-family:monospace;font-size:13px;">' +
-            '<button onclick="connectOwnNumber()" style="background:rgba(157,150,255,0.15);color:#9d96ff;border:1px solid rgba(157,150,255,0.3);border-radius:8px;padding:8px 16px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap;">Connect</button>' +
-          '</div>' +
-          '<div style="background:rgba(0,0,0,0.15);border-radius:6px;padding:8px 10px;margin-top:10px;">' +
-            '<div style="font-size:10px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:3px;">Webhook URL (for your number\\'s call provider)</div>' +
-            '<code style="font-size:10.5px;color:#00e5a0;word-break:break-all;">' + escH(d.webhookUrl || '') + '</code>' +
-          '</div>' +
-        '</div>';
-    } else {
-      numberBlock =
-        '<div class="form-group" style="margin-bottom:10px;">' +
-          '<label style="font-size:11px;">Your Vapi phone number</label>' +
-          '<input id="ph-number" value="' + escH(s.phoneNumber || '') + '" placeholder="+44 7700 900123" style="font-family:monospace;font-size:13px;">' +
-        '</div>' +
-        '<div style="background:rgba(255,255,255,0.03);border-radius:8px;padding:10px 12px;margin-bottom:10px;">' +
-          '<div style="font-size:10.5px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Webhook URL — paste into your Vapi number\\'s Server settings</div>' +
-          '<code style="font-size:11px;color:#00e5a0;word-break:break-all;">' + escH(d.webhookUrl || '') + '</code>' +
-        '</div>';
-    }
-
-    el.innerHTML =
-      '<div style="background:rgba(0,229,160,0.04);border:1px solid rgba(0,229,160,0.2);border-radius:10px;padding:14px;">' +
-        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
-          '<div style="font-size:12px;color:#fff;font-weight:600;">Voice answering ' + (s.enabled && s.phoneNumber ? '<span style="color:#00e5a0;font-size:11px;">● Live</span>' : '<span style="color:#6b6b8a;font-size:11px;">● Off</span>') + '</div>' +
-          '<label class="toggle"><input type="checkbox" id="ph-enabled" ' + (s.enabled ? 'checked' : '') + '><span class="slider"></span></label>' +
-        '</div>' +
-        '<p style="font-size:11.5px;color:#9898b8;margin:0 0 12px;line-height:1.5;">Aria answers calls 24/7, books appointments (with conflict-checking), takes quote requests, and texts callers a follow-up.</p>' +
-        numberBlock +
-        '<div class="form-group" style="margin-bottom:10px;">' +
-          '<label style="font-size:11px;">Greeting (first thing callers hear)</label>' +
-          '<input id="ph-greeting" value="' + escH(s.firstMessage || '') + '" placeholder="Hi, you\\'ve reached [business], this is Aria. How can I help?">' +
-        '</div>' +
-        phoneScheduleBlock(s) +
-        '<button class="btn-save" onclick="savePhoneSettings()">Save</button>' +
-      '</div>' +
-      '<h5 style="font-size:11px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin:18px 0 8px;">Recent calls</h5>' +
-      callRows;
-  } catch (e) { el.innerHTML = '<div class="empty">Failed to load phone settings.</div>'; }
-}
-
-// Renders the "when should Aria answer?" controls. Mode selector + (when
-// not 24/7) a per-day hours grid, timezone, and a fallback number that
-// calls transfer to when Aria is off-schedule.
-function phoneScheduleBlock(s) {
-  const mode = s.answerMode || 'always';
-  const hrs = s.businessHours || { mon:'9-17', tue:'9-17', wed:'9-17', thu:'9-17', fri:'9-17', sat:'closed', sun:'closed' };
-  const tz = s.timezone || 'Europe/London';
-  const days = [['mon','Mon'],['tue','Tue'],['wed','Wed'],['thu','Thu'],['fri','Fri'],['sat','Sat'],['sun','Sun']];
-  const detailHidden = mode === 'always';
-  const dayRows = days.map(function(d){
-    return '<div style="display:flex;align-items:center;gap:8px;">' +
-      '<span style="min-width:34px;font-size:11px;color:#aaa;text-transform:uppercase;font-weight:600;">' + d[1] + '</span>' +
-      '<input id="ph-hrs-' + d[0] + '" value="' + escH(hrs[d[0]] || 'closed') + '" placeholder="closed" style="flex:1;font-size:12px;font-family:monospace;">' +
-    '</div>';
-  }).join('');
-  return '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:14px;margin-bottom:10px;">' +
-    '<label style="font-size:11px;display:block;margin-bottom:6px;">When should Aria answer?</label>' +
-    '<select id="ph-mode" onchange="togglePhoneSchedule()" style="width:100%;font-size:13px;margin-bottom:10px;">' +
-      '<option value="always" ' + (mode==='always'?'selected':'') + '>Always — 24/7</option>' +
-      '<option value="out_of_hours" ' + (mode==='out_of_hours'?'selected':'') + '>Out of hours only (after you close)</option>' +
-      '<option value="business_hours" ' + (mode==='business_hours'?'selected':'') + '>Business hours only (overflow while you\\'re busy)</option>' +
-    '</select>' +
-    '<div id="ph-schedule-detail" style="display:' + (detailHidden?'none':'block') + ';">' +
-      '<p style="font-size:10.5px;color:#8888aa;margin:0 0 8px;line-height:1.5;">Set your opening hours below. Format: <b>9-17</b> or <b>9:30-17:30</b> · <b>closed</b> · <b>24h</b>.</p>' +
-      '<div style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px;">' + dayRows + '</div>' +
-      '<div class="form-group" style="margin-bottom:10px;">' +
-        '<label style="font-size:11px;">Timezone</label>' +
-        '<input id="ph-tz" value="' + escH(tz) + '" placeholder="Europe/London" style="font-family:monospace;font-size:12.5px;">' +
-      '</div>' +
-      '<div class="form-group" style="margin-bottom:0;">' +
-        '<label style="font-size:11px;">Transfer calls to (when Aria isn\\'t answering)</label>' +
-        '<input id="ph-fallback" value="' + escH(s.fallbackNumber || '') + '" placeholder="+44 7700 900123 — your mobile / shop line" style="font-family:monospace;font-size:12.5px;">' +
-        '<p style="font-size:10.5px;color:#6b6b8a;margin-top:4px;line-height:1.5;">When Aria is off-schedule, callers ring through to this number. Leave blank to just let them try again later.</p>' +
-      '</div>' +
-    '</div>' +
-  '</div>';
-}
-
-function togglePhoneSchedule() {
-  const mode = document.getElementById('ph-mode').value;
-  const detail = document.getElementById('ph-schedule-detail');
-  if (detail) detail.style.display = (mode === 'always') ? 'none' : 'block';
-}
-
-async function provisionPhoneNumber(btn) {
-  if (btn) { btn.disabled = true; btn.textContent = 'Getting your number…'; }
-  try {
-    const r = await apiPost('/api/dashboard/phone/provision', {});
-    if (r.ok) { toast('✓ Your Aria number: ' + r.number); loadPhoneSettings(); }
-    else { toast(r.error || 'Could not get a number'); if (btn) { btn.disabled = false; btn.textContent = 'Get my number →'; } }
-  } catch (e) { toast('Provisioning failed'); if (btn) { btn.disabled = false; btn.textContent = 'Get my number →'; } }
-}
-
-async function connectOwnNumber() {
-  const el = document.getElementById('ph-own-number');
-  const num = (el && el.value || '').trim();
-  if (!num) { toast('Enter your number first'); return; }
-  if (!/^[+0-9 ()-]{7,}$/.test(num)) { toast('That doesn\\'t look like a phone number'); return; }
-  try {
-    const r = await apiPost('/api/dashboard/phone/settings', { phoneNumber: num, enabled: true });
-    if (r.ok) { toast('✓ Number connected — see the setup note to route calls to Aria'); loadPhoneSettings(); }
-    else toast(r.error || 'Could not connect number');
-  } catch (e) { toast('Connect failed'); }
-}
-
-async function releasePhoneNumber() {
-  if (!confirm('Release this number? Aria will stop answering calls to it and the number is gone for good.')) return;
-  try {
-    const r = await apiPost('/api/dashboard/phone/release', {});
-    if (r.ok) { toast('Number released'); loadPhoneSettings(); }
-    else toast(r.error || 'Release failed');
-  } catch (e) { toast('Release failed'); }
-}
-
-async function savePhoneSettings() {
-  // ph-number only exists in the BYO-paste state; provisioned numbers have
-  // no input field, so guard the read.
-  const numEl = document.getElementById('ph-number');
-  const body = {
-    enabled: document.getElementById('ph-enabled').checked,
-    firstMessage: document.getElementById('ph-greeting').value.trim(),
-  };
-  if (numEl) body.phoneNumber = numEl.value.trim();
-  // Schedule fields (present whenever the panel is unlocked)
-  const modeEl = document.getElementById('ph-mode');
-  if (modeEl) {
-    body.answerMode = modeEl.value;
-    const tzEl = document.getElementById('ph-tz');
-    const fbEl = document.getElementById('ph-fallback');
-    if (tzEl) body.timezone = tzEl.value.trim();
-    if (fbEl) body.fallbackNumber = fbEl.value.trim();
-    const bh = {};
-    ['mon','tue','wed','thu','fri','sat','sun'].forEach(function(dk){
-      const inp = document.getElementById('ph-hrs-' + dk);
-      if (inp) bh[dk] = inp.value.trim() || 'closed';
-    });
-    if (Object.keys(bh).length) body.businessHours = bh;
-  }
-  try {
-    const r = await apiPost('/api/dashboard/phone/settings', body);
-    if (r.ok) { toast(body.enabled ? '✓ Voice answering live' : '✓ Saved'); loadPhoneSettings(); }
-    else toast(r.error || 'Save failed');
-  } catch (e) { toast('Save failed'); }
-}
-
-// ─── Webhooks panel ─────────────────────────────────────────────────────
-async function loadWebhooks() {
-  const el = document.getElementById('webhooks-panel');
-  if (!el) return;
-  try {
-    const d = await api('/api/dashboard/webhooks');
-    const hooks = d.webhooks || [];
-    const recent = (d.recentDeliveries || []).slice(0, 8);
-
-    const EVENT_LABELS = {
-      new_lead: 'New lead', hot_lead: 'Hot lead', new_booking: 'Booking',
-      handoff: 'Handoff', angry_message: 'Angry', csat_negative: '👎 CSAT',
-      conversation_started: 'Conv started', test: 'Test',
-    };
-    const hookCards = hooks.map((wh, i) => {
-      const events = (wh.events || []).map(e => '<span style="background:rgba(157,150,255,0.1);color:#9d96ff;padding:2px 8px;border-radius:10px;font-size:10.5px;">' + (EVENT_LABELS[e] || e) + '</span>').join(' ');
-      return '<div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:12px 14px;margin-bottom:8px;">' +
-        '<div style="display:flex;align-items:start;gap:12px;">' +
-          '<div style="flex:1;min-width:0;">' +
-            '<div style="font-size:13px;color:#fff;font-weight:600;">' + escH(wh.label || 'Webhook') + ' ' + (wh.enabled ? '<span style="color:#00e5a0;font-size:10px;">●ON</span>' : '<span style="color:#6b6b8a;font-size:10px;">●OFF</span>') + '</div>' +
-            '<div style="font-size:11px;color:#8888aa;margin-top:2px;font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH(wh.url) + '</div>' +
-            (events ? '<div style="margin-top:6px;display:flex;gap:4px;flex-wrap:wrap;">' + events + '</div>' : '') +
-            (wh.secretHint ? '<div style="font-size:10.5px;color:#6b6b8a;margin-top:6px;font-family:monospace;">Secret: ' + wh.secretHint + '</div>' : '') +
-          '</div>' +
-          '<div style="display:flex;flex-direction:column;gap:4px;flex-shrink:0;">' +
-            '<button onclick="testWebhook(' + i + ')" style="background:rgba(0,229,160,0.1);color:#00e5a0;border:1px solid rgba(0,229,160,0.3);border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit;">Test</button>' +
-            '<button onclick="deleteWebhook(' + i + ')" style="background:rgba(255,80,80,0.1);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit;">Remove</button>' +
-          '</div>' +
-        '</div>' +
-      '</div>';
-    }).join('');
-
-    const recentRows = recent.length ? recent.map(r => {
-      const okColour = r.ok ? '#00e5a0' : '#ff6b6b';
-      return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:11.5px;">' +
-        '<span style="color:' + okColour + ';font-weight:600;min-width:36px;">' + (r.status || (r.ok ? 'OK' : 'ERR')) + '</span>' +
-        '<span style="color:#aaa;min-width:90px;">' + escH(r.event) + '</span>' +
-        '<span style="color:#8888aa;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:monospace;font-size:10.5px;">' + escH(r.url.replace(/^https?:\\/\\//, '')) + '</span>' +
-        '<span style="color:#6b6b8a;font-size:10.5px;">' + timeAgo(r.ts) + '</span>' +
-      '</div>';
-    }).join('') : '<div class="empty" style="padding:10px 0;font-size:11.5px;">No deliveries yet — events fire when leads, bookings, handoffs, or angry messages happen.</div>';
-
-    el.innerHTML =
-      (hookCards || '<div class="empty" style="padding:10px 0;font-size:12px;">No webhooks yet. Add one to pipe Aria events to Zapier, Slack, or your CRM.</div>') +
-      '<div style="background:rgba(157,150,255,0.05);border:1px solid rgba(157,150,255,0.2);border-radius:10px;padding:12px;margin-top:10px;">' +
-        '<div class="form-group" style="margin-bottom:8px;"><label>Label</label><input id="wh-label" placeholder="My Zapier webhook"></div>' +
-        '<div class="form-group" style="margin-bottom:8px;"><label>URL</label><input id="wh-url" placeholder="https://hooks.zapier.com/hooks/catch/..."></div>' +
-        '<div class="form-group" style="margin-bottom:10px;"><label>Fire on which events?</label>' +
-          '<div id="wh-events" style="display:flex;flex-wrap:wrap;gap:6px;">' +
-            ['new_lead','hot_lead','new_booking','handoff','angry_message','csat_negative'].map(e =>
-              '<label style="display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,0.04);padding:5px 10px;border-radius:14px;font-size:11.5px;color:#ccc;cursor:pointer;"><input type="checkbox" value="' + e + '" ' + (['new_lead','new_booking','handoff'].includes(e) ? 'checked' : '') + ' style="margin:0;">' + (EVENT_LABELS[e] || e) + '</label>'
-            ).join('') +
-          '</div>' +
-        '</div>' +
-        '<button class="btn-save" onclick="addWebhook()">+ Add webhook</button>' +
-      '</div>' +
-      '<h5 style="font-size:11px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin:18px 0 8px;">Recent deliveries</h5>' +
-      recentRows;
-  } catch (e) { el.innerHTML = '<div class="empty">Failed to load webhooks.</div>'; }
-}
-
-async function addWebhook() {
-  const label = document.getElementById('wh-label').value.trim();
-  const url = document.getElementById('wh-url').value.trim();
-  const events = Array.from(document.querySelectorAll('#wh-events input:checked')).map(c => c.value);
-  if (!url) { toast('URL required'); return; }
-  try {
-    const r = await apiPost('/api/dashboard/webhooks', { label, url, events });
-    if (r.ok) {
-      toast('Webhook added — secret: ' + r.secret.slice(0, 12) + '…');
-      loadWebhooks();
-    } else { toast(r.error || 'Failed'); }
-  } catch (e) { toast('Add failed'); }
-}
-
-async function deleteWebhook(idx) {
-  if (!confirm('Remove this webhook? Events will stop firing to it immediately.')) return;
-  try {
-    const r = await fetch('/api/dashboard/webhooks/' + idx + '?' + Q, { method: 'DELETE' });
-    const d = await r.json();
-    if (d.ok) { toast('Removed'); loadWebhooks(); }
-  } catch (e) { toast('Remove failed'); }
-}
-
-async function testWebhook(idx) {
-  toast('Firing test event…');
-  try {
-    const r = await apiPost('/api/dashboard/webhooks/' + idx + '/test', {});
-    if (r.ok) toast('✓ Test sent, status ' + r.status);
-    else toast('✗ ' + (r.reason || r.error || ('status ' + r.status)));
-    setTimeout(loadWebhooks, 500);
-  } catch (e) { toast('Test failed'); }
-}
-
-// ─── Notification digest settings panel ─────────────────────────────────
-async function loadDigestSettings() {
-  const el = document.getElementById('digest-panel');
-  if (!el) return;
-  try {
-    const d = await api('/api/dashboard/notifications/settings');
-    const s = d.settings || {};
-    const queued = d.queuedToday || 0;
-    const lastSent = d.lastDigestSent ? ' · last sent ' + d.lastDigestSent : '';
-
-    el.innerHTML =
-      '<div style="background:rgba(157,150,255,0.04);border:1px solid rgba(157,150,255,0.2);border-radius:10px;padding:14px;">' +
-        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
-          '<div style="font-size:12px;color:#fff;font-weight:600;">Batch informational alerts <span style="color:#8888aa;font-weight:400;font-size:11px;">· ' + queued + ' queued today' + lastSent + '</span></div>' +
-          '<label class="toggle"><input type="checkbox" id="nd-enabled" ' + (s.enabled ? 'checked' : '') + '><span class="slider"></span></label>' +
-        '</div>' +
-        '<p style="font-size:11.5px;color:#9898b8;margin:0 0 12px;line-height:1.5;">When on, low-urgency events (new leads, bookings, review requests, conflict deflections) batch into one daily email. Urgent stuff (handoffs, angry messages, no-show predictions, quote approvals) still fire immediately.</p>' +
-        '<div style="display:flex;gap:10px;align-items:flex-end;">' +
-          '<div class="form-group" style="flex:0 0 120px;margin-bottom:0;">' +
-            '<label style="font-size:11px;">Send time</label>' +
-            '<input id="nd-sendTime" type="time" value="' + escH(s.sendTime || '17:00') + '" style="font-family:inherit;font-size:13px;">' +
-          '</div>' +
-          '<div class="form-group" style="flex:1;margin-bottom:0;">' +
-            '<label style="font-size:11px;">Timezone</label>' +
-            '<input id="nd-timezone" value="' + escH(s.timezone || 'Europe/London') + '" placeholder="Europe/London" style="font-family:monospace;font-size:12px;">' +
-          '</div>' +
-          '<button class="btn-save" onclick="saveDigestSettings()" style="flex:0 0 80px;">Save</button>' +
-        '</div>' +
-      '</div>';
-  } catch (e) { el.innerHTML = '<div class="empty">Failed to load digest settings.</div>'; }
-}
-
-async function saveDigestSettings() {
-  const body = {
-    enabled:  document.getElementById('nd-enabled').checked,
-    sendTime: document.getElementById('nd-sendTime').value || '17:00',
-    timezone: document.getElementById('nd-timezone').value.trim() || 'Europe/London',
-  };
-  try {
-    const r = await apiPost('/api/dashboard/notifications/settings', body);
-    if (r.ok) {
-      toast(body.enabled ? '✓ Digest mode on — informational alerts batch into ' + body.sendTime + ' email' : '✓ Digest off — all alerts fire immediately');
-      loadDigestSettings();
-    } else { toast(r.error || 'Failed'); }
-  } catch (e) { toast('Save failed'); }
-}
-
-// ─── Review-request settings panel ──────────────────────────────────────
-async function loadReviewSettings() {
-  const el = document.getElementById('reviews-panel');
-  if (!el) return;
-  try {
-    const d = await api('/api/dashboard/reviews/settings');
-    const s = d.settings || {};
-    const recent = (d.recent || []).slice(0, 6);
-    const defaultTmpl = d.defaultTemplate || '';
-
-    const statusBadge = s.enabled && s.url
-      ? '<span style="color:#00e5a0;font-size:11px;">● Active</span>'
-      : (s.url ? '<span style="color:#fbbf24;font-size:11px;">● Disabled</span>' : '<span style="color:#6b6b8a;font-size:11px;">● Not configured</span>');
-
-    const recentRows = recent.length ? recent.map(r => {
-      const colour = r.status === 'sent' ? '#00e5a0' : '#8888aa';
-      const lbl = r.status === 'sent' ? 'sent' : (r.status === 'skipped-no-url' ? 'skipped (no URL)' : 'skipped');
-      return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:11.5px;">' +
-        '<span style="color:' + colour + ';font-weight:600;min-width:46px;">' + lbl + '</span>' +
-        '<span style="color:#aaa;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH(r.senderName || r.senderId || '?') + ' on ' + escH(r.channel || '?') + '</span>' +
-        '<span style="color:#6b6b8a;font-size:10.5px;">' + timeAgo(r.ts) + '</span>' +
-      '</div>';
-    }).join('') : '<div class="empty" style="padding:10px 0;font-size:11.5px;">No review requests sent yet — they fire 24h after each confirmed booking once you set a URL below.</div>';
-
-    el.innerHTML =
-      '<div style="background:rgba(0,229,160,0.05);border:1px solid rgba(0,229,160,0.2);border-radius:10px;padding:14px;">' +
-        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
-          '<div style="font-size:12px;color:#fff;font-weight:600;">Auto-ask for reviews ' + statusBadge + '</div>' +
-          '<label class="toggle"><input type="checkbox" id="rv-enabled" ' + (s.enabled ? 'checked' : '') + '><span class="slider"></span></label>' +
-        '</div>' +
-        '<div class="form-group" style="margin-bottom:10px;">' +
-          '<label style="font-size:11px;">Your Google review link <span style="color:#9898b8;font-weight:400;">(g.page/r/... or any review URL)</span></label>' +
-          '<input id="rv-url" placeholder="https://g.page/r/your-place-id/review" value="' + escH(s.url || '') + '" style="font-family:monospace;font-size:12px;">' +
-          '<div style="font-size:10.5px;color:#8888aa;margin-top:4px;">Find yours at <a href="https://whitespark.ca/google-review-link-generator/" target="_blank" style="color:#00e5a0;">whitespark.ca/google-review-link-generator</a></div>' +
-        '</div>' +
-        '<div style="display:flex;gap:10px;margin-bottom:10px;">' +
-          '<div class="form-group" style="flex:1;margin-bottom:0;">' +
-            '<label style="font-size:11px;">Send how long after booking?</label>' +
-            '<select id="rv-delay" style="width:100%;">' +
-              [2,6,12,24,48,72,168].map(h => '<option value="' + h + '" ' + (s.delayHours === h ? 'selected' : '') + '>' + (h < 24 ? h + ' hour' + (h > 1 ? 's' : '') : (h / 24) + ' day' + (h / 24 > 1 ? 's' : '')) + '</option>').join('') +
-            '</select>' +
-          '</div>' +
-          '<div class="form-group" style="flex:1;margin-bottom:0;display:flex;flex-direction:column;justify-content:flex-end;">' +
-            '<label style="display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:#ccc;cursor:pointer;background:rgba(255,255,255,0.04);padding:8px 12px;border-radius:8px;"><input type="checkbox" id="rv-alwaysEmail" ' + (s.alwaysEmail ? 'checked' : '') + ' style="margin:0;">Also email (not just channel)</label>' +
-          '</div>' +
-        '</div>' +
-        '<div class="form-group" style="margin-bottom:10px;">' +
-          '<label style="font-size:11px;">Message template <span style="color:#9898b8;font-weight:400;">— placeholders: {customer} {business} {service} {url}</span></label>' +
-          '<textarea id="rv-template" rows="3" style="font-family:inherit;font-size:12.5px;width:100%;background:rgba(0,0,0,0.2);border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#fff;padding:8px 10px;resize:vertical;" placeholder="' + escH(defaultTmpl) + '">' + escH(s.template || '') + '</textarea>' +
-          '<div style="font-size:10.5px;color:#8888aa;margin-top:4px;">Leave blank to use the default template shown above.</div>' +
-        '</div>' +
-        '<div style="display:flex;gap:8px;">' +
-          '<button class="btn-save" onclick="saveReviewSettings()" style="flex:1;">Save</button>' +
-          '<button onclick="previewReview()" style="background:rgba(157,150,255,0.1);color:#9d96ff;border:1px solid rgba(157,150,255,0.3);border-radius:8px;padding:8px 14px;font-size:12px;cursor:pointer;font-family:inherit;">Preview</button>' +
-        '</div>' +
-        '<div id="rv-preview" style="margin-top:10px;font-size:12.5px;color:#ccc;background:rgba(0,0,0,0.2);border-left:3px solid #9d96ff;padding:10px 12px;border-radius:6px;display:none;"></div>' +
-      '</div>' +
-      '<h5 style="font-size:11px;color:#8888aa;text-transform:uppercase;letter-spacing:0.5px;margin:18px 0 8px;">Recent review requests</h5>' +
-      recentRows;
-  } catch (e) { el.innerHTML = '<div class="empty">Failed to load review settings.</div>'; }
-}
-
-async function saveReviewSettings() {
-  const body = {
-    enabled:    document.getElementById('rv-enabled').checked,
-    url:        document.getElementById('rv-url').value.trim(),
-    delayHours: Number(document.getElementById('rv-delay').value) || 24,
-    template:   document.getElementById('rv-template').value.trim(),
-    alwaysEmail: document.getElementById('rv-alwaysEmail').checked,
-  };
-  try {
-    const r = await apiPost('/api/dashboard/reviews/settings', body);
-    if (r.ok) {
-      toast(body.enabled && body.url ? '✓ Review requests active' : '✓ Saved');
-      loadReviewSettings();
-    } else { toast(r.error || 'Failed to save'); }
-  } catch (e) { toast('Save failed'); }
-}
-
-async function previewReview() {
-  try {
-    const r = await apiPost('/api/dashboard/reviews/test', { customer: 'Sarah', service: 'haircut' });
-    const el = document.getElementById('rv-preview');
-    if (el) {
-      el.style.display = 'block';
-      el.innerHTML = '<div style="color:#9d96ff;font-size:10.5px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Preview — what Sarah would receive:</div>' + escH(r.preview || '(no preview)');
-    }
-  } catch (e) { toast('Preview failed'); }
-}
-
-async function saveOutbound(key, value) {
-  try {
-    // Send a partial profile update containing nested outbound flag
-    const profileResp = await api('/api/dashboard/profile');
-    const outbound = profileResp?.profile?.outbound || {};
-    outbound[key] = value;
-    const r = await apiPost('/api/dashboard/profile', { owner: OWNER, outbound });
-    if (r.ok) toast(value ? 'On — Aria will send these' : 'Off');
-  } catch (e) { toast('Failed to update'); }
-}
-
-async function saveSetting(key, value) {
-  try {
-    const body = { owner: OWNER };
-    body[key] = value;
-    const r = await apiPost('/api/dashboard/settings', body);
-    if (r.ok) toast('Setting updated!');
-    else toast('Failed to update');
-  } catch (e) { toast('Error updating setting'); }
-}
-
-async function loadChannels() {
-  try {
-    const d = await api('/api/dashboard/channel-stats');
-    const channels = d.channels || {};
-    const stats = d.stats || {};
-    const container = document.getElementById('channel-cards');
-    if (!container) return;
-
-    const channelDefs = [
-      { key: 'whatsapp', name: 'WhatsApp Business', icon: '\u{1F4AC}', color: '#25D366', detail: c => c.displayPhone || 'Connected' },
-      { key: 'instagram', name: 'Instagram DMs', icon: '\u{1F4F7}', color: '#E1306C', detail: c => c.igUsername || 'Connected' },
-      { key: 'facebook', name: 'Facebook Messenger', icon: '\u{1F4AC}', color: '#1877F2', detail: c => c.pageName || 'Connected' },
-    ];
-
-    let html = '';
-    let anyConnected = false;
-    for (const def of channelDefs) {
-      const ch = channels[def.key];
-      const st = stats[def.key] || { replied: 0 };
-      if (ch && ch.accessToken) {
-        anyConnected = true;
-        // Connection is solid (we have a token). The toggle below controls
-        // whether Aria actively REPLIES \u2014 that's separate from "connected".
-        const replyColor = ch.enabled ? '#00e5a0' : '#ffa726';
-        const replyText = ch.enabled ? 'Aria is replying' : 'Replies paused';
-        html += '<div style="background:#161630;border:1px solid rgba(0,229,160,0.25);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;">' +
-          '<div style="display:flex;align-items:center;gap:12px;">' +
-            '<span style="font-size:24px;">' + def.icon + '</span>' +
-            '<div><div style="font-weight:600;font-size:14px;">' + def.name + ' <span style="color:#00e5a0;font-size:12px;font-weight:700;">\u2713 Connected</span></div>' +
-            '<div style="font-size:12px;color:' + replyColor + ';">' + escH(def.detail(ch)) + ' \u00B7 ' + replyText + '</div>' +
-            '<div style="font-size:11px;color:#6b6b8a;margin-top:2px;">' + st.replied + ' replies</div></div>' +
-          '</div>' +
-          '<div style="display:flex;align-items:center;gap:8px;">' +
-            '<label class="toggle" style="width:44px;height:24px;"><input type="checkbox" ' + (ch.enabled ? 'checked' : '') + ' onchange="toggleChannel(\\'' + def.key + '\\',this.checked)"><span class="slider"></span></label>' +
-            '<button onclick="disconnectChannel(\\'' + def.key + '\\')" style="background:rgba(255,80,80,0.1);color:#ff6b6b;border:1px solid rgba(255,80,80,0.2);border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit;">Disconnect</button>' +
-          '</div>' +
-        '</div>';
-      } else {
-        html += '<div style="background:#161630;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;display:flex;align-items:center;justify-content:space-between;opacity:0.5;">' +
-          '<div style="display:flex;align-items:center;gap:12px;">' +
-            '<span style="font-size:24px;">' + def.icon + '</span>' +
-            '<div><div style="font-weight:600;font-size:14px;">' + def.name + '</div>' +
-            '<div style="font-size:12px;color:#6b6b8a;">Not connected</div></div>' +
-          '</div>' +
-        '</div>';
-      }
-    }
-    container.innerHTML = html;
-
-    // When a channel IS connected, HIDE its big "Connect" button — leaving it
-    // visible (even relabeled "Reconnect") makes users think the connection
-    // is broken and they must act. Connected state is shown clearly by the
-    // ✓ Connected card above. A connected channel only needs the small
-    // Disconnect control on its card, not a giant blue Connect button.
-    const hideIfConnected = (btnId, isConnected) => {
-      const btn = document.getElementById(btnId);
-      if (btn) btn.style.display = isConnected ? 'none' : '';
-    };
-    hideIfConnected('meta-connect-btn', !!channels.facebook?.accessToken);
-    hideIfConnected('ig-connect-btn',   !!channels.instagram?.accessToken);
-    hideIfConnected('gmail-connect-btn', !!d.gmailConnected);
-
-    // Gmail has no card in #channel-cards (it's not a social channel), so when
-    // connected give it its own clear ✓ Connected confirmation row.
-    const gmailRow = document.getElementById('gmail-status-row');
-    if (gmailRow) {
-      gmailRow.innerHTML = d.gmailConnected
-        ? '<div style="background:#161630;border:1px solid rgba(0,229,160,0.25);border-radius:12px;padding:16px;display:flex;align-items:center;gap:12px;">' +
-            '<span style="font-size:24px;">📧</span>' +
-            '<div><div style="font-weight:600;font-size:14px;">Gmail <span style="color:#00e5a0;font-size:12px;font-weight:700;">✓ Connected</span></div>' +
-            '<div style="font-size:12px;color:#00e5a0;">Inbox + auto-reply active</div></div>' +
-          '</div>'
-        : '';
-    }
-  } catch (e) { console.warn('Failed to load channels:', e); }
-}
-
-async function toggleChannel(channel, enabled) {
-  try {
-    const r = await apiPost('/api/dashboard/channel-toggle', { owner: OWNER, channel, enabled });
-    if (r.ok) toast(channel + (enabled ? ' enabled' : ' paused'));
-    loadChannels();
-  } catch (e) { toast('Error updating channel'); }
-}
-
-async function disconnectChannel(channel) {
-  if (!confirm('Disconnect ' + channel + '? Aria will stop replying on this channel.')) return;
-  try {
-    const r = await apiPost('/api/dashboard/channel-disconnect', { owner: OWNER, channel });
-    if (r.ok) toast(channel + ' disconnected');
-    loadChannels();
-  } catch (e) { toast('Error disconnecting'); }
-}
-
-loadChannels();
-
-let msgChannel = 'all';
-async function loadMessages(page, channel) {
-  if (channel) msgChannel = channel;
-  document.querySelectorAll('.msg-filter').forEach((btn, i) => {
-    const channels = ['all','whatsapp','instagram','facebook'];
-    if (channels[i] === msgChannel) {
-      btn.style.background = 'rgba(0,229,160,0.15)';
-      btn.style.color = '#00e5a0';
-      btn.style.borderColor = 'rgba(0,229,160,0.3)';
-    } else {
-      btn.style.background = 'rgba(255,255,255,0.06)';
-      btn.style.color = '#ccc';
-      btn.style.borderColor = 'rgba(255,255,255,0.1)';
-    }
-  });
-
-  const container = document.getElementById('messages-list');
-  try {
-    const d = await api('/api/dashboard/messages?channel=' + msgChannel + '&page=' + page);
-    if (!d.items || !d.items.length) {
-      container.innerHTML = '<div class="empty">No messages yet.</div>';
-      return;
-    }
-    const icons = { whatsapp: '\u{1F4AC}', instagram: '\u{1F4F7}', facebook: '\u{1F4AC}' };
-    let html = '<table><thead><tr><th></th><th>From</th><th>Message</th><th>Reply</th><th>When</th></tr></thead><tbody>';
-    for (const m of d.items) {
-      html += '<tr>' +
-        '<td>' + (icons[m.channel] || '') + '</td>' +
-        '<td>' + escH(m.senderName || m.senderId) + '</td>' +
-        '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH((m.message || '').substring(0, 80)) + '</td>' +
-        '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escH((m.reply || '').substring(0, 80)) + '</td>' +
-        '<td>' + timeAgo(m.timestamp) + '</td>' +
-      '</tr>';
-    }
-    html += '</tbody></table>';
-    if (d.totalPages > 1) {
-      html += '<div class="pagination">';
-      for (let i = 1; i <= d.totalPages; i++) {
-        html += '<button class="' + (i === page ? 'active' : '') + '" onclick="loadMessages(' + i + ')">' + i + '</button>';
-      }
-      html += '</div>';
-    }
-    container.innerHTML = html;
-  } catch (e) { container.innerHTML = '<div class="empty">Failed to load messages.</div>'; }
-}
-</script>
-</body></html>`);
+  // Authenticated — serve the static dashboard app (public/dashboard/).
+  // ownerEmail + sessionToken travel in the query string; app.js reads them
+  // client-side, so nothing is interpolated server-side anymore.
+  res.sendFile(resolve('public/dashboard/index.html'));
 });
 
 // ─── Meta OAuth (Facebook Login for Business) ────────────────────────────────
@@ -16658,6 +14278,27 @@ app.get('/api/quotes/approve', async (req, res) => {
     subtotal: draft.subtotal, currency: draft.currency,
   });
 
+  // W3 — chase the quote at T+48h. Trades win jobs on the follow-up. The
+  // handler re-checks at fire time and skips silently if the customer
+  // replied or booked since, so always scheduling on send is safe.
+  if (sent) {
+    try {
+      scheduleTask({
+        type: 'quote_followup',
+        dueAt: Date.now() + 48 * 60 * 60 * 1000,
+        ownerEmail,
+        payload: {
+          channel, senderId, senderName,
+          quoteId: id,
+          subtotal: draft.subtotal, currency: draft.currency,
+          validityDays: draft.validityDays,
+          sentAt: new Date().toISOString(),
+        },
+      });
+      console.log(`💷 [quote] follow-up scheduled for ${senderName} (T+48h)`);
+    } catch (e) { console.warn('[quote] schedule follow-up failed:', e.message); }
+  }
+
   pendingQuotes.delete(id);
   persistPendingQuotes();
   res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center;background:#0d0d1f;color:#eee;">
@@ -16808,7 +14449,7 @@ app.post('/api/vapi/webhook', async (req, res) => {
       const serverUrl = appBaseUrl(req);
       const assistant = buildAssistantConfig({
         ownerEmail, profile, knowledge, serverUrl,
-        opts: { voiceId: cfg.voiceId, firstMessage: cfg.firstMessage, maxDurationSec: cfg.maxDurationSec },
+        opts: { voiceId: cfg.voiceId, firstMessage: cfg.firstMessage, maxDurationSec: cfg.maxDurationSec, transcriberLanguage: cfg.language },
       });
       console.log(`📞 [voice] assistant-request for ${ownerEmail} on ${dialed}`);
       return res.json({ assistant });
@@ -16933,6 +14574,17 @@ async function handleVoiceCallOutcome({ ownerEmail, report }) {
     }
   }
 
+  // 2b. MISSED-CALL TEXT-BACK (W1) — the caller never actually spoke to Aria
+  //     (declined off-schedule, rang out, hung up in the first seconds).
+  //     Goes through the outbound scheduler (replay-on-restart, business-hours
+  //     gated, 24h-per-contact dedupe) rather than sending inline.
+  //     Mutually exclusive with step 2: isMissedCall() returns false whenever
+  //     a real intent was extracted, so a caller never gets both texts.
+  if (customerNumber && isMissedCall(report)) {
+    try { scheduleMissedCallFollowup({ ownerEmail, customerNumber, callerName: s.callerName || null }); }
+    catch (e) { console.warn('[voice] missed-call follow-up schedule failed:', e.message); }
+  }
+
   // 3. OWNER notification — digest-aware. Calls are informational unless
   //    the caller needs a callback / left a complaint (then immediate).
   const urgent = s.intent === 'complaint' || s.followUpNeeded === true;
@@ -16979,6 +14631,7 @@ app.get('/api/dashboard/phone/settings', (req, res) => {
       businessHours: cfg.businessHours || { mon: '9-17', tue: '9-17', wed: '9-17', thu: '9-17', fri: '9-17', sat: 'closed', sun: 'closed' },
       timezone: cfg.timezone || 'Europe/London',
       fallbackNumber: cfg.fallbackNumber || '',
+      language: cfg.language || 'en', // W6 — transcriber language (ISO-639-1, or 'multi')
     },
     canProvision: allowed && !!process.env.VAPI_API_KEY, // one-click available?
     webhookUrl: `${appBaseUrl(req)}/api/vapi/webhook`,
@@ -16994,7 +14647,7 @@ app.post('/api/dashboard/phone/settings', express.json({ limit: '8kb' }), (req, 
   // whole object on a greeting-only save would orphan the number (still
   // billing on Vapi, but unreachable from our index).
   const existing = voiceConfig.get(owner) || {};
-  const { enabled, phoneNumber, voiceId, firstMessage, answerMode, businessHours, timezone, fallbackNumber } = req.body || {};
+  const { enabled, phoneNumber, voiceId, firstMessage, answerMode, businessHours, timezone, fallbackNumber, language } = req.body || {};
   const merged = { ...existing };
   if (enabled !== undefined)      merged.enabled = !!enabled;
   // Only let the form set phoneNumber when this ISN'T a provisioned number
@@ -17006,6 +14659,9 @@ app.post('/api/dashboard/phone/settings', express.json({ limit: '8kb' }), (req, 
   if (answerMode !== undefined)   merged.answerMode = ['always', 'business_hours', 'out_of_hours'].includes(answerMode) ? answerMode : 'always';
   if (timezone !== undefined)     merged.timezone = String(timezone).slice(0, 60) || 'Europe/London';
   if (fallbackNumber !== undefined) merged.fallbackNumber = String(fallbackNumber).trim().slice(0, 24);
+  // W6 — transcriber language. Deepgram accepts ISO-639-1 codes (optionally
+  // with a region, e.g. 'en-GB') plus 'multi'; normalise + length-cap only.
+  if (language !== undefined)     merged.language = String(language).trim().toLowerCase().slice(0, 12) || 'en';
   if (businessHours !== undefined && businessHours && typeof businessHours === 'object') {
     // Whitelist the 7 day keys; each value a short range string.
     const clean = {};
@@ -17419,6 +15075,151 @@ registerTaskHandler('conv_recovery', async (task) => {
     console.warn('[outbound] conv_recovery send failed:', e.message);
     return false;
   }
+});
+
+// Quote follow-up (W3) — fires 48h after a quote was sent. Trades win jobs
+// on the chase. The "cancel if replied/booked since" condition is evaluated
+// at FIRE time (same pattern as conv_recovery's recent-activity check) —
+// skipping returns true so the task completes cleanly.
+registerTaskHandler('quote_followup', async (task) => {
+  const { ownerEmail, payload } = task;
+  const { channel, senderId, senderName, subtotal, currency, validityDays, sentAt } = payload;
+  if (!channel || !senderId) return false;
+  const profile = getOwnerProfile(ownerEmail);
+  if (profile?.config?.outbound?.quoteFollowup === false) return false;
+  if (profile?.profile?.outbound?.quoteFollowup === false) return false;
+  const sentAtMs = new Date(sentAt || task.scheduledAt).getTime();
+
+  // Skip — the customer replied since the quote went out (conversation is
+  // alive; a templated chase would read as tone-deaf).
+  const memKey = `${ownerEmail}::${channel}::${senderId}`;
+  const history = conversationMemory.get(memKey) || [];
+  if (history.some(h => h.role === 'sender' && new Date(h.date).getTime() > sentAtMs)) {
+    console.log(`💷 [quote_followup] skipped — ${senderName} replied since the quote`);
+    return true;
+  }
+  // Skip — a booking landed since the quote (they accepted). Channel booking
+  // records carry contact (email/phone) + name, not senderId, so match on
+  // either; WA senderId IS the phone number.
+  const bookedSince = bookings.some(b => b.ownerEmail === ownerEmail
+    && new Date(b.ts).getTime() > sentAtMs
+    && (b.senderId === senderId || b.contact === senderId || (senderName && b.name === senderName)));
+  if (bookedSince) {
+    console.log(`💷 [quote_followup] skipped — ${senderName} booked since the quote`);
+    return true;
+  }
+
+  const channelConfig = channelConfigs.get(ownerEmail)?.[channel];
+  if (!channelConfig) return false;
+  const businessName = profile?.profile?.businessName || 'us';
+  const daysLeft = Math.max(0, Math.round((sentAtMs + (Number(validityDays) > 0 ? Number(validityDays) : 30) * 86400000 - Date.now()) / 86400000));
+  const msg = `Hi ${senderName || 'there'} 👋 Just checking in on the quote from ${businessName}${subtotal ? ` (${currency || '£'}${Number(subtotal).toFixed(2)})` : ''} — any questions?${daysLeft > 0 ? ` It's valid for ${daysLeft} more day${daysLeft === 1 ? '' : 's'}.` : ''} Happy to book you in whenever suits.`;
+  try {
+    await sendChannelReply(channel, channelConfig, senderId, msg, ['Book me in', 'Got questions', 'Not right now']);
+    console.log(`💷 [outbound] quote_followup sent to ${senderName} via ${channel}`);
+    return true;
+  } catch (e) {
+    console.warn('[outbound] quote_followup send failed:', e.message);
+    return false;
+  }
+});
+
+// ─── Missed-call text-back (W1) ──────────────────────────────────────────
+// When the voice line declines off-schedule, rings out, or the caller hangs
+// up in the first seconds (lib/vapi_handler.js isMissedCall), text them on
+// WhatsApp so the job isn't lost. Dedupe: one follow-up per caller per 24h,
+// derived from an append-only ledger (Rule 13). Business hours: the task is
+// scheduled into the owner's next open window so the text never lands at 2am.
+const MISSED_CALL_LEDGER = resolve('data/missed_call_followups.jsonl');
+function appendMissedCallLedger(entry) {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    appendFileSync(MISSED_CALL_LEDGER, JSON.stringify(entry) + '\n');
+  } catch (e) { console.warn('[missed_call] ledger append failed:', e.message); }
+}
+function missedCallSentRecently(ownerEmail, customerNumber, windowMs = 24 * 60 * 60 * 1000) {
+  try {
+    if (!existsSync(MISSED_CALL_LEDGER)) return false;
+    const cutoff = Date.now() - windowMs;
+    const lines = readFileSync(MISSED_CALL_LEDGER, 'utf8').split('\n').filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const e = JSON.parse(lines[i]);
+        if (new Date(e.ts).getTime() < cutoff) break; // ledger is chronological
+        if (e.ownerEmail === ownerEmail && e.customerNumber === customerNumber && e.status === 'sent') return true;
+      } catch {}
+    }
+  } catch {}
+  return false;
+}
+
+// Schedule (not send) — called from the Vapi end-of-call outcome handler.
+// Returns the taskId or null when deduped/skipped.
+function scheduleMissedCallFollowup({ ownerEmail, customerNumber, callerName }) {
+  if (!customerNumber) return null;
+  if (missedCallSentRecently(ownerEmail, customerNumber)) {
+    console.log(`📵 [missed_call] dedupe — already texted ${customerNumber} in the last 24h`);
+    return null;
+  }
+  const dup = listPending({ ownerEmail, type: 'missed_call_followup' })
+    .find(t => t.payload?.customerNumber === customerNumber);
+  if (dup) return null;
+
+  // Business-hours gate (lib/business_hours.js) — same schedule source as the
+  // channel pipeline. Small base delay so we don't text someone mid-redial.
+  let dueAt = Date.now() + 2 * 60 * 1000;
+  const profile = getOwnerProfile(ownerEmail);
+  const schedule = profile?.profile?.schedule || profile?.schedule || profile?.config?.schedule;
+  if (schedule) {
+    const next = nextOpenTime(schedule, dueAt);
+    if (next !== null) dueAt = next;
+    // null = no open window found in 7 days (misconfigured schedule) — send
+    // at the base delay rather than silently dropping the lead (Rule 10).
+  }
+  const taskId = scheduleTask({
+    type: 'missed_call_followup',
+    dueAt, ownerEmail,
+    payload: { customerNumber, callerName: callerName || null },
+  });
+  console.log(`📵 [missed_call] follow-up scheduled for ${customerNumber} at ${new Date(dueAt).toISOString()}`);
+  return taskId;
+}
+
+registerTaskHandler('missed_call_followup', async (task) => {
+  const { ownerEmail, payload } = task;
+  const { customerNumber, callerName } = payload;
+  if (!customerNumber) return false;
+  const profile = getOwnerProfile(ownerEmail);
+  if (profile?.config?.outbound?.missedCallFollowup === false) return false;
+  if (profile?.profile?.outbound?.missedCallFollowup === false) return false;
+
+  // Re-check dedupe at fire time — a restart replay could double-queue.
+  if (missedCallSentRecently(ownerEmail, customerNumber)) {
+    console.log(`📵 [missed_call] fire-time dedupe for ${customerNumber}`);
+    return true;
+  }
+  // Skip if the caller has messaged us on WhatsApp since the missed call —
+  // they already reached us; a "sorry we missed you" would be confusing.
+  const memKey = `${ownerEmail}::whatsapp::${customerNumber}`;
+  const history = conversationMemory.get(memKey) || [];
+  if (history.some(h => h.role === 'sender' && new Date(h.date).getTime() > (task.scheduledAt || 0))) {
+    console.log(`📵 [missed_call] skipped — ${customerNumber} messaged us since the call`);
+    return true;
+  }
+
+  const waConfig = channelConfigs.get(ownerEmail)?.whatsapp;
+  if (!waConfig?.accessToken) {
+    console.warn(`📵 [missed_call] no WhatsApp connected for ${ownerEmail} — cannot text back`);
+    return false;
+  }
+  const businessName = profile?.profile?.businessName || profile?.businessName || 'us';
+  const msg = `Hi${callerName ? ' ' + callerName : ''} 👋 Sorry we missed your call to ${businessName}! What do you need? Reply here and we'll get you sorted.`;
+  const ok = await sendChannelReply('whatsapp', waConfig, customerNumber, msg, ['Book an appointment', 'Get a quote', 'Something else']);
+  if (ok) {
+    appendMissedCallLedger({ ts: new Date().toISOString(), ownerEmail, customerNumber, status: 'sent', taskId: task.id });
+    console.log(`📵 [outbound] missed_call_followup sent to ${customerNumber} (${ownerEmail})`);
+  }
+  return ok;
 });
 
 // Boot scheduler at startup

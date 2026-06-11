@@ -187,15 +187,24 @@
     whatsapp:        _a('whatsapp',     ''),       // WhatsApp number for contact card
     upsells:         _j('upsells',      []),       // [{trigger:"Haircut",offer:"Beard Trim",price:"£5",desc:"Quick 5-min add-on"}]
 
-    // Opt-in tool-use lead router. Default keeps every existing site on the
-    // proven /api/chat path. Set data-endpoint="/api/chat/router" per-client
-    // to flip that client onto the qualifier + handler pipeline.
-    endpoint:        _a('endpoint',     '/api/chat'),
+    // W7 — the tool-use lead router IS the default widget brain. Every embed
+    // without an explicit data-endpoint runs on /api/chat/router/stream
+    // (qualifier + real tools + server-side prompt). Legacy opt-out preserved:
+    // set data-endpoint="/api/chat" to keep a client on the old ::ACTION path.
+    endpoint:        _a('endpoint',     '/api/chat/router'),
   };
 
   // Apply business type preset (any explicit data-* overrides the preset)
   const _preset = BUSINESS_PRESETS[CONFIG.businessType] || BUSINESS_PRESETS.generic;
   if (!_s?.dataset?.quickReplies) CONFIG.quickReplies = _preset.quickReplies;
+
+  // True on the tool-use router brain (the default). Drives: SSE streaming on,
+  // tool-event dispatch, and the W8 image-in-conversation upload path.
+  const IS_ROUTER   = /\/router\/?$/.test(CONFIG.endpoint);
+  // W7 — the router default is the STREAMING route (/api/chat/router/stream):
+  // progressive text + abort-safety (no side-effecting tools fire for a
+  // visitor who closed the tab). Legacy /api/chat embeds keep non-streaming.
+  if (IS_ROUTER) CONFIG.streamingEnabled = true;
 
   const BASE        = CONFIG.serverUrl || window.location.origin;
   const PROXY_URL   = BASE + CONFIG.endpoint;
@@ -1796,6 +1805,21 @@ Return JSON:
       ? `\nVISITOR PROFILE (gathered from conversation):${qualification.need ? `\n- Need: ${qualification.need}` : ''}${qualification.urgency ? `\n- Urgency: ${qualification.urgency}` : ''}${qualification.budget ? `\n- Budget: ${qualification.budget}` : ''}`
       : '';
 
+    // W7 — on the router brain, the ::ACTION tags for booking / callback /
+    // quote / handoff / quick replies / lead capture are superseded by real
+    // tools. Telling the model explicitly prevents double-triggering (tool
+    // call + matching ::TAG in the same reply).
+    const routerToolsNote = IS_ROUTER ? `
+
+━━━ REAL TOOLS (use these — preferred over tags) ━━━
+You have real tools: show_quick_replies, show_lead_capture, start_booking_flow, request_callback, request_quote, handoff_to_human, qualify_lead, lookup_faq, create_lead_record, send_whatsapp_to_owner, book_calendar_slot.
+- For booking/availability → CALL start_booking_flow (show_availability:true for "when are you free?") instead of emitting ::BOOKING or ::CHECK_AVAILABILITY.
+- For a callback → CALL request_callback instead of ::CALLBACK. For a quote → CALL request_quote instead of ::QUOTE.
+- For a human → CALL handoff_to_human instead of ::HANDOFF.
+- For suggested next steps → CALL show_quick_replies and OMIT the FOLLOWUPS: line.
+- To capture an email for follow-up → CALL show_lead_capture.
+Never emit one of those ::TAGS and the matching tool in the same reply. The other tags (::BUTTON, ::IMAGE, ::VIDEO, ::DOCUMENT, ::DIRECTIONS, ::CONTACT, ::SERVICES, ::ORDER, ::RESCHEDULE) still work as text.` : '';
+
     return `
 You are ${CONFIG.botName}, the AI assistant for ${businessName}. You are not a generic chatbot — you are a trained specialist who knows this business and your job is to help visitors make a decision and take action.
 ${userName ? `\nThe visitor's name is ${userName}. Use it once naturally — not in every message.` : ''}
@@ -1881,7 +1905,7 @@ Use sparingly — only when genuinely helpful:
 ::SERVICES                 — show all services as clickable cards
 ::ORDER                    — start order flow (collect item, size/colour, name, email, delivery address — for product/clothing/ecommerce sites)
 ::RESCHEDULE               — reschedule or cancel an existing booking (asks for their email, looks it up, offers to move or cancel)
-
+${routerToolsNote}
 ━━━ FOLLOW-UPS ━━━
 End every response with this line. Make them the NEXT LOGICAL STEP in the visitor's journey toward a decision — not generic questions.
 Format: FOLLOWUPS: [Question one?] | [Question two?] | [Question three?]
@@ -2224,12 +2248,21 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     }
   }
 
-  // Handle callback request
-  async function handleCallback(cb) {
+  // Green ✓ confirmation card — shared by the legacy ::CALLBACK/::QUOTE tag
+  // handlers and the router tool-event dispatcher (W7).
+  function actionConfirmCard(text) {
     const card = document.createElement('div');
     card.className = 'ac-action-card';
-    card.innerHTML = '<p style="font-size:13px;color:#00c853;font-weight:600;">✓ Callback request sent — someone will call you shortly.</p>';
+    const p = document.createElement('p');
+    p.style.cssText = 'font-size:13px;color:#00c853;font-weight:600;';
+    p.textContent = text;
+    card.appendChild(p);
     insertBefore(card); scrollBottom();
+  }
+
+  // Handle callback request
+  async function handleCallback(cb) {
+    actionConfirmCard('✓ Callback request sent — someone will call you shortly.');
     try {
       await fetch(CALLBACK_URL, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -2241,10 +2274,7 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
 
   // Handle quote request
   async function handleQuote(q) {
-    const card = document.createElement('div');
-    card.className = 'ac-action-card';
-    card.innerHTML = '<p style="font-size:13px;color:#00c853;font-weight:600;">✓ Quote request sent — we\'ll get back to you with pricing.</p>';
-    insertBefore(card); scrollBottom();
+    actionConfirmCard("✓ Quote request sent — we'll get back to you with pricing.");
     try {
       await fetch(QUOTE_URL, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -2382,6 +2412,53 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
   }
 
   // =====================================================
+  //  ROUTER TOOL EVENTS (W7)
+  // =====================================================
+  // The router brain emits {tool, result} frames mid-stream (and a toolEvents
+  // array on the non-streaming route). We buffer them during the response and
+  // dispatch the UI effects AFTER the text renders — same ordering as the
+  // legacy parseRich tags, which fire on the final text.
+  let _pendingToolEvents = [];
+  function queueToolEvent(ev) { if (ev && (ev.tool || ev.name)) _pendingToolEvents.push(ev); }
+
+  function dispatchToolEvents() {
+    const events = _pendingToolEvents; _pendingToolEvents = [];
+    for (const ev of events) {
+      const name = ev.tool || ev.name;
+      const result = ev.result || {};
+      if (result.error) continue; // model already saw the error and adjusted
+      switch (name) {
+        case 'show_quick_replies':
+          if (Array.isArray(result.suggestions) && result.suggestions.length) renderQuickReplies(result.suggestions);
+          break;
+        case 'show_lead_capture':
+          if (CONFIG.leadCaptureEnabled) showLeadCard();
+          break;
+        case 'start_booking_flow':
+          if (bookingState) break; // a ::BOOKING text tag already opened it
+          if (result.show_availability || !CONFIG.booking) fetchAvailability();
+          else startBooking();
+          break;
+        case 'request_callback':
+          // Server already notified the owner (request_callback handler) —
+          // just confirm to the visitor. No re-POST to /api/chat/callback.
+          actionConfirmCard('✓ Callback request sent — someone will call you shortly.');
+          trackEvent('callback_requested', { phone: result.phone || '' });
+          break;
+        case 'request_quote':
+          actionConfirmCard("✓ Quote request sent — we'll get back to you with pricing.");
+          trackEvent('quote_requested', {});
+          break;
+        case 'handoff_to_human':
+          renderRichElements({ showHandoff: true });
+          break;
+        // qualify_lead / lookup_faq / create_lead_record / send_whatsapp_to_owner /
+        // book_calendar_slot are server-side — nothing to render.
+      }
+    }
+  }
+
+  // =====================================================
   //  STREAMING RESPONSE
   // =====================================================
   async function streamResponse(messages, model, maxTokens = 500) {
@@ -2410,6 +2487,9 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
           try {
             const c = JSON.parse(raw); if (c.error) throw new Error(c.error);
             if (c.text) { fullText += c.text; bubble.textContent = fullText.replace(/\nFOLLOWUPS:.*$/m,''); scrollBottom(); }
+            // Router stream emits {tool, result} frames as tools dispatch —
+            // buffer them; dispatchToolEvents() renders the UI after the text.
+            if (c.tool) queueToolEvent(c);
             // Router stream emits a final {done, score, ...} frame — persist the
             // score so next turn's policy decision uses an up-to-date value.
             if (c.done) persistRouterScore(c);
@@ -2434,7 +2514,75 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
     if (!res.ok) throw new Error();
     const data = await res.json();
     persistRouterScore(data); // no-op on legacy /api/chat (no score field)
+    // Non-streaming router returns toolEvents in the body — same dispatch.
+    if (Array.isArray(data.toolEvents)) data.toolEvents.forEach(queueToolEvent);
     return data.content[0].text;
+  }
+
+  // =====================================================
+  //  IMAGE MESSAGE (W8 — router path)
+  // =====================================================
+  // The photo joins the SAME router conversation as an Anthropic image
+  // content block, so vision feeds the live lead/quote pipeline (qualify →
+  // request_quote) exactly like the channel pipeline — not the old stateless
+  // one-shot /api/chat/upload.
+  async function sendImageMessage(dataUrl, mediaType, msgText) {
+    if (isBusy) return;
+    isBusy = true;
+    const userText = msgText || 'Here is a photo — please take a look.';
+    const base64 = String(dataUrl).split(',')[1] || '';
+    history.push({
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: base64 } },
+        { type: 'text', text: userText },
+      ],
+    });
+    if (history.length > 24) history = history.slice(-24);
+
+    typ().classList.add('show');
+    el('_ac-ttext').textContent = 'Taking a look at your photo…';
+    scrollBottom();
+    try {
+      let fullText = '';
+      if (CONFIG.streamingEnabled) {
+        typ().classList.remove('show');
+        fullText = await streamResponse([...history], CONFIG.smartModel, 800);
+      } else {
+        fullText = await standardResponse([...history], CONFIG.smartModel, 800);
+        typ().classList.remove('show');
+      }
+      if (fullText) {
+        deliverResponse(fullText);
+        const { clean } = parseFollowups(fullText);
+        const { text: ct } = parseRich(clean);
+        history.push({ role: 'assistant', content: ct });
+        botMsgs++; msgStreak++;
+        dispatchToolEvents();
+        detectKnowledgeGap(ct);
+        trackEvent('chat_image_sent', { page: document.title });
+      } else {
+        _pendingToolEvents = [];
+      }
+    } catch {
+      _pendingToolEvents = [];
+      typ().classList.remove('show');
+      makeBotBubble("Sorry, I couldn't process that image. Could you try again?");
+      sounds.pop(); addTimestamp(); scrollBottom();
+    }
+    // Swap the heavy base64 block for a text note: keeps localStorage under
+    // quota and stops later turns re-billing the image tokens. The model's
+    // reply (what it SAW) stays in history — same as the channel pipeline.
+    for (let i = history.length - 1; i >= 0; i--) {
+      const m = history[i];
+      if (m.role === 'user' && Array.isArray(m.content) && m.content.some(b => b.type === 'image')) {
+        history[i] = { role: 'user', content: `[photo attached] ${userText}` };
+        break;
+      }
+    }
+    saveHistory();
+    isBusy = false;
+    setTimeout(() => { if (!isBusy) el('_ac-inp').focus(); }, 100);
   }
 
   // =====================================================
@@ -2602,6 +2750,9 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
         const { text: ct } = parseRich(clean);
         history.push({ role: 'assistant', content: ct });
         botMsgs++; msgStreak++;
+        // W7 — render router tool effects (quick replies, booking flow, lead
+        // form, callback/quote confirms, handoff) after the text is delivered.
+        dispatchToolEvents();
         saveHistory(); ping(); maybeShowLead(); checkStreak();
         // Detect and log knowledge gaps (questions the bot couldn't answer from site content)
         detectKnowledgeGap(ct);
@@ -2615,8 +2766,11 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
         if (checkCompetitor(text)) ping({ competitorMention: text.slice(0, 200) });
         // GA4 event per message
         trackEvent('chat_message_sent', { botMsgs, page: document.title });
+      } else {
+        _pendingToolEvents = []; // failed/empty response — drop stale tool effects
       }
     } catch {
+      _pendingToolEvents = [];
       typ().classList.remove('show');
       // Remove the last user message from history so they can retry cleanly
       const failedMsg = (history[history.length - 1]?.role === 'user') ? history.pop()?.content : text;
@@ -2773,6 +2927,13 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
   // =====================================================
   function maybeShowLead() {
     if (!CONFIG.leadCaptureEnabled || leadDone || botMsgs !== CONFIG.leadCaptureAfter) return;
+    showLeadCard();
+  }
+
+  // Direct form trigger — used by maybeShowLead's N-messages heuristic AND the
+  // router brain's show_lead_capture tool (W7).
+  function showLeadCard() {
+    if (leadDone || document.getElementById('_ac-lead')) return;
     const card = document.createElement('div'); card.id = '_ac-lead';
     const nameHook = userName ? ` ${userName}` : '';
     // Contextual prompt based on what we know about the visitor
@@ -3109,29 +3270,40 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
       fileInput.addEventListener('change', async (e) => {
         const file = e.target.files[0];
         if (!file) return;
-        if (file.size > 5 * 1024 * 1024) { showToast('Max file size is 5MB'); return; }
+        if (file.size > 5 * 1024 * 1024) { toast('Max file size is 5MB'); return; }
+        if (isBusy) { toast('One moment — still replying'); return; }
 
         const reader = new FileReader();
         reader.onload = async () => {
           const dataUrl = reader.result;
           // Show user's image in chat
           const userDiv = document.createElement('div');
-          userDiv.className = 'ac-msg ac-user';
+          userDiv.className = 'ac-msg user';
           const img = document.createElement('img');
           img.src = dataUrl;
           img.className = 'ac-img-preview';
+          img.style.cssText = 'max-width:180px;border-radius:10px;display:block;';
           userDiv.appendChild(img);
-          const msgText = document.getElementById('_ac-inp').value.trim();
+          const msgText = el('_ac-inp').value.trim();
           if (msgText) {
             const p = document.createElement('p');
             p.textContent = msgText;
+            p.style.cssText = 'margin:6px 0 0;';
             userDiv.appendChild(p);
           }
           insertBefore(userDiv);
           scrollBottom();
-          document.getElementById('_ac-inp').value = '';
+          el('_ac-inp').value = ''; el('_ac-inp').style.height = 'auto';
 
-          showTyping();
+          if (IS_ROUTER) {
+            // W8 — photo joins the live router conversation (vision → quote).
+            await sendImageMessage(dataUrl, file.type, msgText);
+            return;
+          }
+
+          // Legacy opt-out path (data-endpoint="/api/chat") — stateless
+          // one-shot vision call, unchanged behavior.
+          typ().classList.add('show'); scrollBottom();
           try {
             const res = await fetch(BASE + '/api/chat/upload', {
               method: 'POST',
@@ -3145,13 +3317,14 @@ ${CONFIG.customPrompt ? `\n━━━ CUSTOM INSTRUCTIONS (override above if conf
               }),
             });
             const data = await res.json();
-            hideTyping();
+            typ().classList.remove('show');
             if (data.content?.[0]?.text) {
-              addBotMessage(data.content[0].text);
+              deliverResponse(data.content[0].text);
             }
           } catch {
-            hideTyping();
-            addBotMessage("Sorry, I couldn't process that image. Could you try again?");
+            typ().classList.remove('show');
+            makeBotBubble("Sorry, I couldn't process that image. Could you try again?");
+            sounds.pop(); addTimestamp(); scrollBottom();
           }
         };
         reader.readAsDataURL(file);
