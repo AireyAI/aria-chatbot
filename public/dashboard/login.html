@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0A0A12">
+  <title>Sign in — Aria</title>
+  <link rel="icon" type="image/svg+xml" href="/dashboard/assets/favicon.svg">
+  <link rel="stylesheet" href="/dashboard/assets/styles.css">
+</head>
+<body>
+
+  <div class="login-wrap">
+    <main class="login-card" aria-labelledby="login-heading">
+      <span class="logo">Aria<em>Ai</em></span>
+      <h1 id="login-heading" style="font-size:18px;margin-bottom:4px">Welcome back</h1>
+      <p style="color:var(--text-2);font-size:var(--fs-small);margin-bottom:20px">Sign in to your Aria dashboard.</p>
+
+      <form id="login-form" novalidate>
+        <div class="field">
+          <label for="login-email">Email</label>
+          <input class="input" id="login-email" type="email" autocomplete="username" required>
+        </div>
+        <div class="field">
+          <label for="login-password">Password</label>
+          <input class="input" id="login-password" type="password" autocomplete="current-password" required>
+        </div>
+        <button class="btn btn-primary" id="login-btn" type="submit" style="width:100%;padding:10px">Sign in</button>
+        <p class="login-msg" id="login-msg" role="alert" aria-live="assertive"></p>
+      </form>
+
+      <p style="text-align:center;margin-top:4px">
+        <a href="#" id="forgot-link" style="font-size:var(--fs-small)">Forgotten your password?</a>
+      </p>
+      <p class="login-foot">Powered by AireyAi</p>
+    </main>
+  </div>
+
+  <script>
+    'use strict';
+    (function () {
+      var qs = new URLSearchParams(location.search);
+      var emailInput = document.getElementById('login-email');
+      var passInput = document.getElementById('login-password');
+      var msg = document.getElementById('login-msg');
+      var btn = document.getElementById('login-btn');
+
+      var owner = qs.get('owner') || '';
+      if (owner) {
+        emailInput.value = owner;
+        passInput.focus();
+      } else {
+        emailInput.focus();
+      }
+      if (qs.get('expired')) {
+        msg.textContent = 'Your session expired — please sign in again.';
+        msg.className = 'login-msg err';
+      }
+
+      function setMsg(text, ok) {
+        msg.textContent = text;
+        msg.className = 'login-msg ' + (ok ? 'ok' : 'err');
+      }
+
+      document.getElementById('login-form').addEventListener('submit', function (e) {
+        e.preventDefault();
+        var email = emailInput.value.trim();
+        var password = passInput.value;
+        if (!email || !password) { setMsg('Enter your email and password.'); return; }
+        btn.disabled = true;
+        btn.textContent = 'Signing in…';
+        fetch('/api/dashboard/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ owner: email, password: password })
+        }).then(function (res) { return res.json().catch(function () { return {}; }); })
+          .then(function (data) {
+            if (data && data.ok && data.token) {
+              location.href = '/dashboard?owner=' + encodeURIComponent(email) + '&s=' + encodeURIComponent(data.token);
+            } else {
+              setMsg((data && data.error) || 'Wrong email or password.');
+              btn.disabled = false;
+              btn.textContent = 'Sign in';
+            }
+          })
+          .catch(function () {
+            setMsg('Couldn’t reach the server — try again.');
+            btn.disabled = false;
+            btn.textContent = 'Sign in';
+          });
+      });
+
+      document.getElementById('forgot-link').addEventListener('click', function (e) {
+        e.preventDefault();
+        var email = emailInput.value.trim();
+        if (!email) { setMsg('Enter your email first, then tap “Forgotten your password?”.'); emailInput.focus(); return; }
+        setMsg('Sending reset link…', true);
+        fetch('/api/dashboard/forgot-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ owner: email })
+        }).then(function (res) { return res.json().catch(function () { return {}; }); })
+          .then(function (data) {
+            if (data && data.ok) setMsg(data.message || 'Reset link sent — check your inbox.', true);
+            else setMsg((data && data.error) || 'Couldn’t send the reset email.');
+          })
+          .catch(function () { setMsg('Couldn’t reach the server — try again.'); });
+      });
+    })();
+  </script>
+</body>
+</html>

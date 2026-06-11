@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0A0A12">
+  <title>Aria — Dashboard</title>
+  <link rel="icon" type="image/svg+xml" href="/dashboard/assets/favicon.svg">
+  <link rel="stylesheet" href="/dashboard/assets/styles.css">
+</head>
+<body>
+
+  <a class="visually-hidden" href="#view">Skip to content</a>
+
+  <header class="topbar">
+    <button class="icon-btn hamburger" id="hamburger-btn" aria-label="Open menu" aria-controls="sidebar" aria-expanded="false"></button>
+    <span class="logo">Aria<em>Ai</em></span>
+    <span class="topbar-spacer"></span>
+    <span class="email-chip" id="email-chip"></span>
+    <button class="btn btn-ghost" id="cmdk-btn" aria-label="Open command palette (Command K)" title="Command palette (⌘K)"></button>
+    <button class="icon-btn" id="help-btn" aria-label="Replay the tour" title="Tour"></button>
+    <button class="btn btn-ghost" id="logout-btn"></button>
+  </header>
+
+  <div class="sidebar-backdrop" id="sidebar-backdrop" aria-hidden="true"></div>
+
+  <nav class="sidebar" id="sidebar" aria-label="Main navigation">
+    <div>
+      <div class="nav-group-label" id="nav-overview-label">Overview</div>
+      <ul class="nav-list" aria-labelledby="nav-overview-label">
+        <li><button class="nav-item" data-nav="home">Home</button></li>
+        <li><button class="nav-item" data-nav="conversations">Conversations</button></li>
+        <li><button class="nav-item" data-nav="leads">Leads</button></li>
+        <li><button class="nav-item" data-nav="customers">Customers</button></li>
+        <li><button class="nav-item" data-nav="bookings">Bookings</button></li>
+      </ul>
+    </div>
+    <div>
+      <div class="nav-group-label" id="nav-manage-label">Manage</div>
+      <ul class="nav-list" aria-labelledby="nav-manage-label">
+        <li><button class="nav-item" data-nav="train">Train Aria</button></li>
+        <li><button class="nav-item" data-nav="channels">Channels</button></li>
+        <li><button class="nav-item" data-nav="business">Business</button></li>
+        <li><button class="nav-item" data-nav="settings">Settings</button></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main class="main">
+    <div id="view" aria-live="polite"></div>
+  </main>
+
+  <!-- mobile bottom tab bar (≤700px) -->
+  <nav class="tabbar" aria-label="Primary">
+    <button data-nav="home">Home</button>
+    <button data-nav="conversations">Chats</button>
+    <button data-nav="leads">Leads</button>
+    <button data-nav="bookings">Bookings</button>
+    <button id="tab-more" aria-haspopup="true" aria-controls="more-sheet">More</button>
+  </nav>
+  <div class="sheet" id="more-sheet" role="menu" aria-label="More pages">
+    <ul class="nav-list">
+      <li><button class="nav-item" data-nav="customers" role="menuitem">Customers</button></li>
+      <li><button class="nav-item" data-nav="train" role="menuitem">Train Aria</button></li>
+      <li><button class="nav-item" data-nav="channels" role="menuitem">Channels</button></li>
+      <li><button class="nav-item" data-nav="business" role="menuitem">Business</button></li>
+      <li><button class="nav-item" data-nav="settings" role="menuitem">Settings</button></li>
+    </ul>
+  </div>
+
+  <!-- toasts -->
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+  <!-- drawer -->
+  <div class="drawer-overlay" id="drawer-overlay"></div>
+  <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" aria-hidden="true">
+    <div class="drawer-head">
+      <h2 id="drawer-title"></h2>
+      <button class="icon-btn" id="drawer-close" aria-label="Close panel"></button>
+    </div>
+    <div class="drawer-body" id="drawer-body"></div>
+  </aside>
+
+  <!-- modal -->
+  <div class="modal-overlay" id="modal-overlay"></div>
+  <div class="modal" id="modal" role="alertdialog" aria-modal="true" aria-labelledby="modal-title"></div>
+
+  <!-- command palette -->
+  <div class="cmdk-overlay" id="cmdk-overlay"></div>
+  <div class="cmdk" id="cmdk" role="dialog" aria-modal="true" aria-label="Command palette" aria-hidden="true">
+    <div class="cmdk-input-wrap">
+      <span id="cmdk-search-ic" aria-hidden="true"></span>
+      <input class="cmdk-input" id="cmdk-input" type="text" placeholder="Search pages and actions…"
+             role="combobox" aria-expanded="true" aria-controls="cmdk-list" aria-autocomplete="list" autocomplete="off" spellcheck="false">
+    </div>
+    <ul class="cmdk-list" id="cmdk-list" role="listbox" aria-label="Commands"></ul>
+    <div class="cmdk-foot">
+      <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+      <span><kbd>↵</kbd> run</span>
+      <span><kbd>esc</kbd> close</span>
+    </div>
+  </div>
+
+  <script src="/dashboard/assets/icons.js"></script>
+  <script src="/dashboard/assets/app.js"></script>
+  <script src="/dashboard/assets/panels.js"></script>
+</body>
+</html>
