@@ -60,7 +60,7 @@ import { canBatch as digestCanBatch, shouldFireDigest, renderDigestHtml } from '
 import { verifyVapiSignature, buildAssistantConfig, extractCallReport, extractToolCall, provisionVapiNumber, releaseVapiNumber, isMissedCall } from './lib/vapi_handler.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
-import { interpretOwnerCommand } from './lib/owner_chatops.js';
+import { interpretOwnerCommand, isClosedOn, localDateISO } from './lib/owner_chatops.js';
 
 const app    = express();
 // Railway terminates TLS at its edge proxy and forwards X-Forwarded-Proto.
@@ -13496,6 +13496,19 @@ function applyOwnerCommand(ownerEmail, action, payload) {
     persistProfiles();
     return 'updated your opening hours';
   }
+  if (action === 'set_closure') {
+    const prof = findMutableOwnerProfile(ownerEmail);
+    if (!prof) throw new Error('no saved profile found — set up your business profile in the dashboard first');
+    prof.schedule = prof.schedule || {};
+    const byDate = new Map((Array.isArray(prof.schedule.closures) ? prof.schedule.closures : []).map(c => [c.date, c]));
+    for (const c of payload.closures) byDate.set(c.date, c);
+    // Keep today-or-future only (past closures are noise) and sort ascending.
+    const todayISO = localDateISO(Date.now(), prof.schedule.timezone);
+    prof.schedule.closures = [...byDate.values()].filter(c => c.date >= todayISO).sort((a, b) => a.date.localeCompare(b.date));
+    persistProfiles();
+    const n = payload.closures.length;
+    return `marked ${n} ${n > 1 ? 'dates' : 'date'} as closed`;
+  }
   throw new Error(`unknown action: ${action}`);
 }
 
@@ -13536,10 +13549,13 @@ async function handleOwnerCommand({ ownerEmail, channel, channelConfig, senderId
   let proposal;
   try {
     const profile = getOwnerProfile(ownerEmail);
+    const tz = profile?.profile?.schedule?.timezone || 'Europe/London';
     proposal = await interpretOwnerCommand({
       messageText: text,
       businessName: profile?.config?.businessName || profile?.profile?.businessName,
       currentHours: profile?.profile?.schedule?.days || profile?.profile?.schedule?.businessHours,
+      todayISO: localDateISO(Date.now(), tz),
+      timezone: tz,
     }, claude);
   } catch (e) {
     if (isAiBillingError(e)) {
@@ -13652,10 +13668,39 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
     || profile?.profile?.allowedTopics
     || null;
 
+  // One-off / holiday closure gate (owner chat-ops `set_closure`). Runs BEFORE
+  // the recurring-hours gate so it applies even to always-on businesses — a
+  // holiday closes the doors regardless of the weekly schedule. Mirrors the
+  // out-of-hours behaviour (silent vs auto-reply), with a closure-specific note.
+  const schedule = profile?.profile?.schedule || profile?.schedule || profile?.config?.schedule;
+  if (schedule) {
+    const closure = isClosedOn(schedule, new Date(), schedule.timezone);
+    if (closure) {
+      const oohSilent = (schedule.outOfHoursMode || schedule.outOfHours) === 'silent';
+      const closureMsg = closure.reason
+        ? `Thanks for getting in touch! We're closed today (${closure.reason}) — leave a message and we'll get back to you when we reopen.`
+        : `Thanks for getting in touch! We're closed today — leave a message and we'll get back to you when we reopen.`;
+      console.log(`🚪 [${channel}] Closure day for ${ownerEmail} (${closure.date}${closure.reason ? ` — ${closure.reason}` : ''})`);
+      if (!oohSilent) {
+        try { await sendChannelReply(channel, ownerChannels[channel], senderId, closureMsg); }
+        catch (e) { console.warn('[closure] auto-reply send failed:', e.message); }
+      }
+      const msgs = channelMessages.get(ownerEmail) || [];
+      msgs.push({
+        id: messageId, channel, senderId, senderName,
+        message: messageText, reply: oohSilent ? '(closure day — not replied)' : closureMsg,
+        timestamp: new Date().toISOString(), status: 'closure',
+      });
+      if (msgs.length > 500) msgs.splice(0, msgs.length - 500);
+      channelMessages.set(ownerEmail, msgs);
+      persistChannelMessages();
+      return;
+    }
+  }
+
   // Business hours gate. Owner-configurable schedule per profile. If outside
   // hours: either silently log (no reply), or send a polite auto-reply
   // saying "we are closed". Either way the message + lead are still saved.
-  const schedule = profile?.profile?.schedule || profile?.schedule || profile?.config?.schedule;
   if (schedule) {
     const evalRes = evaluateSchedule(schedule, new Date());
     if (!evalRes.inHours) {

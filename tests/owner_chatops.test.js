@@ -6,7 +6,7 @@
 // tests cover the parsing/validation/summary logic, not the model.
 
 import { describe, it, expect } from 'vitest';
-import { interpretOwnerCommand, OWNER_TOOLS } from '../lib/owner_chatops.js';
+import { interpretOwnerCommand, OWNER_TOOLS, isClosedOn, localDateISO } from '../lib/owner_chatops.js';
 
 // Minimal fake Anthropic client — returns whatever content we hand it.
 function fakeClaude(content) {
@@ -16,8 +16,8 @@ const toolUse = (name, input) => [{ type: 'tool_use', name, input }];
 const textOnly = (t) => [{ type: 'text', text: t }];
 
 describe('OWNER_TOOLS schema', () => {
-  it('exposes exactly add_faq + set_business_hours', () => {
-    expect(OWNER_TOOLS.map(t => t.name).sort()).toEqual(['add_faq', 'set_business_hours']);
+  it('exposes add_faq + set_business_hours + set_closure', () => {
+    expect(OWNER_TOOLS.map(t => t.name).sort()).toEqual(['add_faq', 'set_business_hours', 'set_closure']);
   });
 });
 
@@ -77,6 +77,52 @@ describe('set_business_hours', () => {
     const claude = fakeClaude(toolUse('set_business_hours', { changes: [{ day: 'mon', value: '17-9' }] }));
     const r = await interpretOwnerCommand({ messageText: '...' }, claude);
     expect(r.action).toBe('none');
+  });
+});
+
+describe('set_closure', () => {
+  it('keeps valid ISO dates, dedupes + sorts, and echoes them in the summary', async () => {
+    const claude = fakeClaude(toolUse('set_closure', { dates: ['2026-12-26', '2026-12-25', '2026-12-25'], reason: 'Christmas' }));
+    const r = await interpretOwnerCommand({ messageText: 'shut 25th-26th dec', todayISO: '2026-12-01' }, claude);
+    expect(r.action).toBe('set_closure');
+    expect(r.payload.closures).toEqual([
+      { date: '2026-12-25', reason: 'Christmas' },
+      { date: '2026-12-26', reason: 'Christmas' },
+    ]);
+    expect(r.summary).toContain('Christmas');
+    expect(r.summary).toMatch(/25 Dec/);
+  });
+
+  it('drops invalid / impossible dates', async () => {
+    const claude = fakeClaude(toolUse('set_closure', { dates: ['2026-13-40', 'next monday', '2026-08-31'] }));
+    const r = await interpretOwnerCommand({ messageText: '...', todayISO: '2026-08-01' }, claude);
+    expect(r.action).toBe('set_closure');
+    expect(r.payload.closures).toEqual([{ date: '2026-08-31', reason: null }]);
+  });
+
+  it('asks for clarification when no date is valid', async () => {
+    const claude = fakeClaude(toolUse('set_closure', { dates: ['someday'] }));
+    const r = await interpretOwnerCommand({ messageText: '...', todayISO: '2026-08-01' }, claude);
+    expect(r.action).toBe('none');
+  });
+});
+
+describe('isClosedOn / localDateISO (the channel gate)', () => {
+  it('localDateISO renders the owner-local calendar date', () => {
+    // 2026-08-25 23:30 UTC is already the 26th in Sydney.
+    expect(localDateISO('2026-08-25T10:00:00Z', 'Europe/London')).toBe('2026-08-25');
+    expect(localDateISO('2026-08-25T23:30:00Z', 'Australia/Sydney')).toBe('2026-08-26');
+  });
+
+  it('matches a closure on the owner-local date', () => {
+    const sched = { timezone: 'Europe/London', closures: [{ date: '2026-08-25', reason: 'Bank holiday' }] };
+    expect(isClosedOn(sched, new Date('2026-08-25T09:00:00Z'))).toEqual({ date: '2026-08-25', reason: 'Bank holiday' });
+    expect(isClosedOn(sched, new Date('2026-08-24T09:00:00Z'))).toBe(null);
+  });
+
+  it('returns null when there are no closures', () => {
+    expect(isClosedOn({ timezone: 'Europe/London' }, new Date())).toBe(null);
+    expect(isClosedOn({ closures: [] }, new Date())).toBe(null);
   });
 });
 

@@ -1055,15 +1055,26 @@ Panels.train = {
 
   /* --- 6.55 manage Aria by text (owner chat-ops) --- */
   loadChatops() {
+    const self = this;
     const card = $('#train-chatops');
-    card.innerHTML = '<div class="card-title">' + icon('message-circle', 16) + '<h2>Manage Aria by text</h2><span class="ct-sub">update FAQs &amp; hours from your phone</span></div><div id="chatops-body">' + skeletonHTML(2) + '</div>';
+    card.innerHTML = '<div class="card-title">' + icon('message-circle', 16) + '<h2>Manage Aria by text</h2><span class="ct-sub">update FAQs, hours &amp; closures from your phone</span></div><div id="chatops-body">' + skeletonHTML(2) + '</div>';
     getProfile().then(profile => {
       const num = profile.ownerWhatsApp || '';
+      const sched = profile.schedule || {};
+      const closures = (Array.isArray(sched.closures) ? sched.closures : []).slice().sort((a, b) => String(a.date).localeCompare(String(b.date)));
+      const fmtDate = (iso) => { try { return new Intl.DateTimeFormat('en-GB', { timeZone: 'UTC', weekday: 'short', day: 'numeric', month: 'short' }).format(new Date(iso + 'T00:00:00Z')); } catch { return iso; } };
+      const closuresHTML = closures.length
+        ? '<div class="field" style="margin-top:var(--sp-3)"><label>Upcoming closures</label><div class="scope-chips">' +
+            closures.map(c => '<span class="scope-chip">' + esc(fmtDate(c.date)) + (c.reason ? ' · ' + esc(c.reason) : '') +
+              '<button class="icon-btn" style="width:20px;height:20px" data-closure-del="' + esc(c.date) + '" aria-label="Remove closure ' + esc(c.date) + '">' + icon('x', 11) + '</button></span>').join('') +
+          '</div></div>'
+        : '';
       $('#chatops-body').innerHTML =
-        '<p class="lr-sub" style="margin-bottom:var(--sp-3)">Register your own mobile, then WhatsApp your Aria number from it. Aria recognises you as the owner and lets you change things by text — e.g. <em>"add an FAQ: do you do emergency callouts? yes, 24/7"</em> or <em>"we now close at 5 on Fridays"</em>. Aria always shows the change and waits for your <strong>YES</strong> before anything goes live.</p>' +
+        '<p class="lr-sub" style="margin-bottom:var(--sp-3)">Register your own mobile, then WhatsApp your Aria number from it. Aria recognises you as the owner and lets you change things by text — e.g. <em>"add an FAQ: do you do emergency callouts? yes, 24/7"</em>, <em>"we now close at 5 on Fridays"</em>, or <em>"closed bank holiday Monday"</em>. Aria always shows the change and waits for your <strong>YES</strong> before anything goes live.</p>' +
         '<div class="field"><label for="chatops-num">Your WhatsApp number</label>' +
         '<input class="input" id="chatops-num" value="' + esc(num) + '" placeholder="+44 7700 900123" autocomplete="tel" inputmode="tel"></div>' +
-        '<button class="btn btn-primary" id="chatops-save">' + icon('check', 14) + ' Save number</button>';
+        '<button class="btn btn-primary" id="chatops-save">' + icon('check', 14) + ' Save number</button>' +
+        closuresHTML;
       $('#chatops-save').addEventListener('click', async () => {
         try {
           await apiPost('/api/dashboard/profile', { ownerWhatsApp: $('#chatops-num').value.trim() });
@@ -1071,6 +1082,15 @@ Panels.train = {
           toast($('#chatops-num').value.trim() ? 'Chat-ops number saved' : 'Chat-ops number cleared');
         } catch (e) { toast(e.message, 'error'); }
       });
+      $$('[data-closure-del]', $('#chatops-body')).forEach(b => b.addEventListener('click', async () => {
+        try {
+          const keep = closures.filter(c => c.date !== b.dataset.closureDel);
+          await apiPost('/api/dashboard/profile', { schedule: { ...sched, closures: keep } });
+          invalidateProfile();
+          toast('Closure removed');
+          self.loadChatops();
+        } catch (e) { toast(e.message, 'error'); }
+      }));
     }).catch(e => { $('#chatops-body').innerHTML = errorStateHTML(e.message); });
   },
 
