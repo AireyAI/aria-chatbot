@@ -60,6 +60,7 @@ import { canBatch as digestCanBatch, shouldFireDigest, renderDigestHtml } from '
 import { verifyVapiSignature, buildAssistantConfig, extractCallReport, extractToolCall, provisionVapiNumber, releaseVapiNumber, isMissedCall } from './lib/vapi_handler.js';
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
+import { interpretOwnerCommand } from './lib/owner_chatops.js';
 
 const app    = express();
 // Railway terminates TLS at its edge proxy and forwards X-Forwarded-Proto.
@@ -11862,7 +11863,7 @@ app.get('/api/dashboard/profile', (req, res) => {
 app.post('/api/dashboard/profile', (req, res) => {
   const owner = requireDashboardAuth(req, res);
   if (!owner) return;
-  const { businessName, services, location, phone, email, hours, tone, servicesCarousel, allowedTopics, outbound, schedule, onboardingComplete } = req.body;
+  const { businessName, services, location, phone, email, hours, tone, servicesCarousel, allowedTopics, outbound, schedule, onboardingComplete, ownerWhatsApp } = req.body;
   // Find or create profile entry
   let profileKey = null;
   for (const [k, v] of clientProfiles) {
@@ -11883,6 +11884,7 @@ app.post('/api/dashboard/profile', (req, res) => {
   if (outbound         !== undefined && typeof outbound === 'object') updates.outbound = outbound;
   if (schedule         !== undefined && typeof schedule === 'object') updates.schedule = schedule;
   if (onboardingComplete !== undefined) updates.onboardingComplete = !!onboardingComplete;
+  if (ownerWhatsApp !== undefined) updates.ownerWhatsApp = String(ownerWhatsApp || '').trim();
   if (profileKey) {
     const existing = clientProfiles.get(profileKey);
     existing.profile = { ...existing.profile, ...updates };
@@ -13423,6 +13425,144 @@ function trackChannelReply(ownerEmail, channel) {
   persistChannelStats();
 }
 
+// ─── Owner chat-ops ───────────────────────────────────────────────────────
+// Lets a business owner manage their Aria by texting their own WhatsApp
+// number. When the SENDER's phone matches the owner's registered admin
+// number (profile.ownerWhatsApp), the message is treated as an admin command
+// instead of a customer enquiry: Aria interprets it (lib/owner_chatops.js),
+// proposes the concrete change, and applies it only on a YES reply (Rule #12).
+// Audit trail is append-only (Rule #13). The pending proposal is in-memory —
+// if the server restarts mid-confirm the owner just re-sends the command.
+const pendingOwnerCommands = new Map(); // ownerEmail → { id, action, payload, summary, staged_at }
+const OWNER_COMMANDS_LOG = resolve('data/owner_commands.jsonl');
+function appendOwnerCommand(entry) {
+  try {
+    mkdirSync(resolve('data'), { recursive: true });
+    appendFileSync(OWNER_COMMANDS_LOG, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n');
+  } catch (e) { console.warn('[owner-cmd] append failed:', e.message); }
+}
+
+// Last 10 significant digits — tolerates +44 / 0 / spaces between how the
+// owner types their number in settings vs how WhatsApp reports the sender.
+function phoneTail(s) {
+  const d = String(s || '').replace(/\D/g, '');
+  return d.length >= 10 ? d.slice(-10) : d;
+}
+function isOwnerSender(ownerEmail, senderId) {
+  const prof = getOwnerProfile(ownerEmail)?.profile;
+  const registered = prof?.ownerWhatsApp;
+  if (!registered) return false;
+  const tail = phoneTail(senderId);
+  return !!tail && phoneTail(registered) === tail;
+}
+
+// Find the mutable profile object for an owner (same lookup the dashboard
+// /api/dashboard/profile save uses), so schedule edits persist.
+function findMutableOwnerProfile(ownerEmail) {
+  for (const [, v] of clientProfiles) {
+    if (v?.profile?.email === ownerEmail) return v.profile;
+  }
+  return null;
+}
+
+// Execute a confirmed owner command against the live stores. Returns a short
+// confirmation phrase. Throws on anything it can't apply (Rule #10).
+function applyOwnerCommand(ownerEmail, action, payload) {
+  if (action === 'add_faq') {
+    const entries = knowledgeBase.get(ownerEmail) || [];
+    entries.push({
+      id: crypto.randomUUID(),
+      question: payload.question,
+      answer: payload.answer,
+      createdAt: new Date().toISOString(),
+      source: 'owner_chatops',
+    });
+    knowledgeBase.set(ownerEmail, entries);
+    persistKnowledgeBase();
+    return `added an FAQ: "${payload.question}"`;
+  }
+  if (action === 'set_business_hours') {
+    const prof = findMutableOwnerProfile(ownerEmail);
+    if (!prof) throw new Error('no saved profile found — set up your business profile in the dashboard first');
+    prof.schedule = prof.schedule || {};
+    // Setting specific hours is meaningless while mode is 'always' (those
+    // hours are ignored), so switch to business_hours — the summary the owner
+    // confirmed already states Aria will only reply during these hours.
+    if (prof.schedule.mode !== 'custom') prof.schedule.mode = 'business_hours';
+    // `days` is the schedule key the dashboard hours card reads and writes.
+    // evaluateSchedule (the bot gate) now normalises `days`, so writing this one
+    // key both takes effect in the bot AND shows in the dashboard.
+    prof.schedule.days = { ...(prof.schedule.days || {}), ...payload.hours };
+    persistProfiles();
+    return 'updated your opening hours';
+  }
+  throw new Error(`unknown action: ${action}`);
+}
+
+const OWNER_YES_RE = /^\s*(y|yes|yep|yeah|yup|ok|okay|sure|go|do it|confirm|approve|send|👍|✅)\b/i;
+const OWNER_NO_RE  = /^\s*(n|no|nope|nah|cancel|stop|don'?t|👎|❌)\b/i;
+
+async function handleOwnerCommand({ ownerEmail, channel, channelConfig, senderId, senderName, messageText }) {
+  const text = String(messageText || '').trim();
+  const pending = pendingOwnerCommands.get(ownerEmail);
+
+  // Stage 2 — resolve an outstanding proposal on a YES / NO.
+  if (pending) {
+    if (OWNER_YES_RE.test(text)) {
+      try {
+        const confirmation = applyOwnerCommand(ownerEmail, pending.action, pending.payload);
+        pendingOwnerCommands.delete(ownerEmail);
+        appendOwnerCommand({ id: pending.id, ownerEmail, senderId, status: 'confirmed', action: pending.action, payload: pending.payload });
+        await sendChannelReply(channel, channelConfig, senderId, `✅ Done — ${confirmation}. It's live now.`);
+      } catch (e) {
+        pendingOwnerCommands.delete(ownerEmail);
+        appendOwnerCommand({ id: pending.id, ownerEmail, senderId, status: 'failed', action: pending.action, error: e.message });
+        await sendChannelReply(channel, channelConfig, senderId, `⚠️ I couldn't apply that — ${e.message}.`);
+      }
+      return;
+    }
+    if (OWNER_NO_RE.test(text)) {
+      pendingOwnerCommands.delete(ownerEmail);
+      appendOwnerCommand({ id: pending.id, ownerEmail, senderId, status: 'cancelled', action: pending.action });
+      await sendChannelReply(channel, channelConfig, senderId, `No problem — cancelled. Text me anytime to change something.`);
+      return;
+    }
+    // Neither — treat as a fresh command (replaces the stale proposal below).
+    appendOwnerCommand({ id: pending.id, ownerEmail, senderId, status: 'superseded', action: pending.action });
+    pendingOwnerCommands.delete(ownerEmail);
+  }
+
+  // Stage 1 — interpret a new command.
+  let proposal;
+  try {
+    const profile = getOwnerProfile(ownerEmail);
+    proposal = await interpretOwnerCommand({
+      messageText: text,
+      businessName: profile?.config?.businessName || profile?.profile?.businessName,
+      currentHours: profile?.profile?.schedule?.days || profile?.profile?.schedule?.businessHours,
+    }, claude);
+  } catch (e) {
+    if (isAiBillingError(e)) {
+      await sendChannelReply(channel, channelConfig, senderId, `Aria's AI is briefly unavailable — try that again in a few minutes.`);
+      return;
+    }
+    console.error('[owner-chatops] interpret failed:', e.message);
+    await sendChannelReply(channel, channelConfig, senderId, `Sorry — something went wrong reading that. Try rephrasing it.`);
+    return;
+  }
+
+  if (proposal.action === 'none') {
+    await sendChannelReply(channel, channelConfig, senderId, proposal.reply);
+    return;
+  }
+
+  const id = crypto.randomUUID();
+  pendingOwnerCommands.set(ownerEmail, { id, action: proposal.action, payload: proposal.payload, summary: proposal.summary, staged_at: new Date().toISOString() });
+  appendOwnerCommand({ id, ownerEmail, senderId, status: 'staged', action: proposal.action, payload: proposal.payload });
+  await sendChannelReply(channel, channelConfig, senderId, `${proposal.summary}\n\nReply YES to apply, or NO to cancel.`, ['Yes', 'No']);
+  console.log(`🛠️  [owner-chatops] ${ownerEmail} staged ${proposal.action} (from ${senderId})`);
+}
+
 async function handleIncomingChannelMessage({ channel, recipientId, senderId, senderName, messageText, messageId, imageRefs = [], voiceMeta = null }) {
   // Dedup
   if (processedMetaMessages.has(messageId)) return;
@@ -13449,6 +13589,19 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
   // Check channel enabled
   const ownerChannels = channelConfigs.get(ownerEmail);
   if (!ownerChannels?.[channel]?.enabled) return;
+
+  // Owner chat-ops — if the sender is this business's owner texting their own
+  // Aria number, switch to admin mode (manage KB / hours by message) instead
+  // of replying as if they were a customer. WhatsApp only for now.
+  if (channel === 'whatsapp' && isOwnerSender(ownerEmail, senderId)) {
+    console.log(`🛠️  [${channel}] Owner command from ${senderId} for ${ownerEmail}: "${messageText.substring(0, 80)}"`);
+    try {
+      await handleOwnerCommand({ ownerEmail, channel, channelConfig: ownerChannels[channel], senderId, senderName, messageText });
+    } catch (e) {
+      console.error('[owner-chatops] handler failed:', e.message);
+    }
+    return;
+  }
 
   console.log(`📱 [${channel}] Message from ${senderName} (${senderId}) for ${ownerEmail}: "${messageText.substring(0, 80)}"`);
 

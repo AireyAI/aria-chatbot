@@ -738,6 +738,7 @@ Panels.train = {
         '<div class="card span-2" id="train-quick"></div>' +
         '<div class="card span-2" id="train-kb"></div>' +
         '<div class="card span-2" id="train-services"></div>' +
+        '<div class="card span-2" id="train-chatops"></div>' +
         '<div class="card" id="train-hours"></div>' +
         '<div class="card" id="train-scope"></div>' +
       '</div>';
@@ -747,6 +748,7 @@ Panels.train = {
     this.renderQuickTrain();
     this.loadKB();
     this.loadServices();
+    this.loadChatops();
     this.loadHours();
     this.loadScope();
   },
@@ -1049,6 +1051,27 @@ Panels.train = {
       };
       paint();
     }).catch(e => { $('#svc-body').innerHTML = errorStateHTML(e.message); });
+  },
+
+  /* --- 6.55 manage Aria by text (owner chat-ops) --- */
+  loadChatops() {
+    const card = $('#train-chatops');
+    card.innerHTML = '<div class="card-title">' + icon('message-circle', 16) + '<h2>Manage Aria by text</h2><span class="ct-sub">update FAQs &amp; hours from your phone</span></div><div id="chatops-body">' + skeletonHTML(2) + '</div>';
+    getProfile().then(profile => {
+      const num = profile.ownerWhatsApp || '';
+      $('#chatops-body').innerHTML =
+        '<p class="lr-sub" style="margin-bottom:var(--sp-3)">Register your own mobile, then WhatsApp your Aria number from it. Aria recognises you as the owner and lets you change things by text — e.g. <em>"add an FAQ: do you do emergency callouts? yes, 24/7"</em> or <em>"we now close at 5 on Fridays"</em>. Aria always shows the change and waits for your <strong>YES</strong> before anything goes live.</p>' +
+        '<div class="field"><label for="chatops-num">Your WhatsApp number</label>' +
+        '<input class="input" id="chatops-num" value="' + esc(num) + '" placeholder="+44 7700 900123" autocomplete="tel" inputmode="tel"></div>' +
+        '<button class="btn btn-primary" id="chatops-save">' + icon('check', 14) + ' Save number</button>';
+      $('#chatops-save').addEventListener('click', async () => {
+        try {
+          await apiPost('/api/dashboard/profile', { ownerWhatsApp: $('#chatops-num').value.trim() });
+          invalidateProfile();
+          toast($('#chatops-num').value.trim() ? 'Chat-ops number saved' : 'Chat-ops number cleared');
+        } catch (e) { toast(e.message, 'error'); }
+      });
+    }).catch(e => { $('#chatops-body').innerHTML = errorStateHTML(e.message); });
   },
 
   /* --- 6.6 business hours (message channels) --- */
