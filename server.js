@@ -20,7 +20,7 @@
  *   PORT                   default 3000
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync, renameSync } from 'fs';
 import { resolve, join } from 'path';
 
 // Load .env file manually (no extra package needed)
@@ -62,6 +62,12 @@ import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 import { interpretOwnerCommand, isClosedOn, localDateISO } from './lib/owner_chatops.js';
 import { draftGbpPost } from './lib/gbp_post.js';
+import { buildValueReport, renderValueReportHtml } from './lib/value_report.js';
+import { recordOwnerUsage, checkOwnerBudget, ownerUsageSummary } from './lib/usage_meter.js';
+import { filterOwnerLeads, leadsToCsv } from './lib/lead_export.js';
+import { purgeExpired, subjectAccessExport, redactSubject } from './lib/gdpr.js';
+import { detectAnomalies, formatAlert } from './lib/heartbeat.js';
+import { clusterGaps, suggestSiteSections } from './lib/content_radar.js';
 
 const app    = express();
 // Railway terminates TLS at its edge proxy and forwards X-Forwarded-Proto.
@@ -13888,6 +13894,7 @@ async function handleIncomingChannelMessage({ channel, recipientId, senderId, se
 
   // Charge budget (input + output tokens for THIS reply)
   recordTokenUsage(ownerEmail, reply._tokensUsed || 0);
+  recordOwnerUsageNow(ownerEmail, reply._tokensUsed || 0); // durable per-client meter
 
   // Reminder-response handling — act on Claude's classification BEFORE
   // running the standard send/persist flow. Clears pendingReminder so the
@@ -15027,6 +15034,299 @@ app.get('/api/dashboard/calls', (req, res) => {
 // replays pending tasks. Per Rule 12: each task is an explicit OUTBOUND
 // message — owners can disable per task type via profile.config.outbound.
 
+// ════════════════════════════════════════════════════════════════════════════
+// GO-BIG FEATURES (2026-06-15) — value report, per-client usage meter, lead CSV
+// export, GDPR purge/SAR, channel heartbeat, content-gap radar. Each is a pure,
+// deterministic lib module (lib/value_report.js etc.) wired here. £0 at runtime
+// (no AI calls). Built + adversarially reviewed via the go-big workflow.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── Value report: the monthly "Aria paid for itself" receipt ───────────────
+async function buildOwnerValueReport(owner, windowDays = 30) {
+  let leads = [];
+  try {
+    const raw = await fsp.readFile(resolve('data', 'leads.jsonl'), 'utf8');
+    leads = raw.trim().split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean)
+      .filter(r => !r.ownerEmail || String(r.ownerEmail).toLowerCase() === owner.toLowerCase());
+  } catch { /* no leads file yet */ }
+  let channelLeads = [];
+  try {
+    if (existsSync(CHANNEL_LEADS_FILE)) {
+      channelLeads = readFileSync(CHANNEL_LEADS_FILE, 'utf8').split('\n').filter(Boolean)
+        .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean)
+        .filter(r => String(r.ownerEmail || '').toLowerCase() === owner.toLowerCase());
+    }
+  } catch { /* ignore */ }
+  const ownerBookings = bookings.filter(b => String(b.ownerEmail || b.alertTo || '').toLowerCase() === owner.toLowerCase());
+  const messages = channelMessages.get(owner) || [];
+  return buildValueReport({ leads, channelLeads, bookings: ownerBookings, messages, windowDays });
+}
+app.get('/api/dashboard/value-report', async (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  try {
+    const windowDays = Math.min(Math.max(parseInt(req.query.windowDays, 10) || 30, 1), 365);
+    res.json(await buildOwnerValueReport(owner, windowDays));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Monthly value-report email handler. REGISTERED but NOT auto-armed (it emails
+// real clients) — Kyle enables by scheduling a 'value_report' task per owner.
+const VALUE_REPORT_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000;
+registerTaskHandler('value_report', async (task) => {
+  const ownerEmail = task.ownerEmail;
+  try {
+    const report = await buildOwnerValueReport(ownerEmail, 30);
+    const profile = getOwnerProfile(ownerEmail);
+    const cfg = profile?.config?.valueReport || profile?.profile?.valueReport || {};
+    if (cfg.enabled !== false) {
+      const businessName = profile?.profile?.businessName || '';
+      await smartSend({
+        ownerEmail, to: ownerEmail,
+        subject: report.estValueGBP > 0 ? `Aria found you ~£${report.estValueGBP} this month` : 'Your monthly Aria report',
+        html: renderValueReportHtml(report, { businessName }),
+      });
+    }
+  } catch (e) { console.warn('[value_report] send failed:', e.message); }
+  scheduleTask({ type: 'value_report', dueAt: Date.now() + VALUE_REPORT_INTERVAL_MS, ownerEmail, payload: {} });
+  return true;
+});
+
+// ─── Per-client usage meter (durable). checkBudget already gates per-owner in
+// memory; this adds persistence + a message count + dashboard visibility. No
+// second reply-gate (would risk silencing) — metering + visibility only. ─────
+const OWNER_USAGE_PATH = resolve('data', 'owner-usage.json');
+let ownerUsage = {};
+try { if (existsSync(OWNER_USAGE_PATH)) ownerUsage = JSON.parse(readFileSync(OWNER_USAGE_PATH, 'utf8')) || {}; } catch (e) { console.warn('[usage_meter] load failed:', e.message); }
+let _ownerUsageFlushTimer = null;
+function _flushOwnerUsage() {
+  if (_ownerUsageFlushTimer) return; // debounce: at most one write per window
+  _ownerUsageFlushTimer = setTimeout(() => {
+    _ownerUsageFlushTimer = null;
+    fsp.writeFile(OWNER_USAGE_PATH, JSON.stringify(ownerUsage)).catch(e => console.warn('[usage_meter] write failed:', e.message));
+  }, 2000);
+}
+function recordOwnerUsageNow(ownerEmail, tokensUsed) {
+  if (!ownerEmail) return;
+  ownerUsage = recordOwnerUsage(ownerUsage, ownerEmail, { outputTokens: tokensUsed || 0, messages: 1 });
+  _flushOwnerUsage();
+}
+app.get('/api/usage/owner', (req, res) => {
+  const ownerEmail = requireDashboardAuth(req, res);
+  if (!ownerEmail) return;
+  const profile = getOwnerProfile(ownerEmail);
+  const summary = ownerUsageSummary(ownerUsage, ownerEmail, { days: 30 });
+  const budget = checkOwnerBudget(ownerUsage, ownerEmail, { tokensPerDay: profile?.config?.tokensPerDay, messagesPerDay: profile?.config?.messagesPerDay });
+  res.json({ summary, budget });
+});
+
+// ─── Lead CSV export (RFC-4180 escaping) ────────────────────────────────────
+function _slugsForOwner(ownerEmail) {
+  const e = String(ownerEmail || '').toLowerCase();
+  const out = [];
+  for (const [slug, set] of owners) { if (set.has(e)) out.push(slug); }
+  return out;
+}
+app.get('/api/dashboard/leads.csv', async (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  try {
+    const allRows = [];
+    try {
+      const raw = await fsp.readFile(resolve('data', 'leads.jsonl'), 'utf8');
+      for (const line of raw.split('\n')) { const t = line.trim(); if (t) { try { allRows.push(JSON.parse(t)); } catch {} } }
+    } catch {}
+    try {
+      const raw = await fsp.readFile(CHANNEL_LEADS_FILE, 'utf8');
+      for (const line of raw.split('\n')) { const t = line.trim(); if (t) { try { allRows.push(JSON.parse(t)); } catch {} } }
+    } catch {}
+    // Channel rows match on ownerEmail; web rows match on client===slug. Owners
+    // may carry several slugs — merge across each + an owner-email fallback for
+    // slug-less web rows. Dedupe by ts+email+phone+source.
+    const seen = new Set(); const rows = [];
+    for (const slug of [..._slugsForOwner(owner), owner]) {
+      for (const r of filterOwnerLeads(allRows, { ownerEmail: owner, slug })) {
+        const k = (r.ts || '') + '|' + (r.email || '') + '|' + (r.phone || '') + '|' + (r.source || '');
+        if (seen.has(k)) continue; seen.add(k); rows.push(r);
+      }
+    }
+    const stamp = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="aria-leads-${stamp}.csv"`);
+    res.send(leadsToCsv(rows));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── GDPR: retention purge + subject access/erasure ─────────────────────────
+// The ONE sanctioned exception to append-only: purge/erasure must drop rows, so
+// we read-all → filter via the pure lib fns → atomic tmp+rename rewrite.
+const GDPR_RETENTION_DAYS = Number(process.env.GDPR_RETENTION_DAYS || 365);
+const _GDPR_LEADS = resolve('data', 'leads.jsonl');
+const _GDPR_CH_MSGS = resolve('data', 'channel-messages.json');
+function _gdprReadJsonl(p) {
+  if (!existsSync(p)) return [];
+  return readFileSync(p, 'utf8').split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+}
+function _gdprWriteJsonl(p, rows) {
+  const tmp = p + '.tmp';
+  writeFileSync(tmp, rows.map(r => JSON.stringify(r)).join('\n') + (rows.length ? '\n' : ''));
+  renameSync(tmp, p);
+}
+function _gdprWriteJson(p, obj) {
+  const tmp = p + '.tmp';
+  writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  renameSync(tmp, p);
+}
+function runGdprPurge() {
+  const now = Date.now(); let total = 0;
+  for (const p of [_GDPR_LEADS, CHANNEL_LEADS_FILE]) {
+    const rows = _gdprReadJsonl(p);
+    const { kept, removedCount } = purgeExpired(rows, { retentionDays: GDPR_RETENTION_DAYS, now });
+    if (removedCount > 0) { _gdprWriteJsonl(p, kept); total += removedCount; }
+  }
+  // channel-messages.json rows use `timestamp` (ISO), not `ts` — normalize first.
+  if (existsSync(_GDPR_CH_MSGS)) {
+    const obj = JSON.parse(readFileSync(_GDPR_CH_MSGS, 'utf8') || '{}');
+    let changed = false;
+    for (const o of Object.keys(obj)) {
+      const rows = (obj[o] || []).map(m => ({ ...m, ts: m.ts ?? Date.parse(m.timestamp) }));
+      const { kept, removedCount } = purgeExpired(rows, { retentionDays: GDPR_RETENTION_DAYS, now });
+      if (removedCount > 0) { obj[o] = kept.map(({ ts, ...rest }) => rest); changed = true; total += removedCount; }
+    }
+    if (changed) _gdprWriteJson(_GDPR_CH_MSGS, obj);
+  }
+  if (total) console.log(`[gdpr] retention purge removed ${total} record(s) (>${GDPR_RETENTION_DAYS}d)`);
+  return total;
+}
+const GDPR_PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+registerTaskHandler('gdpr_purge', async () => {
+  try { runGdprPurge(); } catch (e) { console.warn('[gdpr] purge failed:', e.message); }
+  scheduleTask({ type: 'gdpr_purge', dueAt: Date.now() + GDPR_PURGE_INTERVAL_MS, ownerEmail: 'system', payload: {} });
+  return true;
+});
+// Owner-scope the leads.jsonl side (it mixes clients) so one owner can't export
+// or erase another owner's customer. Channel stores are already owner-keyed.
+function _gdprOwnerLeads(ownerEmail) {
+  const keys = new Set(_slugsForOwner(ownerEmail).concat(String(ownerEmail).toLowerCase()));
+  const all = _gdprReadJsonl(_GDPR_LEADS);
+  const mine = [], others = [];
+  for (const r of all) (keys.has(String(r.client || '').toLowerCase()) ? mine : others).push(r);
+  return { mine, others };
+}
+app.post('/api/dashboard/gdpr/export', (req, res) => {
+  const ownerEmail = requireDashboardAuth(req, res); if (!ownerEmail) return;
+  const { email, phone } = req.body || {};
+  if (!email && !phone) return res.status(400).json({ error: 'email or phone required' });
+  const { mine } = _gdprOwnerLeads(ownerEmail);
+  const channelLeads = _gdprReadJsonl(CHANNEL_LEADS_FILE).filter(r => r.ownerEmail === ownerEmail);
+  let msgs = [];
+  if (existsSync(_GDPR_CH_MSGS)) { try { msgs = (JSON.parse(readFileSync(_GDPR_CH_MSGS, 'utf8') || '{}')[ownerEmail]) || []; } catch {} }
+  res.json({
+    subject: { email: email || null, phone: phone || null },
+    leads: subjectAccessExport(mine, { email, phone }),
+    channelLeads: subjectAccessExport(channelLeads, { email, phone }),
+    messages: subjectAccessExport(msgs.map(m => ({ ...m, ts: m.ts ?? Date.parse(m.timestamp) })), { email, phone }),
+  });
+});
+app.post('/api/dashboard/gdpr/erase', (req, res) => {
+  const ownerEmail = requireDashboardAuth(req, res); if (!ownerEmail) return;
+  const { email, phone } = req.body || {};
+  if (!email && !phone) return res.status(400).json({ error: 'email or phone required' });
+  let removed = 0;
+  { const { mine, others } = _gdprOwnerLeads(ownerEmail); const r = redactSubject(mine, { email, phone }); if (r.removedCount) { _gdprWriteJsonl(_GDPR_LEADS, others.concat(r.kept)); removed += r.removedCount; } }
+  { const r = redactSubject(_gdprReadJsonl(CHANNEL_LEADS_FILE).filter(x => x.ownerEmail === ownerEmail), { email, phone });
+    if (r.removedCount) {
+      const keepOthers = _gdprReadJsonl(CHANNEL_LEADS_FILE).filter(x => x.ownerEmail !== ownerEmail);
+      _gdprWriteJsonl(CHANNEL_LEADS_FILE, keepOthers.concat(r.kept)); removed += r.removedCount;
+    } }
+  if (existsSync(_GDPR_CH_MSGS)) {
+    const obj = JSON.parse(readFileSync(_GDPR_CH_MSGS, 'utf8') || '{}');
+    if (obj[ownerEmail]) { const r = redactSubject(obj[ownerEmail], { email, phone }); if (r.removedCount) { obj[ownerEmail] = r.kept; _gdprWriteJson(_GDPR_CH_MSGS, obj); removed += r.removedCount; } }
+  }
+  console.log(`[gdpr] erasure for ${ownerEmail} removed ${removed} record(s)`);
+  res.json({ ok: true, removedCount: removed });
+});
+
+// ─── Heartbeat: silent-failure detection. Dashboard card + GET are live; the
+// hourly EMAIL sweep is REGISTERED but NOT auto-armed (a quiet client would get
+// false "channel broken" emails) — Kyle arms it once activity baselines exist. ─
+const _heartbeatLastPing = new Map();
+function _surfaceLastActivityTs(ownerEmail, surface) {
+  if (surface === 'email') { const s = EMAIL_REPLY_STATS.get(ownerEmail); return s?.lastReply ? new Date(s.lastReply).getTime() : null; }
+  if (surface === 'web') {
+    let max = null;
+    for (const sess of sessions.values()) { const t = sess.lastActivity ? new Date(sess.lastActivity).getTime() : null; if (t && (max == null || t > max)) max = t; }
+    return max;
+  }
+  const cs = channelStats.get(ownerEmail)?.[surface];
+  return cs?.lastReply ? new Date(cs.lastReply).getTime() : null;
+}
+function _surfaceTypicalIntervalHours(ownerEmail, surface) {
+  const DEFAULTS = { whatsapp: 6, instagram: 12, facebook: 12, web: 4, voice: 24 * 8, email: 8 };
+  if (surface === 'voice') return DEFAULTS.voice;
+  const msgs = (channelMessages.get(ownerEmail) || []).filter(m => m.channel === surface && m.timestamp).map(m => new Date(m.timestamp).getTime()).filter(Number.isFinite).sort((a, b) => a - b);
+  if (msgs.length < 4) return DEFAULTS[surface] ?? 12;
+  const gaps = []; for (let i = 1; i < msgs.length; i++) gaps.push((msgs[i] - msgs[i - 1]) / 3600000);
+  gaps.sort((a, b) => a - b); const median = gaps[Math.floor(gaps.length / 2)];
+  return median > 0 ? median : (DEFAULTS[surface] ?? 12);
+}
+function _ownerPerSurface(ownerEmail) {
+  const cfg = channelConfigs.get(ownerEmail) || {};
+  const enabled = Object.keys(cfg).filter(k => cfg[k]?.enabled);
+  const perSurface = {};
+  for (const s of [...new Set([...enabled, 'web', 'email'])]) {
+    perSurface[s] = { lastActivityTs: _surfaceLastActivityTs(ownerEmail, s), typicalIntervalHours: _surfaceTypicalIntervalHours(ownerEmail, s) };
+  }
+  return perSurface;
+}
+async function _runHeartbeatSweep() {
+  const today = new Date().toISOString().slice(0, 10);
+  const agencyEmail = process.env.NOTIFY_EMAIL || null;
+  for (const ownerEmail of EMAIL_AUTO_REPLY_ENABLED.keys()) {
+    const profile = getOwnerProfile(ownerEmail);
+    if (profile?.config?.outbound?.heartbeat === false) continue;
+    const fresh = detectAnomalies(_ownerPerSurface(ownerEmail), { now: Date.now() }).filter(a => _heartbeatLastPing.get(`${ownerEmail}::${a.surface}`) !== today);
+    if (!fresh.length) continue;
+    const businessName = profile?.profile?.businessName || ownerEmail.split('@')[0];
+    const lines = fresh.map(a => `<li>${formatAlert(a).replace(/</g, '&lt;')}</li>`).join('');
+    const html = `<div style="font-family:-apple-system,sans-serif;max-width:560px;margin:0 auto;padding:20px;color:#222;line-height:1.6;font-size:14.5px;"><p><strong>Aria heartbeat — possible silent failure for ${businessName}</strong></p><p>One or more inbound channels has gone quieter than usual — often a broken connection (expired token, webhook down), not just a slow week. Worth a quick check:</p><ul>${lines}</ul><p style="color:#666;font-size:12.5px;">At most one heartbeat per channel per day.</p></div>`;
+    const subject = `⚠️ Aria heartbeat: ${fresh.length} channel${fresh.length > 1 ? 's' : ''} quiet — ${businessName}`;
+    try {
+      await smartSend({ ownerEmail, to: ownerEmail, subject, html });
+      if (agencyEmail && agencyEmail !== ownerEmail) await smartSend({ ownerEmail, to: agencyEmail, subject: `[Agency] ${subject}`, html });
+      for (const a of fresh) _heartbeatLastPing.set(`${ownerEmail}::${a.surface}`, today);
+      console.log(`💓 [heartbeat] ${fresh.length} alert(s) for ${ownerEmail}: ${fresh.map(a => a.surface).join(', ')}`);
+    } catch (e) { console.warn('[heartbeat] ping failed:', e.message); }
+  }
+}
+registerTaskHandler('heartbeat_sweep', async () => {
+  try { await _runHeartbeatSweep(); } catch (e) { console.warn('[heartbeat] sweep failed:', e.message); }
+  scheduleTask({ type: 'heartbeat_sweep', dueAt: Date.now() + 60 * 60 * 1000, ownerEmail: 'system', payload: {} });
+  return true;
+});
+app.get('/api/dashboard/heartbeat', (req, res) => {
+  const ownerEmail = requireDashboardAuth(req, res); if (!ownerEmail) return;
+  res.json({ alerts: detectAnomalies(_ownerPerSurface(ownerEmail), { now: Date.now() }) });
+});
+
+// ─── Content radar: "what your site is missing" (deterministic clustering) ───
+app.get('/api/dashboard/content-radar', (req, res) => {
+  const owner = requireDashboardAuth(req, res); if (!owner) return;
+  const gapRows = [];
+  try {
+    if (existsSync(CHANNEL_GAPS_FILE)) {
+      for (const line of readFileSync(CHANNEL_GAPS_FILE, 'utf8').split('\n')) { if (!line.trim()) continue; try { const e = JSON.parse(line); if (e.ownerEmail === owner) gapRows.push(e); } catch {} }
+    }
+  } catch {}
+  const existingTopics = [
+    ...(knowledgeBase.get(owner) || []).map(k => k.question || ''),
+    ...(knowledgeDocs.get(owner) || []).map(d => d.title || ''),
+    ...[...faqs.values()].filter(f => f.approved).map(f => f.question || ''),
+  ].filter(Boolean);
+  const clusters = clusterGaps(gapRows, { minCount: 2, windowDays: 30 });
+  const suggestions = suggestSiteSections(clusters, { existingTopics, minCount: 3 });
+  res.json({ suggestions, totalClusters: clusters.length, totalGaps: gapRows.length });
+});
+
 registerTaskHandler('lead_followup', async (task) => {
   const { ownerEmail, payload } = task;
   const { leadEmail, leadName, channel, leadScore, lastMessage } = payload;
@@ -15474,6 +15774,15 @@ registerTaskHandler('missed_call_followup', async (task) => {
 
 // Boot scheduler at startup
 const _pendingCount = bootstrapFromLedger();
+
+// GO-BIG: arm the internal GDPR retention purge (no external sends; at the
+// 365-day window it removes nothing until data ages, then trims quietly). The
+// value_report + heartbeat EMAIL sweeps are built + registered but deliberately
+// NOT auto-armed here — they email real clients, so Kyle enables them when
+// ready. Their dashboard cards (read-only) already deliver the value.
+if (!listPending({ type: 'gdpr_purge' }).length) {
+  scheduleTask({ type: 'gdpr_purge', dueAt: Date.now() + 60 * 1000, ownerEmail: 'system', payload: {} });
+}
 console.log(`📅 Outbound scheduler: ${_pendingCount} pending tasks loaded from ledger`);
 startTickLoop(60_000);
 

@@ -476,21 +476,18 @@ Panels.leads = {
   },
 };
 
-window.exportLeadsCSV = async function () {
+window.exportLeadsCSV = function () {
+  // Direct authed navigation to the server endpoint (lib/lead_export.js) — it
+  // merges web + channel leads with RFC-4180 escaping and a dated filename.
+  // A real navigation (not fetch) is needed so the browser saves the file.
   try {
-    const d = await api('/api/dashboard/leads');
-    const leads = (d && d.leads) || [];
-    if (!leads.length) { toast('No leads to export', 'info'); return; }
-    const csvCell = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
-    const csv = ['Name,Email,Phone,Score,Date']
-      .concat(leads.map(l => [l.name, l.email, l.phone, l.score != null ? l.score : l.tag, l.date].map(csvCell).join(',')))
-      .join('\n');
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+    a.href = '/api/dashboard/leads.csv?' + Q;
     a.download = 'aria-leads.csv';
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(a.href);
-    toast('Exported ' + leads.length + ' leads');
+    a.remove();
+    toast('Preparing CSV…', 'info');
   } catch (e) { toast(e.message, 'error'); }
 };
 
@@ -740,6 +737,11 @@ Panels.train = {
         '<div class="card span-2" id="train-services"></div>' +
         '<div class="card span-2" id="train-chatops"></div>' +
         '<div class="card span-2" id="train-gbp"></div>' +
+        '<div class="card span-2" id="train-value"></div>' +
+        '<div class="card span-2" id="train-radar"></div>' +
+        '<div class="card span-2" id="train-heartbeat"></div>' +
+        '<div class="card span-2" id="train-usage"></div>' +
+        '<div class="card span-2" id="train-gdpr"></div>' +
         '<div class="card" id="train-hours"></div>' +
         '<div class="card" id="train-scope"></div>' +
       '</div>';
@@ -751,6 +753,11 @@ Panels.train = {
     this.loadServices();
     this.loadChatops();
     this.loadGbp();
+    this.loadValue();
+    this.loadRadar();
+    this.loadHeartbeat();
+    this.loadUsage();
+    this.loadGdpr();
     this.loadHours();
     this.loadScope();
   },
@@ -1127,6 +1134,103 @@ Panels.train = {
         const msg = /ai_unavailable/.test(e.message) ? 'Aria’s AI is temporarily unavailable — try again shortly.' : e.message;
         out.innerHTML = '<p class="lr-sub">' + esc(msg) + '</p>';
       } finally { btn.disabled = false; btn.innerHTML = orig; }
+    });
+  },
+
+  /* --- value report: the monthly "Aria paid for itself" headline --- */
+  loadValue() {
+    const card = $('#train-value');
+    card.innerHTML = '<div class="card-title">' + icon('trending-up', 16) + '<h2>What Aria has earned you</h2><span class="ct-sub">last 30 days</span></div><div id="value-body">' + skeletonHTML(2) + '</div>';
+    const stat = (num, label) => '<div style="min-width:88px"><div style="font-size:24px;font-weight:700;line-height:1.1">' + num + '</div><div class="lr-sub" style="font-size:12px">' + esc(label) + '</div></div>';
+    loadInto($('#value-body'), () => api('/api/dashboard/value-report'), (r, c) => {
+      c.innerHTML =
+        '<div style="font-size:20px;font-weight:700;margin-bottom:var(--sp-3)">' +
+          (r.estValueGBP > 0 ? '≈ £' + r.estValueGBP + ' of business captured' : 'Aria is ready and waiting') + '</div>' +
+        '<div style="display:flex;gap:var(--sp-4);flex-wrap:wrap">' +
+          stat(r.chatsHandled || 0, 'Chats handled') + stat(r.leadsCaptured || 0, 'Leads') +
+          stat(r.hotLeads || 0, 'Hot leads') + stat(r.bookingsCount || 0, 'Jobs booked') + '</div>' +
+        '<p class="lr-sub" style="margin-top:var(--sp-3)">' + icon('mail', 12) + ' A monthly summary email can be switched on for you.</p>';
+      return true;
+    });
+  },
+
+  /* --- content radar: what your site is missing --- */
+  loadRadar() {
+    const card = $('#train-radar');
+    card.innerHTML = '<div class="card-title">' + icon('lightbulb', 16) + '<h2>What your site is missing</h2><span class="ct-sub">topics customers ask about that you don’t cover</span></div><div id="radar-body"></div>';
+    loadInto($('#radar-body'), () => api('/api/dashboard/content-radar'), (d, c) => {
+      const items = (d && d.suggestions) || [];
+      if (!items.length) return false;
+      c.innerHTML = items.map(s =>
+        '<div class="lr-row" style="padding:var(--sp-2) 0;border-bottom:1px solid var(--border)"><div class="lr-title">“' + esc(s.theme) + '”</div>' +
+        '<div class="lr-sub">' + esc(s.rationale) + (s.lastSeen ? ' · last ' + timeAgo(s.lastSeen) : '') + '</div></div>'
+      ).join('');
+      return true;
+    }, { emptyIcon: 'check', emptyTitle: 'Nothing missing', emptySub: 'Aria is answering everything your customers ask.' });
+  },
+
+  /* --- channel heartbeat: silent-failure watch --- */
+  loadHeartbeat() {
+    const card = $('#train-heartbeat');
+    card.innerHTML = '<div class="card-title">' + icon('bell', 16) + '<h2>Channel heartbeat</h2><span class="ct-sub">a broken channel looks like a quiet week — we watch for it</span></div><div id="hb-body">' + skeletonHTML(2) + '</div>';
+    loadInto($('#hb-body'), () => api('/api/dashboard/heartbeat'), (d, c) => {
+      const alerts = (d && d.alerts) || [];
+      if (!alerts.length) { c.innerHTML = '<div class="pill accent">' + icon('check', 12) + ' All channels active</div>'; return true; }
+      c.innerHTML = alerts.map(a =>
+        '<div class="lr-row" style="padding:var(--sp-2) 0;border-bottom:1px solid var(--border)"><div class="lr-title" style="color:' + (a.severity === 'critical' ? 'var(--danger,#dc2626)' : 'var(--warn,#d97706)') + '">' +
+        icon('alert-triangle', 13) + ' ' + esc(a.surface) + '</div><div class="lr-sub">' +
+        esc(a.hoursSince === null || a.hoursSince === Infinity ? 'no activity on record' : 'quiet ~' + Math.round(a.hoursSince) + 'h (normally every ~' + Math.round(a.typicalIntervalHours) + 'h)') + '</div></div>'
+      ).join('');
+      return true;
+    });
+  },
+
+  /* --- per-client usage --- */
+  loadUsage() {
+    const card = $('#train-usage');
+    card.innerHTML = '<div class="card-title">' + icon('zap', 16) + '<h2>Your usage</h2><span class="ct-sub">last 30 days</span></div><div id="usage-body">' + skeletonHTML(1) + '</div>';
+    loadInto($('#usage-body'), () => api('/api/usage/owner'), (d, c) => {
+      const s = d.summary || {}, b = d.budget || {};
+      const tokK = ((s.totalTokens || 0) / 1000).toFixed(1) + 'k';
+      const pct = b.capTokens ? Math.min(100, Math.round(((b.usedTokens || 0) / b.capTokens) * 100)) : 0;
+      const bar = pct >= 90 ? 'var(--danger,#dc2626)' : pct >= 70 ? 'var(--warn,#d97706)' : 'var(--accent,#0d9488)';
+      const stat = (num, label) => '<div style="min-width:80px"><div style="font-size:20px;font-weight:700">' + num + '</div><div class="lr-sub" style="font-size:12px">' + esc(label) + '</div></div>';
+      c.innerHTML =
+        '<div style="display:flex;gap:var(--sp-4);flex-wrap:wrap;margin-bottom:var(--sp-3)">' +
+          stat(tokK, 'Tokens') + stat(s.totalMessages || 0, 'Replies') + stat('$' + (s.estCostUsd || 0), 'Est. cost') + '</div>' +
+        '<div class="lr-sub" style="margin-bottom:4px">Today: ' + (b.usedTokens || 0).toLocaleString() + ' / ' + (b.capTokens || 0).toLocaleString() + ' tokens' + (b.blockedBy ? ' — limit reached (' + esc(b.blockedBy) + ')' : '') + '</div>' +
+        '<div style="height:8px;background:var(--surface-2,#e5e7eb);border-radius:4px;overflow:hidden"><div style="height:100%;width:' + pct + '%;background:' + bar + '"></div></div>';
+      return true;
+    });
+  },
+
+  /* --- GDPR: export / erase a person's data on request --- */
+  loadGdpr() {
+    const card = $('#train-gdpr');
+    card.innerHTML = '<div class="card-title">' + icon('shield', 16) + '<h2>Data &amp; privacy (GDPR)</h2><span class="ct-sub">export or erase a person’s data on request</span></div>' +
+      '<p class="lr-sub" style="margin:0 0 var(--sp-3)">Old leads auto-purge after the retention window. To honour an access or erasure request, enter the person’s email or phone.</p>' +
+      '<div class="field"><label for="gdpr-id">Email or phone</label><input class="input" id="gdpr-id" placeholder="jane@example.com or 07700 900123"></div>' +
+      '<div class="form-row"><button class="btn" id="gdpr-export">' + icon('download', 14) + ' Export their data</button>' +
+      '<button class="btn btn-ghost" id="gdpr-erase">' + icon('trash', 14) + ' Erase their data</button></div>' +
+      '<pre id="gdpr-out" class="lr-sub" style="white-space:pre-wrap;max-height:200px;overflow:auto;margin-top:var(--sp-3)"></pre>';
+    const idOf = () => { const v = ($('#gdpr-id').value || '').trim(); return v.includes('@') ? { email: v } : { phone: v }; };
+    $('#gdpr-export').addEventListener('click', async () => {
+      const body = idOf(); if (!body.email && !body.phone) return toast('Enter an email or phone', 'error');
+      try {
+        const r = await apiPost('/api/dashboard/gdpr/export', body);
+        const n = (r.leads?.length || 0) + (r.channelLeads?.length || 0) + (r.messages?.length || 0);
+        $('#gdpr-out').textContent = 'Found ' + n + ' record(s):\n' + JSON.stringify(r, null, 2);
+        toast('Exported ' + n + ' record(s)');
+      } catch (e) { toast(e.message, 'error'); }
+    });
+    $('#gdpr-erase').addEventListener('click', async () => {
+      const body = idOf(); if (!body.email && !body.phone) return toast('Enter an email or phone', 'error');
+      if (!confirm('Permanently erase ALL data for ' + (body.email || body.phone) + '? This cannot be undone.')) return;
+      try {
+        const r = await apiPost('/api/dashboard/gdpr/erase', body);
+        $('#gdpr-out').textContent = 'Erased ' + r.removedCount + ' record(s).';
+        toast('Erased ' + r.removedCount + ' record(s)');
+      } catch (e) { toast(e.message, 'error'); }
     });
   },
 
