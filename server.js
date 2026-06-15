@@ -61,6 +61,7 @@ import { verifyVapiSignature, buildAssistantConfig, extractCallReport, extractTo
 import { safeFetch as _safeFetch }     from './lib/onboarding.js';
 import { recordEvent, rollupForWindow, renderWeeklyDigestHtml, estimateLeadValue, sessionsForSlugWindow } from './lib/analytics.js';
 import { interpretOwnerCommand, isClosedOn, localDateISO } from './lib/owner_chatops.js';
+import { draftGbpPost } from './lib/gbp_post.js';
 
 const app    = express();
 // Railway terminates TLS at its edge proxy and forwards X-Forwarded-Proto.
@@ -11857,6 +11858,47 @@ app.get('/api/dashboard/profile', (req, res) => {
     if (v.profile?.email === owner) { profile = v.profile; break; }
   }
   res.json({ profile: profile || {} });
+});
+
+// POST /api/dashboard/gbp-post/draft — draft a Google Business Profile post
+// from the owner's last-30-days customer conversations. On-demand (owner taps
+// a button) so it never spends tokens in the background. Degrades gracefully
+// when the AI key is unfunded (Rule #10) — owner sees a "try again" message,
+// not a crash.
+app.post('/api/dashboard/gbp-post/draft', async (req, res) => {
+  const owner = requireDashboardAuth(req, res);
+  if (!owner) return;
+  try {
+    // Gather recent CUSTOMER questions (Aria's replies + owner admin texts are
+    // excluded — owner commands never reach channelMessages). Dedupe near-dupes.
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const seen = new Set();
+    const snippets = [];
+    for (const m of (channelMessages.get(owner) || [])) {
+      if (new Date(m.timestamp).getTime() < cutoff) continue;
+      const q = String(m.message || '').trim();
+      if (!q) continue;
+      const k = q.toLowerCase().slice(0, 60);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      snippets.push(q.slice(0, 160));
+    }
+    const profile = getOwnerProfile(owner)?.profile || {};
+    const categoryCounts = (channelStats.get(owner) || {}).categories || {};
+    const monthLabel = new Date().toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
+    const result = await draftGbpPost({
+      businessName: profile.businessName || owner,
+      services: profile.services || '',
+      monthLabel,
+      questionSnippets: snippets,
+      categoryCounts,
+    }, claude);
+    res.json(result);
+  } catch (e) {
+    if (isAiBillingError(e)) return res.status(503).json(AI_UNAVAILABLE_PAYLOAD);
+    console.error('[gbp-post] draft failed:', e.message);
+    res.status(500).json({ error: 'draft_failed' });
+  }
 });
 
 // POST /api/dashboard/profile

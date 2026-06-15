@@ -739,6 +739,7 @@ Panels.train = {
         '<div class="card span-2" id="train-kb"></div>' +
         '<div class="card span-2" id="train-services"></div>' +
         '<div class="card span-2" id="train-chatops"></div>' +
+        '<div class="card span-2" id="train-gbp"></div>' +
         '<div class="card" id="train-hours"></div>' +
         '<div class="card" id="train-scope"></div>' +
       '</div>';
@@ -749,6 +750,7 @@ Panels.train = {
     this.loadKB();
     this.loadServices();
     this.loadChatops();
+    this.loadGbp();
     this.loadHours();
     this.loadScope();
   },
@@ -1092,6 +1094,40 @@ Panels.train = {
         } catch (e) { toast(e.message, 'error'); }
       }));
     }).catch(e => { $('#chatops-body').innerHTML = errorStateHTML(e.message); });
+  },
+
+  /* --- 6.57 google business post (drafted from real conversations) --- */
+  loadGbp() {
+    const card = $('#train-gbp');
+    card.innerHTML = '<div class="card-title">' + icon('sparkles', 16) + '<h2>Google Business post</h2><span class="ct-sub">draft a post from what customers asked</span></div>' +
+      '<p class="lr-sub" style="margin:0 0 var(--sp-3)">Aria reads this month\'s conversations and drafts a Google Business Profile post you can paste straight in — grounded in what people actually asked. You approve every word.</p>' +
+      '<button class="btn btn-primary" id="gbp-draft">' + icon('sparkles', 14) + ' Draft this month’s post</button>' +
+      '<div id="gbp-result" style="margin-top:var(--sp-3)"></div>';
+    $('#gbp-draft').addEventListener('click', async () => {
+      const btn = $('#gbp-draft'); const out = $('#gbp-result'); const orig = btn.innerHTML;
+      btn.disabled = true; btn.innerHTML = 'Drafting…'; out.innerHTML = skeletonHTML(2);
+      try {
+        const r = await apiPost('/api/dashboard/gbp-post/draft', {});
+        if (r && r.ok && r.post) {
+          const cta = (r.post.ctaType && r.post.ctaType !== 'NONE')
+            ? ' · button: ' + esc(r.post.ctaType.replace(/_/g, ' ').toLowerCase()) + (r.post.ctaLabel ? ' (“' + esc(r.post.ctaLabel) + '”)' : '')
+            : '';
+          out.innerHTML =
+            '<div class="field"><label>Theme</label><div class="lr-sub">' + esc(r.post.theme) + cta + '</div></div>' +
+            '<div class="field"><label for="gbp-body">Post (edit before pasting)</label><textarea class="textarea" id="gbp-body" rows="7">' + esc(r.post.body) + '</textarea></div>' +
+            '<button class="btn" id="gbp-copy">' + icon('check', 14) + ' Copy post</button>';
+          $('#gbp-copy').addEventListener('click', async () => {
+            try { await navigator.clipboard.writeText($('#gbp-body').value); toast('Post copied'); }
+            catch { toast('Select the text and copy it manually', 'info'); }
+          });
+        } else {
+          out.innerHTML = '<p class="lr-sub">' + esc((r && r.reason) || 'Couldn’t draft a post right now.') + '</p>';
+        }
+      } catch (e) {
+        const msg = /ai_unavailable/.test(e.message) ? 'Aria’s AI is temporarily unavailable — try again shortly.' : e.message;
+        out.innerHTML = '<p class="lr-sub">' + esc(msg) + '</p>';
+      } finally { btn.disabled = false; btn.innerHTML = orig; }
+    });
   },
 
   /* --- 6.6 business hours (message channels) --- */
