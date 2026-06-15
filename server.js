@@ -15791,7 +15791,7 @@ const _pendingCount = bootstrapFromLedger();
 // Railway logs. (gdpr_purge re-arm: schedule a {type:'gdpr_purge'} task; runs a
 // synchronous full-file rewrite, so prefer arming it off-peak.)
 console.log(`📅 Outbound scheduler: ${_pendingCount} pending tasks loaded from ledger`);
-startTickLoop(60_000);
+const _schedulerTick = startTickLoop(60_000);
 
 // Notification-digest tick — runs every minute, flushes buffered
 // informational alerts for any owner whose local sendTime is "now".
@@ -16124,9 +16124,9 @@ function gracefulShutdown(signal) {
   if (_shuttingDown) return;
   _shuttingDown = true;
   console.log(`🛑 ${signal} received — shutting down cleanly`);
-  // The event loop is kept alive by timers (scheduler tick etc.), so exit
-  // explicitly with code 0 rather than waiting for it to drain. A short delay
-  // lets the log line flush first.
+  try { clearInterval(_schedulerTick); } catch {} // stop the scheduler tick loop
+  // The event loop is kept alive by timers, so exit explicitly with code 0
+  // rather than waiting for it to drain. A short delay lets the log line flush.
   setTimeout(() => process.exit(0), 200).unref();
 }
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
