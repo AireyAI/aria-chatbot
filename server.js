@@ -15198,11 +15198,19 @@ function runGdprPurge() {
   return total;
 }
 const GDPR_PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
-registerTaskHandler('gdpr_purge', async () => {
-  try { runGdprPurge(); } catch (e) { console.warn('[gdpr] purge failed:', e.message); }
-  scheduleTask({ type: 'gdpr_purge', dueAt: Date.now() + GDPR_PURGE_INTERVAL_MS, ownerEmail: 'system', payload: {} });
-  return true;
-});
+// DISABLED 2026-06-15 after a Railway "deployment crashed" report. The handler
+// is intentionally NOT registered so that any gdpr_purge task left pending in
+// the ledger (from the prior deploy's seed) is dropped cleanly as "no handler"
+// on the next tick — it will NOT run a synchronous full-file rewrite. runGdprPurge
+// stays below as the helper to re-enable once the crash root-cause is confirmed.
+// To re-arm: restore this registerTaskHandler block + schedule one gdpr_purge task.
+//
+// registerTaskHandler('gdpr_purge', async () => {
+//   try { runGdprPurge(); } catch (e) { console.warn('[gdpr] purge failed:', e.message); }
+//   scheduleTask({ type: 'gdpr_purge', dueAt: Date.now() + GDPR_PURGE_INTERVAL_MS, ownerEmail: 'system', payload: {} });
+//   return true;
+// });
+void GDPR_PURGE_INTERVAL_MS; void runGdprPurge; // keep referenced (re-arm helpers)
 // Owner-scope the leads.jsonl side (it mixes clients) so one owner can't export
 // or erase another owner's customer. Channel stores are already owner-keyed.
 function _gdprOwnerLeads(ownerEmail) {
@@ -15775,14 +15783,13 @@ registerTaskHandler('missed_call_followup', async (task) => {
 // Boot scheduler at startup
 const _pendingCount = bootstrapFromLedger();
 
-// GO-BIG: arm the internal GDPR retention purge (no external sends; at the
-// 365-day window it removes nothing until data ages, then trims quietly). The
-// value_report + heartbeat EMAIL sweeps are built + registered but deliberately
-// NOT auto-armed here — they email real clients, so Kyle enables them when
-// ready. Their dashboard cards (read-only) already deliver the value.
-if (!listPending({ type: 'gdpr_purge' }).length) {
-  scheduleTask({ type: 'gdpr_purge', dueAt: Date.now() + 60 * 1000, ownerEmail: 'system', payload: {} });
-}
+// GO-BIG: ALL new background sweeps are now registered-but-UNARMED after a
+// Railway "deployment crashed" report (2026-06-15). go-big therefore adds NO
+// unconditional auto-firing work — it is strictly request-gated endpoints +
+// dashboard cards. The gdpr_purge / value_report / heartbeat handlers exist and
+// can be armed deliberately once the prod crash root-cause is confirmed from the
+// Railway logs. (gdpr_purge re-arm: schedule a {type:'gdpr_purge'} task; runs a
+// synchronous full-file rewrite, so prefer arming it off-peak.)
 console.log(`📅 Outbound scheduler: ${_pendingCount} pending tasks loaded from ledger`);
 startTickLoop(60_000);
 
