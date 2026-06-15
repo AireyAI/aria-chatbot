@@ -16112,3 +16112,22 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err?.message || err);
 });
+
+// ─── Graceful shutdown ──────────────────────────────────────────────────────
+// Railway sends SIGTERM on every redeploy / restart / instance-cycle. Without a
+// handler, Node exits with code 143 and the `npm start` wrapper logs
+// "npm error signal SIGTERM" — which Railway then reports as a CRASHED
+// deployment even though it's a perfectly normal stop. Exit 0 on the signal so
+// normal stops read as "Stopped", not "Crashed" (the false alarm on 2026-06-15).
+let _shuttingDown = false;
+function gracefulShutdown(signal) {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+  console.log(`🛑 ${signal} received — shutting down cleanly`);
+  // The event loop is kept alive by timers (scheduler tick etc.), so exit
+  // explicitly with code 0 rather than waiting for it to drain. A short delay
+  // lets the log line flush first.
+  setTimeout(() => process.exit(0), 200).unref();
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
