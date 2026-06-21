@@ -4211,12 +4211,25 @@ app.post('/api/chat', async (req, res) => {
   const { system, messages, model, max_tokens, sessionId, clientConfig = {} } = req.body;
   if (!messages?.length) return res.status(400).json({ error:'Invalid messages' });
   if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error:'API key not configured' });
+  // Phase 2 — per-client isolation. The website chat path shared ONE global cap,
+  // so one busy (or abusive) client could 429 every other client, and a spoofed
+  // Origin could drain the shared key unbounded. Meter + cap PER OWNER using the
+  // same daily budget the channels path enforces (lib/usage_meter.js defaults:
+  // 200k tokens / 1k messages per owner per day, overridable per profile).
+  // ownerEmail comes from clientConfig (every widget sends it); a single-tenant
+  // embed that sends none is unmetered here and falls back to global isOverCap().
+  const ownerEmail = clientConfig.handoffEmail || clientConfig.ownerEmail || null;
+  if (ownerEmail) {
+    const _p = getOwnerProfile(ownerEmail);
+    const _b = checkOwnerBudget(ownerUsage, ownerEmail, { tokensPerDay: _p?.config?.tokensPerDay, messagesPerDay: _p?.config?.messagesPerDay });
+    if (!_b.allowed) return res.status(429).json({ error: 'Daily message limit reached for this site — resets tomorrow.' });
+  }
   try {
     // W4 — owner KB docs + approved learning FAQs reach website visitors,
     // not just channels. The widget already sends clientConfig on every
     // request; single-tenant embeds without it degrade to '' silently.
     const widgetKnowledge = buildWidgetKnowledgeContext({
-      ownerEmail: clientConfig.handoffEmail || clientConfig.ownerEmail || null,
+      ownerEmail,
       slug: clientConfig.slug || deriveSlugFromRequest(req) || null,
       query: lastUserText(messages),
     });
@@ -4227,6 +4240,7 @@ app.post('/api/chat', async (req, res) => {
       messages:   messages.slice(-24),
     });
     trackUsage(r.usage?.input_tokens || 0, r.usage?.output_tokens || 0);
+    recordOwnerUsageNow(ownerEmail, r.usage?.output_tokens || 0);
     if (sessionId) saveSession(sessionId, { messages: messages.slice(-24) });
     res.json(r);
   } catch(e) {
