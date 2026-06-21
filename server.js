@@ -1903,14 +1903,27 @@ app.get('/api/email-autoreply/reply-log', (req, res) => {
 const DOMAINS_FILE = resolve('data/allowed-domains.json');
 const allowedDomains = new Set(); // e.g. "mysite.co.uk", "localhost:3000"
 
+// When true, a parseable browser origin matching neither FIRST_PARTY_DOMAINS nor
+// allowedDomains is hard-blocked (403) instead of served-and-logged. Ships OFF;
+// flipped on only after the live clients' domains are seeded + verified (see
+// docs/superpowers/specs/2026-06-16-aria-security-hardening-design.md, 0B).
+// NOTE: origin/referer is a browser-only signal — curl with a spoofed/absent
+// Origin still bypasses; off-browser proxy abuse is closed in Phase 2.
+const ENFORCE_DOMAIN_ALLOWLIST = /^(1|true|yes|on)$/i.test(process.env.ENFORCE_DOMAIN_ALLOWLIST || '');
+
 function loadAllowedDomains() {
   try {
     if (existsSync(DOMAINS_FILE)) {
       const saved = JSON.parse(readFileSync(DOMAINS_FILE, 'utf8'));
       for (const d of saved) allowedDomains.add(d.toLowerCase());
-      console.log(`🔒 Loaded ${allowedDomains.size} allowed domains`);
     }
   } catch (e) { console.warn('Failed to load domains:', e.message); }
+  // Env seed (comma-separated) — survives Railway's ephemeral volume, mirrors the
+  // OWNERS_JSON pattern. Merged on top of the file so a redeploy can't lose them.
+  for (const d of String(process.env.ALLOWED_DOMAINS || '').split(',')) {
+    const c = d.trim().toLowerCase(); if (c) allowedDomains.add(c);
+  }
+  console.log(`🔒 Loaded ${allowedDomains.size} allowed domains (enforce=${ENFORCE_DOMAIN_ALLOWLIST})`);
 }
 
 function persistAllowedDomains() {
@@ -1946,16 +1959,17 @@ function isDomainAllowed(req) {
   if (FIRST_PARTY_DOMAINS.has(hostname) || FIRST_PARTY_DOMAINS.has(host)) return true;
   for (const d of FIRST_PARTY_DOMAINS) { if (hostname.endsWith('.' + d)) return true; }
 
-  // No per-client allowlist configured → allow all (backwards compatible).
-  if (allowedDomains.size === 0) return true;
-
   // Per-client allowlist match (exact host/hostname or subdomain).
   if (allowedDomains.has(host) || allowedDomains.has(hostname)) return true;
   for (const d of allowedDomains) { if (hostname.endsWith('.' + d)) return true; }
 
-  // Unknown domain. Rather than hard-block (which shows users a broken
-  // "something went wrong" widget), allow it but log so Kyle can see who's
-  // embedding. Abuse is already capped by checkRate + the monthly cap.
+  // No match. When enforcing, hard-block (the widget middleware turns false into
+  // 403). When not enforcing (default, and any fresh empty-allowlist deploy),
+  // serve + log so we can see who's embedding before the flag is flipped on.
+  if (ENFORCE_DOMAIN_ALLOWLIST) {
+    console.warn('[domain] BLOCKED non-allowlisted origin:', hostname);
+    return false;
+  }
   console.warn('[domain] serving widget for non-allowlisted origin:', hostname);
   return true;
 }
@@ -8017,14 +8031,13 @@ app.post('/admin/owners', (req, res) => {
 // Admin auth — accepts (in order of preference):
 //   1. aria_admin_session cookie  — set by /admin/auth magic-link exchange
 //   2. X-Admin-Pass header        — used by curl/scripts (server-side only)
-//   3. ?pass= query string        — legacy, deprecated, kept for old inbox links
-//      until the next deploy. New links never include the password.
+// The ?pass= query-string fallback was removed 2026-06-16 — it leaked the master
+// password into access logs + browser history. Scripts use the X-Admin-Pass
+// header; the dashboard authenticates via the cookie.
 function adminAuth(req) {
   if (_hasValidAdminCookie(req)) return true;
   const headerPass = req.headers['x-admin-pass'];
   if (typeof headerPass === 'string' && _constantTimeEq(headerPass, ADMIN)) return true;
-  const queryPass = req.query?.pass;
-  if (typeof queryPass === 'string' && _constantTimeEq(queryPass, ADMIN)) return true;
   return false;
 }
 
@@ -9196,7 +9209,6 @@ app.get('/admin', (req, res) => {
 </body>
 </html>`);
 
-  const PASS = ADMIN;
   res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aria Admin v5</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f0f1a;color:#e8e8f8;min-height:100vh;}
@@ -9665,7 +9677,7 @@ textarea{resize:vertical;min-height:60px;}
 </div>
 
 <script>
-const PASS = '${PASS}';
+const PASS = '';
 let _d = null;
 
 async function load() {
