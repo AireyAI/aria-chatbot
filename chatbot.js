@@ -117,6 +117,7 @@
     webhook:      _a('webhook',      ''),
 
     canned:       _j('canned',       {}),
+    pricing:      _j('pricing',       {}),   // {"window cleaning":{"from":15,"unit":"per window","min":40}} — powers estimate_quote
     pageMessages: _j('pageMessages', {}),
     pageTriggers: _j('pageTriggers', []),
     quickReplies: _j('quickReplies', ['📅 Book Now', '💰 Get a Quote', '📞 Call Us', '❓ I have a question']),
@@ -263,6 +264,7 @@
       handoffWa:      CONFIG.handoffWa    || CONFIG.whatsapp,
       handoffUrl:     CONFIG.handoffUrl,
       canned:         CONFIG.canned || {},
+      pricing:        CONFIG.pricing || {},
       calendarConnected: !!CONFIG.calendarConnected,
       lastScore,
       isOutOfHours,
@@ -1824,12 +1826,12 @@ Return JSON:
     const routerToolsNote = IS_ROUTER ? `
 
 ━━━ REAL TOOLS (use these — preferred over tags) ━━━
-You have real tools: show_quick_replies, show_lead_capture, start_booking_flow, request_callback, request_quote, handoff_to_human, qualify_lead, lookup_faq, create_lead_record, send_whatsapp_to_owner, book_calendar_slot, lookup_booking, check_availability, reschedule_booking, cancel_booking, schedule_callback, show_social_proof.
+You have real tools: show_quick_replies, show_lead_capture, start_booking_flow, request_callback, request_quote, handoff_to_human, qualify_lead, lookup_faq, create_lead_record, send_whatsapp_to_owner, book_calendar_slot, lookup_booking, check_availability, reschedule_booking, cancel_booking, schedule_callback, show_social_proof, estimate_quote.
 - For availability → CALL check_availability to OFFER real free slots in your own words ("I've got Tuesday 2pm or Wednesday 10am — which suits?"), or start_booking_flow (show_availability:true) for the picker — instead of ::BOOKING or ::CHECK_AVAILABILITY.
 - "When is my appointment / is my booking confirmed?" → CALL lookup_booking (ask for the email they booked with first).
 - To MOVE or CANCEL an existing appointment → CALL reschedule_booking / cancel_booking. These need owner approval — tell the visitor the business will confirm shortly.
 - For a callback NOW → request_callback. For a callback at a SPECIFIC time, or when you are out-of-hours → schedule_callback (needs phone + the time they want).
-- For a quote → CALL request_quote instead of ::QUOTE.
+- For "how much / rough price?" → CALL estimate_quote (ballpark from the price list); say it's an estimate and offer a precise figure. For a full written quote → request_quote instead of ::QUOTE.
 - If the visitor is hesitating or asks "are you any good / do you have reviews?" → CALL show_social_proof to reassure them with real ratings.
 - For a human → CALL handoff_to_human instead of ::HANDOFF.
 - For suggested next steps → CALL show_quick_replies and OMIT the FOLLOWUPS: line.
