@@ -4651,7 +4651,7 @@ app.post('/api/chat/router', async (req, res) => {
       systemPrompt: fullPrompt,
       clientConfig: { ...clientConfig, serverBaseUrl: `${req.protocol}://${req.get('host')}` },
       sessionId,
-      serverFns: { smartSend, sendWhatsAppMessage, lookupServerFaq,
+      serverFns: { smartSend, sendWhatsAppMessage, lookupServerFaq, lookupBooking, getAvailability,
                    requestCallback: processCallbackRequest, requestQuote: processQuoteRequest },
       model: model || 'claude-sonnet-4-6',
       maxTokens: max_tokens || 800,
@@ -4797,7 +4797,7 @@ app.post('/api/chat/router/stream', async (req, res) => {
       systemPrompt: fullPrompt,
       clientConfig: { ...clientConfig, serverBaseUrl: `${req.protocol}://${req.get('host')}` },
       sessionId,
-      serverFns: { smartSend, sendWhatsAppMessage, lookupServerFaq,
+      serverFns: { smartSend, sendWhatsAppMessage, lookupServerFaq, lookupBooking, getAvailability,
                    requestCallback: processCallbackRequest, requestQuote: processQuoteRequest },
       onTextDelta: t => { if (!aborted) sse({ text: t }); },
       onToolEvent: e => { if (!aborted) sse({ tool: e.name, result: e.result }); },
@@ -5568,32 +5568,29 @@ app.post('/api/order', async (req, res) => {
 // ─── Booking Lookup / Reschedule / Cancel ────────────────────────────────────
 
 // Look up a booking by visitor email in Google Calendar
-app.get('/api/booking/lookup', async (req, res) => {
-  const { owner, email } = req.query;
-  if (!owner || !email) return res.json({ booking: null });
-  const entry = gmailTokens.get(owner);
-  if (!entry) return res.json({ booking: null });
-
+// Shared by GET /api/booking/lookup (legacy widget) + the router's lookup_booking
+// tool — find a visitor's upcoming appointment by email on the owner's connected
+// Google Calendar. Read-only (same extract-and-share pattern as processCallbackRequest).
+async function lookupBooking({ ownerEmail, email }) {
+  const owner = ownerTo(ownerEmail);
+  if (!owner || !email || !gmailTokens.has(owner)) return { booking: null };
   try {
-    const calendar = google.calendar({ version: 'v3', auth: entry.auth });
-    const now = new Date();
+    const calendar = google.calendar({ version: 'v3', auth: gmailTokens.get(owner).auth });
     const { data } = await calendar.events.list({
       calendarId: 'primary',
-      timeMin: now.toISOString(),
+      timeMin: new Date().toISOString(),
       maxResults: 50,
       singleEvents: true,
       orderBy: 'startTime',
       q: email,
     });
-
+    const lc = String(email).toLowerCase();
     const event = data.items?.find(e =>
-      e.description?.toLowerCase().includes(email.toLowerCase()) ||
-      e.attendees?.some(a => a.email?.toLowerCase() === email.toLowerCase())
+      e.description?.toLowerCase().includes(lc) ||
+      e.attendees?.some(a => a.email?.toLowerCase() === lc)
     );
-
-    if (!event) return res.json({ booking: null });
-
-    res.json({
+    if (!event) return { booking: null };
+    return {
       booking: {
         id: event.id,
         summary: event.summary || 'Appointment',
@@ -5602,11 +5599,14 @@ app.get('/api/booking/lookup', async (req, res) => {
           : event.start?.date || 'Unknown date',
         description: event.description || '',
       },
-    });
+    };
   } catch (e) {
     console.warn('Booking lookup failed:', e.message);
-    res.json({ booking: null });
+    return { booking: null };
   }
+}
+app.get('/api/booking/lookup', async (req, res) => {
+  res.json(await lookupBooking({ ownerEmail: req.query.owner, email: req.query.email }));
 });
 
 // Cancel a booking
@@ -5860,13 +5860,14 @@ app.post('/api/chat/abandoned', async (req, res) => {
 // ─── Smart Chat Actions ──────────────────────────────────────────────────────
 
 // Calendar availability check — returns free slots for the next 5 days
-app.get('/api/calendar/availability', async (req, res) => {
-  const owner = ownerTo(req.query.owner);
-  if (!owner || !gmailTokens.has(owner)) return res.json({ slots: [], message: 'Calendar not connected' });
-
+// Shared by GET /api/calendar/availability (legacy widget) + the router's
+// check_availability tool — real free 1-hour slots (next 5 working days, 9-5)
+// from the owner's Google Calendar free/busy. Read-only.
+async function getAvailability({ ownerEmail }) {
+  const owner = ownerTo(ownerEmail);
+  if (!owner || !gmailTokens.has(owner)) return { slots: [], message: 'Calendar not connected' };
   try {
-    const entry = gmailTokens.get(owner);
-    const calendar = google.calendar({ version: 'v3', auth: entry.auth });
+    const calendar = google.calendar({ version: 'v3', auth: gmailTokens.get(owner).auth });
     const now = new Date();
     const end = new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000);
 
@@ -5910,11 +5911,14 @@ app.get('/api/calendar/availability', async (req, res) => {
       }
     }
 
-    res.json({ slots: slots.slice(0, 10) });
+    return { slots: slots.slice(0, 10) };
   } catch (e) {
     console.warn('Calendar availability check failed:', e.message);
-    res.json({ slots: [], message: 'Could not check calendar' });
+    return { slots: [], message: 'Could not check calendar' };
   }
+}
+app.get('/api/calendar/availability', async (req, res) => {
+  res.json(await getAvailability({ ownerEmail: req.query.owner }));
 });
 
 // Callback request — visitor wants a call back
