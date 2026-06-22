@@ -4995,6 +4995,24 @@ app.get('/api/pending/confirm', async (req, res) => {
                ${calEvent?.htmlLink ? `<p><a href="${calEvent.htmlLink}">View in Google Calendar</a></p>` : '<p>⚠️ Google Calendar event could not be created — add it manually.</p>'}
                <p>Visitor contact: ${escapeHtml(b.visitor_contact || 'not captured')}</p>`,
       }).catch(e => console.warn('[aria/pending] booking email failed:', e.message));
+    } else if (row.kind === 'cancel_booking') {
+      const ownerEmail = row.owner?.handoffEmail || process.env.NOTIFY_EMAIL;
+      const eventId = row.payload?.eventId;
+      if (!ownerEmail || !eventId) return res.status(500).send('Missing owner or booking reference on staged row');
+      const r = await cancelBooking({ ownerEmail, eventId });
+      await fsp.appendFile(resolve('data', 'pending_actions.jsonl'),
+        JSON.stringify({ ...row, executed_at: new Date().toISOString(), result: r.ok ? 'cancelled' : 'failed' }) + '\n');
+      if (!r.ok) return res.status(502).send('Could not cancel the booking — please cancel it manually in your calendar.');
+      return res.send('Booking cancelled — the customer has been notified by the calendar.');
+    } else if (row.kind === 'reschedule_booking') {
+      const ownerEmail = row.owner?.handoffEmail || process.env.NOTIFY_EMAIL;
+      const { eventId, new_datetime } = row.payload || {};
+      if (!ownerEmail || !eventId || !new_datetime) return res.status(500).send('Missing reschedule details on staged row');
+      const r = await rescheduleBooking({ ownerEmail, eventId, newDatetime: new_datetime });
+      await fsp.appendFile(resolve('data', 'pending_actions.jsonl'),
+        JSON.stringify({ ...row, executed_at: new Date().toISOString(), result: r.ok ? 'rescheduled' : 'failed' }) + '\n');
+      if (!r.ok) return res.status(502).send('Could not reschedule — please update it manually in your calendar.');
+      return res.send('Booking rescheduled — the customer has been notified by the calendar.');
     } else {
       return res.status(400).send(`Unknown pending kind: ${row.kind}`);
     }
@@ -5610,43 +5628,55 @@ app.get('/api/booking/lookup', async (req, res) => {
 });
 
 // Cancel a booking
+// Shared by POST /api/booking/cancel + the router's cancel_booking tool (run on
+// owner approval via /api/pending/confirm). Deletes the event + notifies the
+// attendee via sendUpdates:'all'. WRITE — approval-gated in the chat path.
+async function cancelBooking({ ownerEmail, eventId }) {
+  const owner = ownerTo(ownerEmail);
+  if (!owner || !eventId || !gmailTokens.has(owner)) return { ok: false, error: 'Calendar not connected' };
+  try {
+    const calendar = google.calendar({ version: 'v3', auth: gmailTokens.get(owner).auth });
+    await calendar.events.delete({ calendarId: 'primary', eventId, sendUpdates: 'all' });
+    return { ok: true };
+  } catch (e) {
+    console.warn('Cancel failed:', e.message);
+    return { ok: false, error: e.message };
+  }
+}
 app.post('/api/booking/cancel', async (req, res) => {
   const { owner, eventId } = req.body;
   if (!owner || !eventId) return res.status(400).json({ error: 'Missing owner or eventId' });
-  const entry = gmailTokens.get(owner);
-  if (!entry) return res.status(400).json({ error: 'Calendar not connected' });
-
-  try {
-    const calendar = google.calendar({ version: 'v3', auth: entry.auth });
-    await calendar.events.delete({ calendarId: 'primary', eventId, sendUpdates: 'all' });
-    res.json({ ok: true });
-  } catch (e) {
-    console.warn('Cancel failed:', e.message);
-    res.status(500).json({ error: 'Could not cancel' });
-  }
+  const r = await cancelBooking({ ownerEmail: owner, eventId });
+  if (r.ok) return res.json({ ok: true });
+  res.status(r.error === 'Calendar not connected' ? 400 : 500).json({ error: r.error === 'Calendar not connected' ? 'Calendar not connected' : 'Could not cancel' });
 });
 
 // Reschedule a booking
-app.post('/api/booking/reschedule', async (req, res) => {
-  const { owner, eventId, newDatetime } = req.body;
-  if (!owner || !eventId || !newDatetime) return res.status(400).json({ error: 'Missing fields' });
-  const entry = gmailTokens.get(owner);
-  if (!entry) return res.status(400).json({ error: 'Calendar not connected' });
-
+// Shared by POST /api/booking/reschedule + the router's reschedule_booking tool
+// (run on owner approval via /api/pending/confirm). Patches the event time +
+// notifies the attendee. WRITE — approval-gated in the chat path.
+async function rescheduleBooking({ ownerEmail, eventId, newDatetime }) {
+  const owner = ownerTo(ownerEmail);
+  if (!owner || !eventId || !newDatetime || !gmailTokens.has(owner)) return { ok: false, error: 'Calendar not connected' };
   try {
-    const calendar = google.calendar({ version: 'v3', auth: entry.auth });
+    const calendar = google.calendar({ version: 'v3', auth: gmailTokens.get(owner).auth });
     const parsed = await parseBookingDatetime(newDatetime);
-
     const patch = parsed
       ? { start: { dateTime: parsed.start, timeZone: 'Europe/London' }, end: { dateTime: parsed.end, timeZone: 'Europe/London' } }
       : { summary: `📅 Rescheduled — ${newDatetime}` };
-
     await calendar.events.patch({ calendarId: 'primary', eventId, requestBody: patch, sendUpdates: 'all' });
-    res.json({ ok: true });
+    return { ok: true };
   } catch (e) {
     console.warn('Reschedule failed:', e.message);
-    res.status(500).json({ error: 'Could not reschedule' });
+    return { ok: false, error: e.message };
   }
+}
+app.post('/api/booking/reschedule', async (req, res) => {
+  const { owner, eventId, newDatetime } = req.body;
+  if (!owner || !eventId || !newDatetime) return res.status(400).json({ error: 'Missing fields' });
+  const r = await rescheduleBooking({ ownerEmail: owner, eventId, newDatetime });
+  if (r.ok) return res.json({ ok: true });
+  res.status(r.error === 'Calendar not connected' ? 400 : 500).json({ error: r.error === 'Calendar not connected' ? 'Calendar not connected' : 'Could not reschedule' });
 });
 
 // ─── Reviews (multi-tenant moderation) ───────────────────────────────────────
