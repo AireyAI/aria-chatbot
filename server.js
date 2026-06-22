@@ -4651,7 +4651,7 @@ app.post('/api/chat/router', async (req, res) => {
       systemPrompt: fullPrompt,
       clientConfig: { ...clientConfig, serverBaseUrl: `${req.protocol}://${req.get('host')}` },
       sessionId,
-      serverFns: { smartSend, sendWhatsAppMessage, lookupServerFaq, lookupBooking, getAvailability,
+      serverFns: { smartSend, sendWhatsAppMessage, lookupServerFaq, lookupBooking, getAvailability, getReviewsSummary,
                    requestCallback: processCallbackRequest, requestQuote: processQuoteRequest },
       model: model || 'claude-sonnet-4-6',
       maxTokens: max_tokens || 800,
@@ -4797,7 +4797,7 @@ app.post('/api/chat/router/stream', async (req, res) => {
       systemPrompt: fullPrompt,
       clientConfig: { ...clientConfig, serverBaseUrl: `${req.protocol}://${req.get('host')}` },
       sessionId,
-      serverFns: { smartSend, sendWhatsAppMessage, lookupServerFaq, lookupBooking, getAvailability,
+      serverFns: { smartSend, sendWhatsAppMessage, lookupServerFaq, lookupBooking, getAvailability, getReviewsSummary,
                    requestCallback: processCallbackRequest, requestQuote: processQuoteRequest },
       onTextDelta: t => { if (!aborted) sse({ text: t }); },
       onToolEvent: e => { if (!aborted) sse({ tool: e.name, result: e.result }); },
@@ -5704,6 +5704,22 @@ function persistReviews() {
   const obj = {};
   for (const [slug, list] of reviews.entries()) obj[slug] = list;
   save('reviews', obj);
+}
+
+// Public reviews summary for the router's show_social_proof tool — average
+// rating, count, and a few recent highlights from APPROVED reviews only (same
+// in-memory store the GET /api/reviews/:slug route serves). Read-only.
+function getReviewsSummary({ slug }) {
+  const list = (reviews.get(slug) || []).filter(r => r.approved && !r.rejected);
+  if (!list.length) return { count: 0 };
+  const avg = +(list.reduce((a, r) => a + (Number(r.rating) || 0), 0) / list.length).toFixed(1);
+  const recent = list.slice(-3).reverse().map(r => ({
+    name: r.name || 'Customer',
+    rating: r.rating,
+    text: String(r.text || '').slice(0, 140),
+    service: r.service || null,
+  }));
+  return { count: list.length, averageRating: avg, recent };
 }
 
 function sanitiseText(s, max = 2000) {
