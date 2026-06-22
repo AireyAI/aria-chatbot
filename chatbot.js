@@ -1798,7 +1798,7 @@ Return JSON:
       : '';
 
     const returnCtx = visitCount > 1
-      ? `\nRETURN VISITOR: This is visit #${visitCount}. If greeting, say "great to see you again" or similar.`
+      ? `\nRETURN VISITOR: This is visit #${visitCount}.${userName ? ` Their name is ${userName} — greet them warmly BY NAME and do NOT ask for their name again.` : ' If greeting, say "great to see you again" or similar.'}${history && history.length ? ' They have chatted here before (their earlier messages are included above) — pick up naturally where they left off rather than starting over.' : ''}`
       : '';
 
     const competitorCtx = CONFIG.competitors.length
@@ -1824,9 +1824,13 @@ Return JSON:
     const routerToolsNote = IS_ROUTER ? `
 
 ━━━ REAL TOOLS (use these — preferred over tags) ━━━
-You have real tools: show_quick_replies, show_lead_capture, start_booking_flow, request_callback, request_quote, handoff_to_human, qualify_lead, lookup_faq, create_lead_record, send_whatsapp_to_owner, book_calendar_slot.
-- For booking/availability → CALL start_booking_flow (show_availability:true for "when are you free?") instead of emitting ::BOOKING or ::CHECK_AVAILABILITY.
-- For a callback → CALL request_callback instead of ::CALLBACK. For a quote → CALL request_quote instead of ::QUOTE.
+You have real tools: show_quick_replies, show_lead_capture, start_booking_flow, request_callback, request_quote, handoff_to_human, qualify_lead, lookup_faq, create_lead_record, send_whatsapp_to_owner, book_calendar_slot, lookup_booking, check_availability, reschedule_booking, cancel_booking, schedule_callback, show_social_proof.
+- For availability → CALL check_availability to OFFER real free slots in your own words ("I've got Tuesday 2pm or Wednesday 10am — which suits?"), or start_booking_flow (show_availability:true) for the picker — instead of ::BOOKING or ::CHECK_AVAILABILITY.
+- "When is my appointment / is my booking confirmed?" → CALL lookup_booking (ask for the email they booked with first).
+- To MOVE or CANCEL an existing appointment → CALL reschedule_booking / cancel_booking. These need owner approval — tell the visitor the business will confirm shortly.
+- For a callback NOW → request_callback. For a callback at a SPECIFIC time, or when you are out-of-hours → schedule_callback (needs phone + the time they want).
+- For a quote → CALL request_quote instead of ::QUOTE.
+- If the visitor is hesitating or asks "are you any good / do you have reviews?" → CALL show_social_proof to reassure them with real ratings.
 - For a human → CALL handoff_to_human instead of ::HANDOFF.
 - For suggested next steps → CALL show_quick_replies and OMIT the FOLLOWUPS: line.
 - To capture an email for follow-up → CALL show_lead_capture.
