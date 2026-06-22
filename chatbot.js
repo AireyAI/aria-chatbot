@@ -115,6 +115,8 @@
     handoffWa:    _a('handoffWa',    ''),
     handoffEmail: _a('handoffEmail', ''),
     webhook:      _a('webhook',      ''),
+    depositUrl:   _a('depositUrl',   ''),   // client's OWN Stripe Payment Link (data-deposit-url) — deposits go to THEM
+    depositInfo:  _a('depositInfo',  ''),   // e.g. "£20 deposit secures your booking" (data-deposit-info)
 
     canned:       _j('canned',       {}),
     pricing:      _j('pricing',       {}),   // {"window cleaning":{"from":15,"unit":"per window","min":40}} — powers estimate_quote
@@ -263,6 +265,8 @@
       handoffEmail:   CONFIG.handoffEmail || CONFIG.ownerEmail,
       handoffWa:      CONFIG.handoffWa    || CONFIG.whatsapp,
       handoffUrl:     CONFIG.handoffUrl,
+      depositUrl:     CONFIG.depositUrl || '',
+      depositInfo:    CONFIG.depositInfo || '',
       canned:         CONFIG.canned || {},
       pricing:        CONFIG.pricing || {},
       calendarConnected: !!CONFIG.calendarConnected,
@@ -1832,6 +1836,7 @@ You have real tools: show_quick_replies, show_lead_capture, start_booking_flow, 
 - To MOVE or CANCEL an existing appointment → CALL reschedule_booking / cancel_booking. These need owner approval — tell the visitor the business will confirm shortly.
 - For a callback NOW → request_callback. For a callback at a SPECIFIC time, or when you are out-of-hours → schedule_callback (needs phone + the time they want).
 - For "how much / rough price?" → CALL estimate_quote (ballpark from the price list); say it's an estimate and offer a precise figure. For a full written quote → request_quote instead of ::QUOTE.
+- To take a booking DEPOSIT / payment → CALL take_deposit (shares the business's own secure Stripe payment link). Use once they've decided to book and a deposit is wanted. Never invent a payment link or amount.
 - If the visitor is hesitating or asks "are you any good / do you have reviews?" → CALL show_social_proof to reassure them with real ratings.
 - For a human → CALL handoff_to_human instead of ::HANDOFF.
 - For suggested next steps → CALL show_quick_replies and OMIT the FOLLOWUPS: line.
