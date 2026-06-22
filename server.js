@@ -4651,7 +4651,7 @@ app.post('/api/chat/router', async (req, res) => {
       systemPrompt: fullPrompt,
       clientConfig: { ...clientConfig, serverBaseUrl: `${req.protocol}://${req.get('host')}` },
       sessionId,
-      serverFns: { smartSend, sendWhatsAppMessage, lookupServerFaq, lookupBooking, getAvailability, getReviewsSummary,
+      serverFns: { smartSend, sendWhatsAppMessage, lookupServerFaq, lookupBooking, getAvailability, getReviewsSummary, scheduleCallback,
                    requestCallback: processCallbackRequest, requestQuote: processQuoteRequest },
       model: model || 'claude-sonnet-4-6',
       maxTokens: max_tokens || 800,
@@ -4797,7 +4797,7 @@ app.post('/api/chat/router/stream', async (req, res) => {
       systemPrompt: fullPrompt,
       clientConfig: { ...clientConfig, serverBaseUrl: `${req.protocol}://${req.get('host')}` },
       sessionId,
-      serverFns: { smartSend, sendWhatsAppMessage, lookupServerFaq, lookupBooking, getAvailability, getReviewsSummary,
+      serverFns: { smartSend, sendWhatsAppMessage, lookupServerFaq, lookupBooking, getAvailability, getReviewsSummary, scheduleCallback,
                    requestCallback: processCallbackRequest, requestQuote: processQuoteRequest },
       onTextDelta: t => { if (!aborted) sse({ text: t }); },
       onToolEvent: e => { if (!aborted) sse({ tool: e.name, result: e.result }); },
@@ -5965,6 +5965,27 @@ async function getAvailability({ ownerEmail }) {
 }
 app.get('/api/calendar/availability', async (req, res) => {
   res.json(await getAvailability({ ownerEmail: req.query.owner }));
+});
+
+// Scheduled callback — Aria books a callback for a specific time the visitor
+// asks for (parsed via the same NL parser bookings use); the owner is reminded
+// at that time via the outbound scheduler. Used by the router's schedule_callback
+// tool. processCallbackRequest (hoisted, defined below) fires when the task is due.
+async function scheduleCallback({ ownerEmail, phone, name, notes, when, siteName }) {
+  const owner = ownerTo(ownerEmail);
+  if (!owner || !phone || !when) return { scheduled: false, message: 'Missing phone or time.' };
+  const parsed = await parseBookingDatetime(when);
+  const dueAt = parsed?.start ? Date.parse(parsed.start) : NaN;
+  if (!Number.isFinite(dueAt) || dueAt < Date.now() + 60_000) {
+    return { scheduled: false, message: 'Could not parse a clear future time.' };
+  }
+  scheduleTask({ type: 'scheduled_callback', dueAt, ownerEmail: owner,
+    payload: { name: name || null, phone, notes: notes || '', ownerEmail: owner, siteName: siteName || null } });
+  return { scheduled: true, scheduledForHuman: new Date(dueAt).toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) };
+}
+registerTaskHandler('scheduled_callback', async (task) => {
+  try { await processCallbackRequest(task.payload); return true; }
+  catch (e) { console.warn('[scheduler] scheduled_callback failed:', e.message); return false; }
 });
 
 // Callback request — visitor wants a call back
