@@ -4595,6 +4595,18 @@ app.post('/api/chat/router', async (req, res) => {
   const { system, messages, model, max_tokens, sessionId, clientConfig = {} } = req.body;
   if (!messages?.length) return res.status(400).json({ error: 'Invalid messages' });
 
+  // Phase 2 — per-client isolation on the DEFAULT widget path. chatbot.js points
+  // every widget at this router; the legacy /api/chat got the same gate. Cap PER
+  // OWNER (lib/usage_meter.js) so one busy/abusive client can't 429 the others on
+  // the shared key. ownerEmail comes from clientConfig; null → unmetered (global
+  // isOverCap backstop above still applies).
+  const ownerEmail = clientConfig.handoffEmail || clientConfig.ownerEmail || null;
+  if (ownerEmail) {
+    const _p = getOwnerProfile(ownerEmail);
+    const _b = checkOwnerBudget(ownerUsage, ownerEmail, { tokensPerDay: _p?.config?.tokensPerDay, messagesPerDay: _p?.config?.messagesPerDay });
+    if (!_b.allowed) return res.status(429).json({ error: 'Daily message limit reached for this site — resets tomorrow.' });
+  }
+
   try {
     const lastScore = clientConfig.lastScore ?? 0;
     const tier = lastScore >= 70 ? 'hot' : lastScore >= 40 ? 'warm' : 'cold';
@@ -4649,6 +4661,7 @@ app.post('/api/chat/router', async (req, res) => {
     // include router traffic. Without this, /api/chat tracked but the new
     // tool-use router silently bypassed the cap (Codex B2).
     if (usage) trackUsage(usage.inputTokens, usage.outputTokens);
+    recordOwnerUsageNow(ownerEmail, usage?.outputTokens || 0);
     if (warning) console.warn('[aria/router]', warning); // Rule #10 — fail loud
     if (sessionId) saveSession(sessionId, { messages: stripImageBlocks(messages.slice(-24)) });
 
@@ -4729,6 +4742,15 @@ app.post('/api/chat/router/stream', async (req, res) => {
   const { system, messages, model, max_tokens, sessionId, clientConfig = {} } = req.body;
   if (!messages?.length) { sse({ error: 'Invalid messages' }); return res.end(); }
 
+  // Phase 2 — per-client isolation (streaming router path). 429 via SSE before
+  // the stream starts; null owner → unmetered (global isOverCap backstop above).
+  const ownerEmail = clientConfig.handoffEmail || clientConfig.ownerEmail || null;
+  if (ownerEmail) {
+    const _p = getOwnerProfile(ownerEmail);
+    const _b = checkOwnerBudget(ownerUsage, ownerEmail, { tokensPerDay: _p?.config?.tokensPerDay, messagesPerDay: _p?.config?.messagesPerDay });
+    if (!_b.allowed) { sse({ error: 'Daily message limit reached for this site — resets tomorrow.' }); return res.end(); }
+  }
+
   // res.on('close') — fires on actual client disconnect. NOT req.on('close')
   // which in Node 24+ fires the moment express.json() finishes consuming the
   // body, killing every SSE write before the model even responds.
@@ -4788,6 +4810,7 @@ app.post('/api/chat/router/stream', async (req, res) => {
 
     // Track usage even on aborted streams — tokens already crossed the wire.
     if (usage) trackUsage(usage.inputTokens, usage.outputTokens);
+    recordOwnerUsageNow(ownerEmail, usage?.outputTokens || 0);
     if (warning) console.warn('[aria/router-stream]', warning);
     if (sessionId) saveSession(sessionId, { messages: stripImageBlocks(messages.slice(-24)) });
 
@@ -4999,6 +5022,13 @@ app.post('/api/chat/stream', async (req, res) => {
   if (!process.env.ANTHROPIC_API_KEY) { sse({ error:'API key not configured — add ANTHROPIC_API_KEY to your .env file' }); return res.end(); }
   const { system, messages, model, max_tokens, sessionId, clientConfig = {} } = req.body;
   if (!messages?.length) { sse({ error:'Invalid' }); return res.end(); }
+  // Phase 2 — per-client isolation (legacy streaming path).
+  const ownerEmail = clientConfig.handoffEmail || clientConfig.ownerEmail || null;
+  if (ownerEmail) {
+    const _p = getOwnerProfile(ownerEmail);
+    const _b = checkOwnerBudget(ownerUsage, ownerEmail, { tokensPerDay: _p?.config?.tokensPerDay, messagesPerDay: _p?.config?.messagesPerDay });
+    if (!_b.allowed) { sse({ error: 'Daily message limit reached for this site — resets tomorrow.' }); return res.end(); }
+  }
   // res.on('close') — Node 24+ emits req 'close' when the body stream is
   // consumed (right after express.json()), which would falsely flag aborted=true
   // before any text deltas fire. res 'close' fires only on actual disconnect.
@@ -5021,6 +5051,7 @@ app.post('/api/chat/stream', async (req, res) => {
     stream.on('text', t => { if (!aborted) sse({ text: t }); });
     stream.on('finalMessage', msg => {
       trackUsage(msg.usage?.input_tokens || 0, msg.usage?.output_tokens || 0);
+      recordOwnerUsageNow(ownerEmail, msg.usage?.output_tokens || 0);
       if (!aborted) { sse('[DONE]'); res.end(); }
       if (sessionId) saveSession(sessionId, { messages: messages.slice(-24) });
     });
